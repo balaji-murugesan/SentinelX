@@ -1,6 +1,7 @@
 """Engine side of the diagnostic ping/pong. Answers pings only: no orders, no state, no broker."""
 
 import asyncio
+import contextlib
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -8,6 +9,7 @@ import structlog
 from opentelemetry import propagate, trace
 from pydantic import ValidationError
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
 
 from contracts.diagnostics import (
     PING_STREAM,
@@ -51,12 +53,30 @@ async def _answer(redis: Redis, fields: dict[str, str]) -> None:
         await cast("Any", redis.expire(key, PONG_TTL_SECONDS))
 
 
-async def answer_pings(redis: Redis, stop: asyncio.Event, *, block_ms: int = 500) -> None:
-    """Read pings until ``stop`` is set, replying to each on its own pong stream."""
-    last_id = await _newest_id(redis)
+async def answer_pings(
+    redis: Redis, stop: asyncio.Event, *, block_ms: int = 500, retry_seconds: float = 1.0
+) -> None:
+    """Read pings until ``stop`` is set, replying to each on its own pong stream.
+
+    If Redis is unreachable the loop waits (1 s, doubling up to 10 s) and tries again instead
+    of crashing: the engine must keep running when Redis is down.
+    """
+    last_id: str | None = None
+    delay = retry_seconds
     while not stop.is_set():
-        batches = await cast("Any", redis.xread({PING_STREAM: last_id}, count=10, block=block_ms))
-        for _stream, messages in batches or []:
-            for message_id, fields in messages:
-                last_id = message_id
-                await _answer(redis, fields)
+        try:
+            if last_id is None:
+                last_id = await _newest_id(redis)
+            batches = await cast(
+                "Any", redis.xread({PING_STREAM: last_id}, count=10, block=block_ms)
+            )
+            delay = retry_seconds
+            for _stream, messages in batches or []:
+                for message_id, fields in messages:
+                    last_id = message_id
+                    await _answer(redis, fields)
+        except (RedisError, OSError) as exc:
+            log.warning("redis unavailable; retrying", error=type(exc).__name__, retry_in=delay)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=delay)
+            delay = min(delay * 2, 10.0)

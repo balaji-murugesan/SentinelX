@@ -14,7 +14,7 @@ from observability.banner import log_startup_banner
 REDIS_PASSWORD = "r3dis-pw-SECRET"
 DB_PASSWORD = "db-pw-SECRET"
 
-ENTRY_POINTS = pytest.mark.parametrize("entry", [engine.main.main, api.main.main])
+ENTRY_POINTS = pytest.mark.parametrize("entry", [engine.main.start, api.main.start])
 
 
 def set_env(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None:

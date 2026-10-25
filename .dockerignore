@@ -1,0 +1,17 @@
+# Keep secrets, history and dev-only files out of every image build context.
+.env
+.env.*
+!.env.example
+.git
+.github
+.venv
+**/__pycache__
+.mypy_cache
+.pytest_cache
+.ruff_cache
+node_modules
+tests
+docs
+openspec
+.claude
+*.md

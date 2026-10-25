@@ -43,6 +43,12 @@ def create_app(settings: ApiSettings, redis_client: Redis | None = None) -> Fast
     if redis_client is not None:
         app.state.redis = redis_client  # set eagerly: test transports skip the lifespan hook
 
+    @app.get("/healthz")
+    async def healthz() -> dict[str, str]:
+        """Liveness for the container health check. Deliberately does not touch Redis: the api
+        process being up is what is checked, and Redis has its own health check."""
+        return {"status": "ok"}
+
     @app.post("/diagnostics/ping", response_model=ProbeResult)
     async def probe() -> ProbeResult:
         """Round trip api -> Redis -> engine -> Redis -> api. Diagnostic only."""
@@ -52,5 +58,6 @@ def create_app(settings: ApiSettings, redis_client: Redis | None = None) -> Fast
             raise HTTPException(status_code=504, detail=str(exc)) from None
         return ProbeResult(ok=True, rtt_ms=rtt_ms)
 
-    FastAPIInstrumentor.instrument_app(app, tracer_provider=get_provider())
+    # healthz is polled every few seconds; tracing it would only add noise.
+    FastAPIInstrumentor.instrument_app(app, tracer_provider=get_provider(), excluded_urls="healthz")
     return app

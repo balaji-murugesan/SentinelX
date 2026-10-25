@@ -1,0 +1,16 @@
+# TODO(Stage 7): TLS and Tailscale come with the VPS setup. Until then this is plain HTTP and
+# Compose publishes it on 127.0.0.1 only, so it is reachable from this machine and nowhere else.
+:80 {
+	# Used by the container health check.
+	respond /caddy-health "ok" 200
+
+	# REST api. "/api/diagnostics/ping" reaches the api as "/diagnostics/ping".
+	handle_path /api/* {
+		reverse_proxy api:8000
+	}
+
+	# Placeholder until the dashboard exists (Stage 6).
+	handle {
+		respond "SentinelX" 200
+	}
+}

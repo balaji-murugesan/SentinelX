@@ -1,0 +1,22 @@
+# OpenTelemetry Collector for Stage 0: receives traces from engine and api and prints them.
+# No tracing backend yet; Jaeger/Tempo is chosen in a later stage.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+exporters:
+  debug:
+    verbosity: detailed  # prints every span, so a trace can be followed in `docker compose logs`
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [debug]

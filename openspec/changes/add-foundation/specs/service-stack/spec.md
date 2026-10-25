@@ -88,3 +88,22 @@ The api service SHALL NOT be given any database URL or credentials, and SHALL co
 #### Scenario: Api configuration
 - **WHEN** the api settings are loaded
 - **THEN** they contain no database URL or database credentials
+
+### Requirement: Database credentials come only from the environment
+Database passwords SHALL be supplied only through environment variables read from the operator's local environment file. No password SHALL appear in the Compose file, any Dockerfile, the database initialisation script, logs, or the example environment file.
+
+#### Scenario: Files in the repository
+- **WHEN** the Compose file, Dockerfiles, initialisation script and example environment file are inspected
+- **THEN** none contains a password value; the example environment file holds empty or visibly placeholder values only
+
+#### Scenario: Password missing
+- **WHEN** an operator runs `docker compose up` without one of the database passwords set
+- **THEN** Compose stops with a message naming the missing variable
+
+#### Scenario: Weak or duplicate passwords
+- **WHEN** the database is initialised with a missing or short (under 16 characters) role password, or the same password for both roles
+- **THEN** initialisation aborts with an error naming the variable and no roles are created
+
+#### Scenario: Logs
+- **WHEN** the stack has started and run
+- **THEN** no container log contains a database password

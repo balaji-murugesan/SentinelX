@@ -1,0 +1,143 @@
+# SentinelX stack. Paper mode unless .env explicitly says otherwise (TRADING_MODE + LIVE_CONFIRM).
+#
+# No credentials live in this file. Secrets are written as ${VARIABLE} references that Compose
+# reads from your local .env (copy .env.example). Each service is given ONLY the variables it
+# needs, so there is deliberately no `env_file:` here: for example only `migrate` ever sees
+# the schema-changing database password, and `api` sees no database settings at all.
+name: sentinelx
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: sentinelx
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      # Read by infra/postgres/init.sql (\getenv) when it creates the two application roles.
+      ENGINE_DB_PASSWORD: ${ENGINE_DB_PASSWORD:?set ENGINE_DB_PASSWORD in .env}
+      MIGRATE_DB_PASSWORD: ${MIGRATE_DB_PASSWORD:?set MIGRATE_DB_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/10-roles.sql:ro
+    healthcheck:
+      # -h 127.0.0.1 matters: during first-time init the server listens only on a unix socket,
+      # so a TCP check turns healthy only once the roles exist and the real server is up.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d sentinelx"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  otel-collector:
+    build:
+      context: .
+      dockerfile: docker/otel-collector.Dockerfile
+    image: sentinelx-otel-collector
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:13133/"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: applies database migrations as the schema-owning role, then exits.
+  # The engine starts only after this finishes successfully, so a failed migration cannot
+  # crash-loop the engine. Reuses the engine image with a different command.
+  migrate:
+    image: sentinelx-engine
+    pull_policy: never
+    command: ["python", "-m", "engine.persistence.migrate"]
+    restart: "no"
+    environment:
+      MIGRATE_DATABASE_URL: postgresql+asyncpg://sentinelx_migrate:${MIGRATE_DB_PASSWORD:?set MIGRATE_DB_PASSWORD in .env}@postgres:5432/sentinelx
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  engine:
+    build:
+      context: .
+      dockerfile: docker/engine.Dockerfile
+    image: sentinelx-engine
+    restart: unless-stopped
+    environment:
+      TRADING_MODE: ${TRADING_MODE:-paper}
+      LIVE_CONFIRM: ${LIVE_CONFIRM:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      REDIS_URL: redis://redis:6379/0
+      # Engine role: data read/write only.
+      DATABASE_URL: postgresql+asyncpg://sentinelx_engine:${ENGINE_DB_PASSWORD:?set ENGINE_DB_PASSWORD in .env}@postgres:5432/sentinelx
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-m", "engine.healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    image: sentinelx-api
+    restart: unless-stopped
+    environment:
+      TRADING_MODE: ${TRADING_MODE:-paper}
+      LIVE_CONFIRM: ${LIVE_CONFIRM:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      REDIS_URL: redis://redis:6379/0
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:80"  # localhost only until TLS + Tailscale arrive in Stage 7
+    volumes:
+      - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      api:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:80/caddy-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  postgres-data:
+  caddy-data:
+  caddy-config:
