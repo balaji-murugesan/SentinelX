@@ -9,6 +9,9 @@ from collections.abc import Iterator
 from typing import Any
 
 import pytest
+import structlog
+
+from contracts.tracing import shutdown_tracing
 
 BLOCKED_SUFFIX = "dhan.co"
 
@@ -55,7 +58,23 @@ def block_real_dhan(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     yield
 
 
-CONFIG_VARS = ("TRADING_MODE", "LIVE_CONFIRM", "REDIS_URL", "DATABASE_URL", "LOG_LEVEL")
+@pytest.fixture(autouse=True)
+def reset_structlog() -> Iterator[None]:
+    """configure_logging()/configure_tracing() change global state; undo it after each test."""
+    yield
+    structlog.reset_defaults()
+    structlog.contextvars.clear_contextvars()
+    shutdown_tracing()
+
+
+CONFIG_VARS = (
+    "TRADING_MODE",
+    "LIVE_CONFIRM",
+    "REDIS_URL",
+    "DATABASE_URL",
+    "LOG_LEVEL",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+)
 
 
 @pytest.fixture(autouse=True)

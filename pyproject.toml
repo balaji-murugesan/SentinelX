@@ -59,6 +59,7 @@ testpaths = ["tests"]
 # "auto" lets `async def test_...` run without a per-test marker.
 asyncio_mode = "auto"
 pythonpath = ["src", "."]
+markers = ["integration: needs real external services (Redis); set TEST_REDIS_URL"]
 
 # Architectural boundaries (CLAUDE.md "Import boundaries"). Run with `uv run lint-imports`.
 [tool.importlinter]

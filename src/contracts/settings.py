@@ -34,6 +34,17 @@ class ModeSettings(BaseSettings):
     redis_url: SecretStr
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
+    # OpenTelemetry collector (OTLP/gRPC), e.g. http://otel-collector:4317. Empty = no export.
+    # The name is the standard OpenTelemetry variable.
+    otel_exporter_otlp_endpoint: str = ""
+
+    @field_validator("otel_exporter_otlp_endpoint")
+    @classmethod
+    def _otel_scheme(cls, value: str) -> str:
+        if value and not value.startswith(("http://", "https://")):
+            raise ValueError("must be empty or start with http:// or https://")
+        return value
+
     @field_validator("redis_url")
     @classmethod
     def _redis_scheme(cls, value: SecretStr) -> SecretStr:

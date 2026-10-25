@@ -1,5 +1,6 @@
 """Startup banner and refusing to start on bad config (task 2.4)."""
 
+import json
 from collections.abc import Callable
 
 import pytest
@@ -24,6 +25,15 @@ def set_env(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None:
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
+
+
+@pytest.fixture
+def no_telemetry_setup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """capture_logs() swaps structlog's processors; the real configure_logging() inside main()
+    would replace them and hide the records. The real pipeline is tested separately below."""
+    for module in (engine.main, api.main):
+        monkeypatch.setattr(module, "configure_logging", lambda *_a, **_k: None)
+        monkeypatch.setattr(module, "configure_tracing", lambda *_a, **_k: None)
 
 
 def test_paper_banner_text() -> None:
@@ -60,7 +70,7 @@ def test_live_banner_logged_at_warning() -> None:
 
 @ENTRY_POINTS
 def test_service_start_logs_one_banner_and_no_secrets(
-    monkeypatch: pytest.MonkeyPatch, entry: Callable[[], None]
+    no_telemetry_setup: None, monkeypatch: pytest.MonkeyPatch, entry: Callable[[], None]
 ) -> None:
     set_env(monkeypatch)
     with capture_logs() as logs:
@@ -74,7 +84,7 @@ def test_service_start_logs_one_banner_and_no_secrets(
 
 @ENTRY_POINTS
 def test_live_start_is_prominent(
-    monkeypatch: pytest.MonkeyPatch, entry: Callable[[], None]
+    no_telemetry_setup: None, monkeypatch: pytest.MonkeyPatch, entry: Callable[[], None]
 ) -> None:
     set_env(monkeypatch, TRADING_MODE="live", LIVE_CONFIRM="yes")
     with capture_logs() as logs:
@@ -87,7 +97,10 @@ def test_live_start_is_prominent(
     "bad", [{"TRADING_MODE": "Live"}, {"TRADING_MODE": "live"}, {"LIVE_CONFIRM": "true"}]
 )
 def test_bad_config_exits_without_banner_or_secrets(
-    monkeypatch: pytest.MonkeyPatch, entry: Callable[[], None], bad: dict[str, str]
+    no_telemetry_setup: None,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: Callable[[], None],
+    bad: dict[str, str],
 ) -> None:
     set_env(monkeypatch, **bad)
     with capture_logs() as logs, pytest.raises(SystemExit) as info:
@@ -97,3 +110,23 @@ def test_bad_config_exits_without_banner_or_secrets(
     assert message.startswith("Invalid configuration")
     assert REDIS_PASSWORD not in message
     assert DB_PASSWORD not in message
+
+
+@ENTRY_POINTS
+def test_real_logging_pipeline_prints_json_banner(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    entry: Callable[[], None],
+) -> None:
+    """End to end: main() configures logging, and the banner comes out as masked JSON."""
+    set_env(monkeypatch, TRADING_MODE="live", LIVE_CONFIRM="yes")
+    entry()
+    out = capsys.readouterr().out
+    (line,) = out.splitlines()
+    record = json.loads(line)
+    assert record["level"] == "warning"
+    assert record["mode"] == "live"
+    assert record["service"] in {"engine", "api"}
+    assert "REAL ORDERS" in record["message"]
+    assert REDIS_PASSWORD not in out
+    assert DB_PASSWORD not in out
