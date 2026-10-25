@@ -1,0 +1,15 @@
+# Secrets: never commit real credentials (only .env.example is tracked)
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Web
+node_modules/
