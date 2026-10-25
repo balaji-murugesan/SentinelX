@@ -53,3 +53,14 @@ def block_real_dhan(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setattr(socket, "getaddrinfo", guarded_getaddrinfo)
     monkeypatch.setattr(socket, "create_connection", guarded_create_connection)
     yield
+
+
+CONFIG_VARS = ("TRADING_MODE", "LIVE_CONFIRM", "REDIS_URL", "DATABASE_URL", "LOG_LEVEL")
+
+
+@pytest.fixture(autouse=True)
+def clean_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start every test with none of the config variables set, so a developer's shell
+    (or a stray TRADING_MODE=live) can never leak into a test."""
+    for name in CONFIG_VARS:
+        monkeypatch.delenv(name, raising=False)

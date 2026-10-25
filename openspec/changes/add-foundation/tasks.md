@@ -10,10 +10,10 @@
 
 ## 2. Runtime configuration
 
-- [ ] 2.1 Implement trading-mode resolution in `contracts` (paper default, live needs `TRADING_MODE=live` and `LIVE_CONFIRM=yes`) with unit tests for every scenario in `runtime-config`; verify the tests pass
-- [ ] 2.2 Implement typed `Settings` for engine and api (pydantic-settings, `SecretStr` for secrets, fail-fast on missing or invalid values without echoing secrets), with tests for missing, invalid, and masked-repr cases, and a test asserting the api settings contain no database URL (only engine and migrate see DB URLs); verify the tests pass
-- [ ] 2.3 Add `.env.example` with placeholders and paper mode; verify a test loads it and resolves paper mode
-- [ ] 2.4 Log the effective mode once at engine and api startup; verify via a test capturing log output
+- [x] 2.1 Implement trading-mode resolution in `contracts` (paper default, live needs `TRADING_MODE=live` and `LIVE_CONFIRM=yes`) with unit tests for every scenario in `runtime-config`; verify the tests pass
+- [x] 2.2 Implement typed `Settings` for engine and api (pydantic-settings, `SecretStr` for secrets, fail-fast on missing or invalid values without echoing secrets), with tests for missing, invalid, and masked-repr cases, and a test asserting the api settings contain no database URL (only engine and migrate see DB URLs); verify the tests pass
+- [x] 2.3 Add `.env.example` with placeholders and paper mode; verify a test loads it and resolves paper mode
+- [x] 2.4 Log the effective mode once at engine and api startup; verify via a test capturing log output
 
 ## 3. Observability
 

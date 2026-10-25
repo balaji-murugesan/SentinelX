@@ -1,0 +1,99 @@
+"""Startup banner and refusing to start on bad config (task 2.4)."""
+
+from collections.abc import Callable
+
+import pytest
+from structlog.testing import capture_logs
+
+import api.main
+import engine.main
+from contracts.banner import log_startup_banner
+from contracts.mode import TradingMode, startup_banner
+
+REDIS_PASSWORD = "r3dis-pw-SECRET"
+DB_PASSWORD = "db-pw-SECRET"
+
+ENTRY_POINTS = pytest.mark.parametrize("entry", [engine.main.main, api.main.main])
+
+
+def set_env(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None:
+    values = {
+        "REDIS_URL": f"redis://:{REDIS_PASSWORD}@redis:6379/0",
+        "DATABASE_URL": f"postgresql+asyncpg://u:{DB_PASSWORD}@postgres:5432/x",
+        **overrides,
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+
+
+def test_paper_banner_text() -> None:
+    banner = startup_banner("engine", TradingMode.PAPER)
+    assert "ENGINE" in banner
+    assert "PAPER" in banner
+    assert "LIVE" not in banner
+
+
+def test_live_banner_text() -> None:
+    banner = startup_banner("api", TradingMode.LIVE)
+    assert "API" in banner
+    assert "LIVE" in banner
+    assert "REAL ORDERS" in banner
+
+
+def test_paper_banner_logged_at_info() -> None:
+    with capture_logs() as logs:
+        log_startup_banner("engine", TradingMode.PAPER)
+    assert len(logs) == 1
+    assert logs[0]["log_level"] == "info"
+    assert logs[0]["mode"] == "paper"
+    assert logs[0]["service"] == "engine"
+
+
+def test_live_banner_logged_at_warning() -> None:
+    with capture_logs() as logs:
+        log_startup_banner("engine", TradingMode.LIVE)
+    assert len(logs) == 1
+    assert logs[0]["log_level"] == "warning"
+    assert logs[0]["mode"] == "live"
+    assert "REAL ORDERS" in logs[0]["event"]
+
+
+@ENTRY_POINTS
+def test_service_start_logs_one_banner_and_no_secrets(
+    monkeypatch: pytest.MonkeyPatch, entry: Callable[[], None]
+) -> None:
+    set_env(monkeypatch)
+    with capture_logs() as logs:
+        entry()
+    assert len(logs) == 1
+    assert logs[0]["mode"] == "paper"
+    rendered = str(logs)
+    assert REDIS_PASSWORD not in rendered
+    assert DB_PASSWORD not in rendered
+
+
+@ENTRY_POINTS
+def test_live_start_is_prominent(
+    monkeypatch: pytest.MonkeyPatch, entry: Callable[[], None]
+) -> None:
+    set_env(monkeypatch, TRADING_MODE="live", LIVE_CONFIRM="yes")
+    with capture_logs() as logs:
+        entry()
+    assert [(r["log_level"], r["mode"]) for r in logs] == [("warning", "live")]
+
+
+@ENTRY_POINTS
+@pytest.mark.parametrize(
+    "bad", [{"TRADING_MODE": "Live"}, {"TRADING_MODE": "live"}, {"LIVE_CONFIRM": "true"}]
+)
+def test_bad_config_exits_without_banner_or_secrets(
+    monkeypatch: pytest.MonkeyPatch, entry: Callable[[], None], bad: dict[str, str]
+) -> None:
+    set_env(monkeypatch, **bad)
+    with capture_logs() as logs, pytest.raises(SystemExit) as info:
+        entry()
+    assert logs == []  # nothing announced: the service never started
+    message = str(info.value)
+    assert message.startswith("Invalid configuration")
+    assert REDIS_PASSWORD not in message
+    assert DB_PASSWORD not in message

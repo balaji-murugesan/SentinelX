@@ -18,11 +18,13 @@ Greenfield: the repo holds only docs and OpenSpec config. Layout, tooling, impor
 
 ## Decisions
 
-**1. Settings via `pydantic-settings`, one class per service, shared base in `contracts`-independent module `engine.config` / `api.config`.**
-`contracts` must not import internal packages and `api` must not import `engine`, so a shared settings module cannot live in either. Put the small trading-mode logic in `contracts.mode` (pure, no I/O) and let each service own its own `Settings` class using it. Secrets use `SecretStr` (masked in `repr`).
+**1. Settings via `pydantic-settings`: a shared base in `contracts`, one subclass per service (`engine.config`, `api.config`).**
+`api` must not import `engine`, so shared settings logic cannot live in either. The gate is a pure function in `contracts.mode` (no I/O, no logging), and `contracts.settings` holds a small `ModeSettings` base (trading mode, live confirmation, Redis URL, log level) that `engine.config` and `api.config` extend. `contracts` imports only external libraries, so the boundary holds. Secrets use `SecretStr` (masked in `repr`). Settings classes read only real environment variables, never a `.env` file: Compose injects the environment, and local runs use `uv run --env-file .env`. That also keeps tests from ever reading a developer's real `.env`.
 *Alternative:* a fourth shared `common` package. Rejected: it adds a package outside the layout fixed by D-018.
 
-**2. Live gate is a model validator.** `trading_mode: Literal["paper","live"] = "paper"`, `live_confirm: str = ""`; validator raises when mode is `live` and confirm is not `yes`. Startup failure beats a silent downgrade, because a silent fallback to paper hides a misconfiguration in production.
+**2. The live gate is a pure function with exact matching, called from a model validator (owner-specified).** `resolve_trading_mode(trading_mode, live_confirm)` returns `PAPER` or `LIVE`, or raises `ModeConfigError`; it never falls back silently. Both variables are read as raw strings so that `Live` or `true` produce an error instead of being coerced. Rules, in order: (1) `LIVE_CONFIRM` must be `""`/unset or exactly `yes`, in every mode; (2) `TRADING_MODE` unset or `""` is paper; (3) `paper` is paper; (4) `live` is live only when `LIVE_CONFIRM` is exactly `yes`, else error; (5) any other value (including `Live`, ` live`, `prod`) is an error, with a hint when only the case differs. Startup failure beats a silent downgrade, because a silent fallback to paper hides a misconfiguration in production. A property test asserts that live is returned if and only if both values are exactly `live` and `yes`.
+Settings use `hide_input_in_errors` and `load_settings()` formats failures as `VARIABLE: reason` lines, so a failed validation never echoes supplied values. The service exits with a non-zero status.
+Decision (flagged for review): a stray `LIVE_CONFIRM=true` is rejected even when `TRADING_MODE` is `paper` or unset. The alternative is to ignore it in paper mode; rejecting is stricter, and a mistyped confirmation usually means someone meant to go live.
 
 **3. Logging with `structlog` + processors.** Order: contextvars merge → add level/timestamp (UTC ISO) → service name → OTel `trace_id` injector → masking processor → JSON renderer. Masking is key-based (token, secret, password, key, authorization) plus an `account_id`/`client_id` last-four rule. It runs last so no processor can reintroduce a raw value.
 *Alternative:* mask in the formatter only. Rejected: key-based masking on the event dict is easy to unit test.
@@ -58,6 +60,7 @@ The reason for a separate service: a failed migration must not crash-loop the en
 ## Risks / Trade-offs
 
 - **Engine consuming a ping from Redis in Stage 0 is test scaffolding** → Keep it minimal and name the streams `diagnostics` so it can be removed or kept as a diagnostics tool later. It must not touch orders, state or the broker.
+- **import-linter ignores for `engine.broker -> dhanhq` are set to `unmatched_ignore_imports_alerting = "none"` because no such import exists yet** → Stage 1 MUST switch it back to `"warn"` once `engine.broker` imports `dhanhq`; carry this as a task in the Stage 1 proposal.
 - **A failed migration blocks engine start** → Intended: the engine stays down (visible in `migrate` logs) instead of crash-looping or running against a half-migrated schema. Existing positions are still protected by exchange-side SLs (D-007). Stage 8 adds a second account inside the same engine process (D-020), not a second engine instance, so there is no migration race to guard against.
 - **Engine role cannot run DDL** → Stage 2 tables must be created only via migrations; a test that creates a table as the engine role confirms it is rejected.
 - **Heartbeat file proves loop liveness, not broker connectivity** → Acceptable now; richer health arrives with Stage 1/2.
