@@ -73,6 +73,8 @@ async def run(
 def main() -> None:
     settings = start()
     try:
+        # asyncio.run creates the event loop, runs the coroutine to completion, and closes the
+        # loop: the one place sync code enters async code (like `await Main()` in C#).
         asyncio.run(run(settings))
     except KeyboardInterrupt:
         pass

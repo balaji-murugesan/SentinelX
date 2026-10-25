@@ -32,13 +32,18 @@ TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL")
 
 pytestmark = [
     pytest.mark.integration,
-    pytest.mark.skipif(not TEST_REDIS_URL, reason="TEST_REDIS_URL not set: no real Redis to test"),
+    # Skip locally when there is no Redis; never in CI (GitHub sets CI=true), where a missing
+    # TEST_REDIS_URL must fail loudly instead of silently not testing.
+    pytest.mark.skipif(
+        not TEST_REDIS_URL and os.environ.get("CI") != "true",
+        reason="TEST_REDIS_URL not set: no real Redis to test",
+    ),
 ]
 
 
 @pytest.fixture
 async def redis() -> AsyncIterator[Redis]:
-    assert TEST_REDIS_URL
+    assert TEST_REDIS_URL, "TEST_REDIS_URL must be set (CI provides a Redis service)"
     # flushdb() below wipes the whole database, so insist on a clearly-marked test database.
     assert TEST_REDIS_URL.rstrip("/").endswith("/15"), "TEST_REDIS_URL must use database 15"
     client = Redis.from_url(TEST_REDIS_URL, decode_responses=True)
@@ -168,7 +173,7 @@ async def test_malformed_ping_does_not_kill_the_responder(redis: Redis, engine_t
 
 
 def load_settings_for_api() -> ApiSettings:
-    assert TEST_REDIS_URL
+    assert TEST_REDIS_URL, "TEST_REDIS_URL must be set (CI provides a Redis service)"
     os.environ["REDIS_URL"] = TEST_REDIS_URL
     try:
         return load_settings(ApiSettings)

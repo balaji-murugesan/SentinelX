@@ -45,6 +45,9 @@ async def heartbeat_loop(
     blocked loop means no beats, which is exactly what the health check should detect."""
     while not stop.is_set():
         write_heartbeat(path)
+        # Sleep for the interval, but wake at once if stop is set. `with` is a context manager
+        # (like C# `using`); contextlib.suppress(X) is `try { ... } catch (X) { }` in one line.
+        # `await` yields to the event loop while waiting, like C# await on a Task.
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=interval_seconds)
 

@@ -12,7 +12,7 @@ Self-hosted trading platform for Dhan: a headless Python engine that manages ord
 
 | Stage | | Status |
 |---|---|---|
-| S0 | Foundation | ⬜ Not started |
+| S0 | Foundation | 🟨 Implemented, awaiting archive (`add-foundation`) |
 | S1 | Market data | ⬜ |
 | S2 | Orders & positions | ⬜ |
 | S3 | Risk engine | ⬜ |
@@ -59,54 +59,86 @@ openspec init --tools claude
 cp .env.example .env
 ```
 
-`.env` keys (full list in `.env.example` once Stage 0 lands):
-
-| Key | Purpose |
-|---|---|
-| `TRADING_MODE` | `paper` (default) or `live` |
-| `LIVE_CONFIRM` | Must be `yes` for live mode to start |
-| `DHAN_CLIENT_ID` / `DHAN_ACCESS_TOKEN` | Broker credentials (from web.dhan.co → DhanHQ Trading APIs) |
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_ALLOWED_CHAT_IDS` | Alerts and `/kill` fallback |
-| `POSTGRES_*`, `REDIS_URL` | Local infrastructure |
-
-## Starting development (Stage 0 onward)
-
-The repo starts with only these docs. Stage 0 scaffolds everything below. In Claude Code:
-
-```
-/opsx:propose add-foundation
-```
-
-Review the generated `openspec/changes/add-foundation/` (proposal, tasks, spec deltas), approve it, then ask Claude Code to implement it.
-
-## Running locally (after Stage 0)
+Then put three different passwords into `.env` (each at least 16 characters). From Git Bash, this
+writes them without printing them:
 
 ```bash
-uv sync                               # create .venv and install dependencies
-docker compose up -d                  # redis, postgres, otel, engine, api, caddy
-docker compose logs -f engine         # follow the engine
-
-uv run pytest                         # tests
-uv run ruff check . && uv run mypy src && uv run lint-imports
-
-cd src/web && npm install && npm run dev   # dashboard (Stage 6+)
+for v in POSTGRES_PASSWORD ENGINE_DB_PASSWORD MIGRATE_DB_PASSWORD; do
+  sed -i "s/^$v=.*/$v=$(openssl rand -hex 24)/" .env
+done
 ```
 
-Outside market hours, set `MARKET_FEED=simulated` to drive the engine with a simulated tick feed.
+`.env` keys (the full, commented list is in `.env.example`):
+
+| Key | Purpose | From |
+|---|---|---|
+| `TRADING_MODE` | `paper` (default) or `live`; anything else refuses to start | S0 |
+| `LIVE_CONFIRM` | Must be exactly `yes` for live mode to start | S0 |
+| `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR` | S0 |
+| `POSTGRES_PASSWORD` | Database bootstrap superuser (initialisation only) | S0 |
+| `ENGINE_DB_PASSWORD` | Engine's database role: read/write data, no schema changes | S0 |
+| `MIGRATE_DB_PASSWORD` | Migration role: schema changes; used only by the one-shot `migrate` service | S0 |
+| `CADDY_PORT` | Optional; host port for the stack (default `8080`, always bound to 127.0.0.1) | S0 |
+| `REDIS_URL`, `DATABASE_URL`, `MIGRATE_DATABASE_URL`, `OTEL_EXPORTER_OTLP_ENDPOINT` | Only for running a service outside Docker; Compose sets its own | S0 |
+| `DHAN_CLIENT_ID` / `DHAN_ACCESS_TOKEN` | Broker credentials (from web.dhan.co → DhanHQ Trading APIs) | S1 |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_ALLOWED_CHAT_IDS` | Alerts and `/kill` fallback | S7 |
+
+The database creates its roles once, when its volume is first made. To change a password later,
+either `docker compose down -v` (deletes the database) or `ALTER ROLE` inside Postgres.
+
+## Running locally
+
+```bash
+uv sync                                      # create .venv and install dependencies
+docker compose up -d --build --wait          # start everything; returns when all are healthy
+docker compose ps -a                         # 6 services healthy, migrate "exited (0)"
+docker compose logs -f engine                # follow the engine (JSON lines)
+uv run python scripts/smoke_test.py          # end-to-end checks against the running stack
+docker compose down                          # stop (add -v to also delete the database)
+```
+
+The stack listens on `http://127.0.0.1:8080` only. In Stage 0 it serves a diagnostic round trip,
+`POST /api/diagnostics/ping` (api → Redis → engine → Redis → api), which also shows up in
+`docker compose logs otel-collector` as one trace spanning both services.
+
+Checks (the same ones CI runs, in `.github/workflows/ci.yml`):
+
+```bash
+uv run ruff format --check . && uv run ruff check . && uv run mypy src && uv run lint-imports
+uv run pytest -ra                            # Redis round-trip tests skip unless TEST_REDIS_URL is set
+openspec validate --all --strict
+```
+
+To include the Redis round-trip tests, start a throwaway Redis and point the tests at database 15
+(they wipe it):
+
+```bash
+docker run -d --rm --name sx-redis -p 127.0.0.1:6380:6379 redis:7-alpine
+TEST_REDIS_URL=redis://127.0.0.1:6380/15 uv run pytest     # Bash
+docker stop sx-redis
+```
+
+In PowerShell, set the variable with `$env:TEST_REDIS_URL = "redis://127.0.0.1:6380/15"` and
+remove it afterwards with `Remove-Item Env:TEST_REDIS_URL`.
+
+Later stages: `MARKET_FEED=simulated` drives the engine with a simulated tick feed outside market
+hours (Stage 1), and `cd src/web && npm install && npm run dev` runs the dashboard (Stage 6).
 
 ## Repository layout
 
 ```
 src/
-  contracts/   shared pydantic models
-  engine/      headless trading engine (only code that calls Dhan)
-  api/         FastAPI bridge
-  cli/         developer CLI
-  web/         React dashboard
-tests/         mirrors src/
-openspec/      specs and changes
-docs/          decisions, architecture, runbook
-docker/  infra/  scripts/
+  contracts/      shared pydantic models (messages, trading-mode gate, settings base)
+  observability/  logging, secret masking, tracing (D-024)
+  engine/         headless trading engine (only code that calls Dhan); persistence/ = migrations
+  api/            FastAPI bridge
+  cli/            developer CLI
+  web/            React dashboard (Stage 6)
+tests/            mirrors src/; integration/ needs Redis or Docker
+openspec/         specs and changes
+docs/             decisions, architecture, runbook
+docker/           Dockerfiles        infra/   postgres, caddy, otel config
+scripts/          smoke_test.py      docker-compose.yml, alembic.ini at the root
 ```
 
 ## Development workflow

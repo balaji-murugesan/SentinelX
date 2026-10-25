@@ -6,6 +6,7 @@ permanent). Needs Docker; skipped, loudly, when Docker is unavailable.
 """
 
 import asyncio
+import os
 import secrets
 import shutil
 import subprocess
@@ -41,7 +42,11 @@ def docker_available() -> bool:
 
 pytestmark = [
     pytest.mark.integration,
-    pytest.mark.skipif(not docker_available(), reason="Docker is not available"),
+    # Skip locally without Docker; never in CI (GitHub sets CI=true), where it must fail instead.
+    pytest.mark.skipif(
+        os.environ.get("CI") != "true" and not docker_available(),
+        reason="Docker is not available",
+    ),
 ]
 
 

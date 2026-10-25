@@ -32,12 +32,17 @@ class ModeSettings(BaseSettings):
     # Required (no default): a missing REDIS_URL stops the service. SecretStr masks the value
     # in repr/logs because Redis URLs can contain a password.
     redis_url: SecretStr
+    # Literal[...] restricts a str to these exact values (like a string-backed enum); anything
+    # else is a validation error at startup.
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
     # OpenTelemetry collector (OTLP/gRPC), e.g. http://otel-collector:4317. Empty = no export.
     # The name is the standard OpenTelemetry variable.
     otel_exporter_otlp_endpoint: str = ""
 
+    # Decorators (@name above a def) wrap or register the function, a little like C# attributes
+    # that also change behaviour. @field_validator registers this as the check for one field;
+    # pydantic requires it to be a @classmethod (a static-like method that receives the class).
     @field_validator("otel_exporter_otlp_endpoint")
     @classmethod
     def _otel_scheme(cls, value: str) -> str:
@@ -52,13 +57,14 @@ class ModeSettings(BaseSettings):
             raise ValueError("must start with redis:// or rediss://")
         return value
 
+    # mode="after": runs once every field has been parsed, so it can look at two fields together.
     @model_validator(mode="after")
     def _enforce_mode_gate(self) -> "ModeSettings":
         # Raises ModeConfigError (a ValueError) -> pydantic reports it as a validation error.
         resolve_trading_mode(self.trading_mode, self.live_confirm)
         return self
 
-    @property
+    @property  # a read-only computed property, like C# `public TradingMode Mode => ...;`
     def mode(self) -> TradingMode:
         """Effective trading mode. Already validated, so this cannot raise."""
         return resolve_trading_mode(self.trading_mode, self.live_confirm)

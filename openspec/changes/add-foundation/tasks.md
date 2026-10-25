@@ -35,10 +35,10 @@
 
 ## 5. CI and documentation
 
-- [ ] 5.1 Add `.github/workflows/ci.yml` running ruff format check, ruff check, mypy, lint-imports, pytest, and `openspec validate --all --strict` with `uv sync --frozen`; verify each command passes locally in the same order
-- [ ] 5.2 Add a CI job (or documented script) that runs the compose health and cross-service trace checks, and a CI Redis service with `TEST_REDIS_URL=redis://localhost:6379/15` so the integration tests run instead of skipping; verify it passes locally
-- [ ] 5.3 Create `scripts/` entry points referenced by README (for example a compose smoke-test script) and update README quick-start to match the real commands; verify each documented command runs as written
-- [ ] 5.4 Comment Python-specific idioms on first use (settings class, `Protocol` if used, async entry point, context managers) with C# analogies per CLAUDE.md; verify by review
+- [x] 5.1 Add `.github/workflows/ci.yml` running ruff format check, ruff check, mypy, lint-imports, pytest, and `openspec validate --all --strict` with `uv sync --frozen`; verify each command passes locally in the same order
+- [x] 5.2 Add a CI job (or documented script) that runs the compose health and cross-service trace checks, and a CI Redis service with `TEST_REDIS_URL=redis://localhost:6379/15` so the integration tests run instead of skipping; verify it passes locally
+- [x] 5.3 Create `scripts/` entry points referenced by README (for example a compose smoke-test script) and update README quick-start to match the real commands; verify each documented command runs as written
+- [x] 5.4 Comment Python-specific idioms on first use (settings class, `Protocol` if used, async entry point, context managers) with C# analogies per CLAUDE.md; verify by review
 
 ## 6. Integration check
 

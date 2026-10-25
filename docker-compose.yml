@@ -123,7 +123,9 @@ services:
     image: caddy:2-alpine
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8080:80"  # localhost only until TLS + Tailscale arrive in Stage 7
+      # localhost only until TLS + Tailscale arrive in Stage 7. CADDY_PORT (optional) moves it
+      # off 8080, e.g. to run a second copy of the stack for testing.
+      - "127.0.0.1:${CADDY_PORT:-8080}:80"
     volumes:
       - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data

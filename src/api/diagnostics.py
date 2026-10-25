@@ -21,6 +21,8 @@ async def ping_engine(redis: Redis, *, timeout_seconds: float = 2.0) -> float:
 
     The round trip is also recorded on the span as ``diagnostics.rtt_ms``.
     """
+    # The span is a context manager: it starts here and ends when the `with` block exits, even
+    # on an exception (like `using var activity = source.StartActivity(...)` in C#).
     with get_tracer("api.diagnostics").start_as_current_span(
         "diagnostics.ping", kind=trace.SpanKind.PRODUCER
     ) as span:
