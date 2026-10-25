@@ -8,8 +8,8 @@ from structlog.testing import capture_logs
 
 import api.main
 import engine.main
-from contracts.banner import log_startup_banner
 from contracts.mode import TradingMode, startup_banner
+from observability.banner import log_startup_banner
 
 REDIS_PASSWORD = "r3dis-pw-SECRET"
 DB_PASSWORD = "db-pw-SECRET"

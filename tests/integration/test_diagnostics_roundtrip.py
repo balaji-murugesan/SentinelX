@@ -25,8 +25,8 @@ from api.config import ApiSettings
 from api.diagnostics import EngineNotResponding, ping_engine
 from contracts.diagnostics import PING_STREAM, DiagnosticPing, pong_key
 from contracts.settings import load_settings
-from contracts.tracing import configure_tracing
 from engine.diagnostics import answer_pings
+from observability.tracing import configure_tracing
 
 TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL")
 

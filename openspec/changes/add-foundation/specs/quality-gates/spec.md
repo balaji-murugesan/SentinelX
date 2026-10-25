@@ -32,7 +32,14 @@ The `api` package SHALL NOT import the `engine` package, directly or transitivel
 The `contracts` package SHALL NOT import any other internal package.
 
 #### Scenario: Violating import
-- **WHEN** a module under `contracts` imports from `engine`, `api`, or `cli`
+- **WHEN** a module under `contracts` imports from `engine`, `api`, `cli`, or `observability`
+- **THEN** the import-boundary check fails
+
+### Requirement: Telemetry package is independent
+The `observability` package SHALL NOT import `engine`, `api`, or `cli`.
+
+#### Scenario: Violating import
+- **WHEN** a module under `observability` imports from `engine`, `api`, or `cli`
 - **THEN** the import-boundary check fails
 
 ### Requirement: Broker SDK confined to broker module

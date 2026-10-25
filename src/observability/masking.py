@@ -1,7 +1,7 @@
 """Masks secrets and account identifiers before anything is logged or exported as telemetry.
 
-Pure functions, no I/O. Used by the log pipeline (contracts.logging_setup) and the span
-exporter (contracts.tracing). CLAUDE.md safety rule 10: no secrets in code, logs, tests or
+Pure functions, no I/O. Used by the log pipeline (observability.logging_setup) and the span
+exporter (observability.tracing). CLAUDE.md safety rule 10: no secrets in code, logs, tests or
 traces; tokens and account IDs are masked.
 
 Three layers, because no single one is enough:

@@ -14,7 +14,7 @@ from redis.asyncio import Redis
 
 from api.config import ApiSettings
 from api.diagnostics import EngineNotResponding, ping_engine
-from contracts.tracing import get_provider
+from observability.tracing import get_provider
 
 
 class ProbeResult(BaseModel):

@@ -53,6 +53,15 @@ def test_clean_tree_passes(sandbox: Path) -> None:
     assert result.returncode == 0, result.stdout
 
 
+OBSERVABILITY_CONTRACT = "observability must not import engine, api or cli"
+
+
+def test_observability_may_import_contracts(sandbox: Path) -> None:
+    """Allowed direction: telemetry code can use the shared message models."""
+    add_module(sandbox, "observability/ok.py", "import contracts\n")
+    assert run_linter(sandbox).returncode == 0
+
+
 @pytest.mark.parametrize(
     ("module", "source", "contract"),
     [
@@ -73,8 +82,17 @@ def test_clean_tree_passes(sandbox: Path) -> None:
             "import cli\n",
             "contracts must not import other internal packages",
         ),
+        (
+            "contracts/bad_obs.py",
+            "import observability\n",
+            "contracts must not import other internal packages",
+        ),
+        ("observability/bad_engine.py", "import engine\n", OBSERVABILITY_CONTRACT),
+        ("observability/bad_api.py", "import api\n", OBSERVABILITY_CONTRACT),
+        ("observability/bad_cli.py", "import cli\n", OBSERVABILITY_CONTRACT),
         ("engine/bad.py", "import dhanhq\n", "only engine.broker may import dhanhq"),
         ("api/bad_dhan.py", "import dhanhq\n", "only engine.broker may import dhanhq"),
+        ("observability/bad_dhan.py", "import dhanhq\n", "only engine.broker may import dhanhq"),
     ],
 )
 def test_violation_is_rejected(sandbox: Path, module: str, source: str, contract: str) -> None:

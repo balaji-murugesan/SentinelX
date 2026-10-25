@@ -15,7 +15,7 @@ import structlog
 from opentelemetry import trace
 from structlog.typing import EventDict, Processor, WrappedLogger
 
-from contracts.masking import mask_value
+from observability.masking import mask_value
 
 
 def add_service(service: str) -> Processor:

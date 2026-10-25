@@ -22,7 +22,8 @@ flowchart LR
 
 ### Import boundaries (enforced by `import-linter` in CI)
 - `api` **must not** import `engine`.
-- `contracts` **must not** import any other internal package.
+- `contracts` **must not** import any other internal package (including `observability`).
+- `observability` **must not** import `engine`, `api` or `cli`.
 - Only `engine.broker` may import `dhanhq` or make HTTP calls to Dhan.
 
 If a task seems to need breaking one of these, stop and propose an OpenSpec change instead.
@@ -39,6 +40,7 @@ If a task seems to need breaking one of these, stop and propose an OpenSpec chan
 ```
 src/
   contracts/   shared pydantic models: commands, events, snapshots
+  observability/ shared runtime telemetry: logging, masking, tracing (D-024)
   engine/      main.py (asyncio entry), market_data/, broker/, orders/,
                positions/, risk/, exits/, bus/, persistence/, telemetry/
   api/         FastAPI app: REST commands + WebSocket stream, auth
@@ -98,7 +100,7 @@ Definition of done for any task: format, lint, mypy, import-linter, and tests al
 7. **Exit before cancel** when replacing the catastrophic SL with an exit.
 8. **Kill switch must not depend on the API, Redis consumer, or dashboard.** The Telegram `/kill` path is handled inside the engine.
 9. **Fail closed.** If risk state, config, or persistence is unavailable, reject new entries; keep managing existing exits.
-10. **No secrets in code, logs, tests, or traces.** Mask tokens and account IDs in logs.
+10. **No secrets in code, logs, tests, or traces.** Mask tokens and account IDs in logs. Never log broker request or response bodies; log selected fields only.
 11. **No tests call the real Dhan API.** Use `PaperBroker`, `SimulatedFeed`, and recorded fixtures.
 12. Respect Dhan limits (PRD §10) via the central rate limiter; exits get priority.
 

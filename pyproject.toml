@@ -37,7 +37,7 @@ build-backend = "hatchling.build"
 
 # Four top-level packages under src/ (D-018) instead of one namespaced package.
 [tool.hatch.build.targets.wheel]
-packages = ["src/contracts", "src/engine", "src/api", "src/cli"]
+packages = ["src/contracts", "src/observability", "src/engine", "src/api", "src/cli"]
 
 [tool.ruff]
 line-length = 100
@@ -52,7 +52,7 @@ select = ["E", "F", "I", "B", "UP", "ASYNC"]
 strict = true
 python_version = "3.12"
 mypy_path = "src"
-packages = ["contracts", "engine", "api", "cli"]
+packages = ["contracts", "observability", "engine", "api", "cli"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -63,7 +63,7 @@ markers = ["integration: needs real external services (Redis); set TEST_REDIS_UR
 
 # Architectural boundaries (CLAUDE.md "Import boundaries"). Run with `uv run lint-imports`.
 [tool.importlinter]
-root_packages = ["contracts", "engine", "api", "cli"]
+root_packages = ["contracts", "observability", "engine", "api", "cli"]
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
@@ -76,12 +76,18 @@ forbidden_modules = ["engine"]
 name = "contracts must not import other internal packages"
 type = "forbidden"
 source_modules = ["contracts"]
+forbidden_modules = ["engine", "api", "cli", "observability"]
+
+[[tool.importlinter.contracts]]
+name = "observability must not import engine, api or cli"
+type = "forbidden"
+source_modules = ["observability"]
 forbidden_modules = ["engine", "api", "cli"]
 
 [[tool.importlinter.contracts]]
 name = "only engine.broker may import dhanhq"
 type = "forbidden"
-source_modules = ["engine", "api", "cli", "contracts"]
+source_modules = ["engine", "api", "cli", "contracts", "observability"]
 forbidden_modules = ["dhanhq"]
 unmatched_ignore_imports_alerting = "none"  # no dhanhq import exists until Stage 1
 ignore_imports = [

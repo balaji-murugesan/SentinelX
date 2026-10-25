@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 import structlog
 
-from contracts.tracing import shutdown_tracing
+from observability.tracing import shutdown_tracing
 
 BLOCKED_SUFFIX = "dhan.co"
 

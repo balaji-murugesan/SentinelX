@@ -31,6 +31,7 @@ Architecture decisions from the design discussions (Sep–Oct 2026), kept as ref
 | D-021 | Telegram `/kill` and alerts handled inside the engine | Proposed |
 | D-022 | Both algo accounts on Dhan; Zerodha stays manual (no integration) | Accepted |
 | D-023 | Market data separated from execution (`MarketDataProvider` vs `BrokerAdapter`) | Accepted |
+| D-024 | Shared runtime telemetry lives in `observability`; `contracts` stays pure models | Accepted |
 
 ---
 
@@ -164,3 +165,10 @@ Architecture decisions from the design discussions (Sep–Oct 2026), kept as ref
 **Context:** Prices are exchange prices, independent of broker, so one feed can serve positions at any broker.
 **Decision:** `MarketDataProvider` (ticks, instrument master) is a separate interface from `BrokerAdapter` (orders, positions), with a common instrument key (exchange + segment + exchange token). Both are implemented by Dhan today.
 **Why now:** cheap at Stage 1; keeps a second broker or the Rust execution engine swappable later without touching market data.
+
+## D-024 — Shared telemetry in `observability`, `contracts` stays pure
+**Status:** Accepted (2026-10-25)
+**Context:** Engine and api both need structured logging, secret masking and tracing setup. `api` must not import `engine`, so the shared code needs a neutral home. Putting it in `contracts` would turn a package of pure message models into a grab bag.
+**Decision:** Shared runtime telemetry (logging setup, masking, tracing, the startup banner) lives in a new top-level package `src/observability/`. `contracts` keeps only messages and shared types (including `DiagnosticPing` / `DiagnosticPong`). Import rules, enforced by `import-linter`: `observability` must not import `engine`, `api` or `cli`; `contracts` must not import `observability` (or any other internal package). Extends the layout in D-018.
+**Alternatives:** keep it in `contracts` (blurs its purpose); duplicate it in `engine` and `api` (two masking implementations that can drift, which is a security risk).
+**Revisit when:** a third kind of shared runtime code appears that is not telemetry; then consider a more general shared package.

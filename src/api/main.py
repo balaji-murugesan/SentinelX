@@ -2,10 +2,10 @@
 announces its mode."""
 
 from api.config import ApiSettings
-from contracts.banner import log_startup_banner
-from contracts.logging_setup import configure_logging
 from contracts.settings import SettingsError, load_settings
-from contracts.tracing import configure_tracing
+from observability.banner import log_startup_banner
+from observability.logging_setup import configure_logging
+from observability.tracing import configure_tracing
 
 
 def main() -> None:

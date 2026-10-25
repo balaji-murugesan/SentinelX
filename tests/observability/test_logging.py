@@ -8,7 +8,7 @@ import pytest
 import structlog
 from opentelemetry.sdk.trace import TracerProvider
 
-from contracts.logging_setup import configure_logging
+from observability.logging_setup import configure_logging
 
 
 def read_lines(capsys: pytest.CaptureFixture[str]) -> list[dict[str, Any]]:

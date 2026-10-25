@@ -16,7 +16,7 @@ from contracts.diagnostics import (
     DiagnosticPong,
     pong_key,
 )
-from contracts.tracing import get_tracer
+from observability.tracing import get_tracer
 
 log = structlog.get_logger("engine.diagnostics")
 

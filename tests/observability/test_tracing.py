@@ -11,8 +11,8 @@ from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from structlog.testing import capture_logs
 
-from contracts.logging_setup import configure_logging
-from contracts.tracing import (
+from observability.logging_setup import configure_logging
+from observability.tracing import (
     SafeSpanExporter,
     configure_tracing,
     get_tracer,
@@ -136,7 +136,7 @@ def test_unreachable_collector_does_not_block_and_warns() -> None:
             pass
         elapsed_in_app = time.monotonic() - started
         # The export itself fails on the background thread; wait for it, then check the log.
-        from contracts.tracing import get_provider
+        from observability.tracing import get_provider
 
         provider = get_provider()
         assert provider is not None

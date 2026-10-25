@@ -6,7 +6,7 @@ One test case per configured key name, so removing a key from the list fails a t
 import pytest
 from pydantic import SecretStr
 
-from contracts.masking import MASK, mask_account, mask_value, scrub_text
+from observability.masking import MASK, mask_account, mask_value, scrub_text
 
 SECRET_VALUE = "s3cr3t-VALUE-123"
 

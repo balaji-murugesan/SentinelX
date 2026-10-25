@@ -98,7 +98,8 @@ flowchart LR
 
 ### 4.2 Hard boundaries (enforced in CI by `import-linter`)
 - `api` never imports `engine`.
-- `contracts` imports nothing internal.
+- `contracts` imports nothing internal and holds only messages and shared types.
+- `observability` (shared logging, masking, tracing) never imports `engine`, `api` or `cli`; `contracts` never imports it (D-024).
 - Only `engine.broker` imports the `dhanhq` SDK or calls Dhan.
 - Market data (`MarketDataProvider`) is a separate interface from execution (`BrokerAdapter`), even though both are Dhan today (D-023).
 
@@ -363,7 +364,7 @@ Each stage is one or more OpenSpec changes (`openspec/changes/<id>/`). A stage i
 - **Accept:** scripted price paths produce expected exits (property-based tests); trail level survives restart.
 
 ### S5 — API bridge · `add-api-bridge`
-- **Scope:** FastAPI REST commands + WebSocket stream (§6.4), auth, OpenAPI → TypeScript type generation.
+- **Scope:** FastAPI REST commands + WebSocket stream (§6.4), auth, OpenAPI → TypeScript type generation. Put the Stage 0 diagnostic `POST /diagnostics/ping` behind auth.
 - **Accept:** commands round-trip with idempotency; killing the api container has zero effect on the engine.
 
 ### S6 — Dashboard · `add-dashboard` (⚠ ASSUMPTION: stays at S6; CLI used before this)

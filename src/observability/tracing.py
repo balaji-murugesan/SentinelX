@@ -30,7 +30,7 @@ from opentelemetry.sdk.trace.export import (
     SpanExportResult,
 )
 
-from contracts.masking import mask_value
+from observability.masking import mask_value
 
 _provider: TracerProvider | None = None
 

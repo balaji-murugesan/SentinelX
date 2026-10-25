@@ -9,7 +9,7 @@ from opentelemetry import propagate, trace
 from redis.asyncio import Redis
 
 from contracts.diagnostics import PING_STREAM, DiagnosticPing, DiagnosticPong, pong_key
-from contracts.tracing import get_tracer
+from observability.tracing import get_tracer
 
 
 class EngineNotResponding(Exception):
