@@ -42,7 +42,7 @@
 
 ## 6. Integration check
 
-- [ ] 6.1 Run the full definition of done on a clean checkout: `uv sync`, ruff format, ruff check, mypy, lint-imports, pytest, `openspec validate add-foundation --strict`, then `docker compose up -d` all healthy with one trace across api and engine
+- [x] 6.1 Run the full definition of done on a clean checkout: `uv sync`, ruff format, ruff check, mypy, lint-imports, pytest, `openspec validate add-foundation --strict`, then `docker compose up -d` all healthy with one trace across api and engine
 
 ## Workflow follow-up
 
