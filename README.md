@@ -12,7 +12,7 @@ Self-hosted trading platform for Dhan: a headless Python engine that manages ord
 
 | Stage | | Status |
 |---|---|---|
-| S0 | Foundation | 🟨 Implemented, awaiting archive (`add-foundation`) |
+| S0 | Foundation | ✅ Done (`add-foundation`, archived 2026-10-25) |
 | S1 | Market data | ⬜ |
 | S2 | Orders & positions | ⬜ |
 | S3 | Risk engine | ⬜ |
