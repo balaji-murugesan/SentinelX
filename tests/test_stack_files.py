@@ -17,6 +17,11 @@ LONG_RUNNING = {"postgres", "redis", "otel-collector", "engine", "api", "caddy"}
 SECRET_NAME = re.compile(r"PASSWORD|SECRET|TOKEN|API_KEY|PRIVATE_KEY", re.IGNORECASE)
 # ${VAR:?message}: required variable, no default value
 REQUIRED_REF = re.compile(r"\$\{[A-Z_]+:\?[^}]+\}")
+# Secrets that may legitimately be empty (DHAN_ACCESS_TOKEN with FEED_SOURCE=simulated). They
+# may only use an EMPTY default, never a literal; the engine's settings still require the
+# token whenever FEED_SOURCE=dhan. Owner-approved allow-list (add-market-data).
+OPTIONAL_SECRETS = frozenset({"DHAN_ACCESS_TOKEN"})
+OPTIONAL_REF = re.compile(r"\$\{[A-Z_]+:-\}")
 
 
 @pytest.fixture(scope="module")
@@ -141,7 +146,11 @@ def test_compose_secrets_are_required_references_not_literals(
 ) -> None:
     for name, service in services.items():
         for key, value in env_of(service).items():
-            if SECRET_NAME.search(key):
+            if key in OPTIONAL_SECRETS:
+                assert OPTIONAL_REF.fullmatch(value), (
+                    f"{name}.{key} must be a ${{VAR:-}} reference with an empty default"
+                )
+            elif SECRET_NAME.search(key):
                 assert REQUIRED_REF.fullmatch(value), (
                     f"{name}.{key} must be a ${{VAR:?...}} reference"
                 )

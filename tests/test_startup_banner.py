@@ -21,6 +21,10 @@ def set_env(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None:
     values = {
         "REDIS_URL": f"redis://:{REDIS_PASSWORD}@redis:6379/0",
         "DATABASE_URL": f"postgresql+asyncpg://u:{DB_PASSWORD}@postgres:5432/x",
+        # Dhan feed (not simulated) so the live-mode tests are a valid engine configuration.
+        "FEED_SOURCE": "dhan",
+        "DHAN_CLIENT_ID": "1100223344",
+        "DHAN_ACCESS_TOKEN": "test-access-token",
         **overrides,
     }
     for name, value in values.items():

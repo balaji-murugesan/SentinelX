@@ -21,7 +21,12 @@ BOTH = pytest.mark.parametrize("settings_cls", [EngineSettings, ApiSettings])
 
 
 def set_valid_env(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None:
-    values = {"REDIS_URL": REDIS_URL, "DATABASE_URL": DATABASE_URL, **overrides}
+    values = {
+        "REDIS_URL": REDIS_URL,
+        "DATABASE_URL": DATABASE_URL,
+        "FEED_SOURCE": "simulated",
+        **overrides,
+    }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
 
@@ -138,7 +143,15 @@ def test_unset_or_empty_trading_mode_is_paper(
 def test_live_with_confirmation(
     monkeypatch: pytest.MonkeyPatch, settings_cls: type[ModeSettings]
 ) -> None:
-    set_valid_env(monkeypatch, TRADING_MODE="live", LIVE_CONFIRM="yes")
+    # The engine refuses the simulated feed in live mode, so use the Dhan feed here.
+    set_valid_env(
+        monkeypatch,
+        TRADING_MODE="live",
+        LIVE_CONFIRM="yes",
+        FEED_SOURCE="dhan",
+        DHAN_CLIENT_ID="1100223344",
+        DHAN_ACCESS_TOKEN="test-access-token",
+    )
     assert load_settings(settings_cls).mode is TradingMode.LIVE
 
 

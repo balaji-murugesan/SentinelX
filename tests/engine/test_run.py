@@ -39,6 +39,7 @@ def make_settings(monkeypatch: pytest.MonkeyPatch, heartbeat: Path) -> EngineSet
     monkeypatch.setenv("REDIS_URL", "redis://redis:6379/0")
     monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@postgres:5432/x")
     monkeypatch.setenv("ENGINE_HEARTBEAT_PATH", str(heartbeat))
+    monkeypatch.setenv("FEED_SOURCE", "simulated")
     return load_settings(EngineSettings)
 
 

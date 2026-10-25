@@ -79,6 +79,12 @@ services:
       # Engine role: data read/write only.
       DATABASE_URL: postgresql+asyncpg://sentinelx_engine:${ENGINE_DB_PASSWORD:?set ENGINE_DB_PASSWORD in .env}@postgres:5432/sentinelx
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      # Market data. FEED_SOURCE has no default on purpose (dhan | simulated).
+      FEED_SOURCE: ${FEED_SOURCE:?set FEED_SOURCE in .env}
+      FEED_INSTRUMENTS: ${FEED_INSTRUMENTS:-}
+      FEED_MAX_SUBSCRIPTIONS: ${FEED_MAX_SUBSCRIPTIONS:-200}
+      DHAN_CLIENT_ID: ${DHAN_CLIENT_ID:-}
+      DHAN_ACCESS_TOKEN: ${DHAN_ACCESS_TOKEN:-}
     depends_on:
       redis:
         condition: service_healthy
