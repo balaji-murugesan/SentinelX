@@ -1,0 +1,89 @@
+[project]
+name = "sentinelx"
+version = "0.1.0"
+description = "Self-hosted trading platform for Dhan: headless engine, FastAPI bridge, React dashboard."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "structlog>=24.4",
+    "fastapi>=0.115",
+    "uvicorn>=0.32",
+    "redis>=5.2",
+    "httpx>=0.27",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30",
+    "alembic>=1.14",
+    "opentelemetry-api>=1.28",
+    "opentelemetry-sdk>=1.28",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.28",
+    "opentelemetry-instrumentation-fastapi>=0.49b0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "hypothesis>=6.120",
+    "import-linter>=2.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Four top-level packages under src/ (D-018) instead of one namespaced package.
+[tool.hatch.build.targets.wheel]
+packages = ["src/contracts", "src/engine", "src/api", "src/cli"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# E/F: pycodestyle + pyflakes, I: import sorting, B: bugbear, UP: modern syntax, ASYNC: blocking calls in async code
+select = ["E", "F", "I", "B", "UP", "ASYNC"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+mypy_path = "src"
+packages = ["contracts", "engine", "api", "cli"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# "auto" lets `async def test_...` run without a per-test marker.
+asyncio_mode = "auto"
+pythonpath = ["src", "."]
+
+# Architectural boundaries (CLAUDE.md "Import boundaries"). Run with `uv run lint-imports`.
+[tool.importlinter]
+root_packages = ["contracts", "engine", "api", "cli"]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "api must not import engine"
+type = "forbidden"
+source_modules = ["api"]
+forbidden_modules = ["engine"]
+
+[[tool.importlinter.contracts]]
+name = "contracts must not import other internal packages"
+type = "forbidden"
+source_modules = ["contracts"]
+forbidden_modules = ["engine", "api", "cli"]
+
+[[tool.importlinter.contracts]]
+name = "only engine.broker may import dhanhq"
+type = "forbidden"
+source_modules = ["engine", "api", "cli", "contracts"]
+forbidden_modules = ["dhanhq"]
+unmatched_ignore_imports_alerting = "none"  # no dhanhq import exists until Stage 1
+ignore_imports = [
+    "engine.broker -> dhanhq",
+    "engine.broker.** -> dhanhq",
+]

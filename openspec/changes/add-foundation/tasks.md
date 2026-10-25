@@ -2,11 +2,11 @@
 
 ## 1. Project scaffold and tooling
 
-- [ ] 1.1 Create `.python-version` (`3.12`) and `pyproject.toml` (`requires-python = ">=3.12"`, uv) with runtime and dev dependencies, plus the `src/{contracts,engine,api,cli}` and `tests/` package skeleton including an empty `engine/broker` package; verify `uv run python --version` prints 3.12.x, `uv sync` succeeds, and `uv run python -c "import contracts, engine, api, cli"` exits 0
-- [ ] 1.2 Configure ruff, mypy (`strict`), pytest (`asyncio_mode`) in `pyproject.toml`, add `.gitignore` (`.env`, `.venv`) and `.gitattributes` (LF for shell/Docker files); verify `uv run ruff format --check .`, `uv run ruff check .`, `uv run mypy src`, and `uv run pytest` all pass on the skeleton
-- [ ] 1.3 Add import-linter contracts (api ↛ engine, contracts ↛ internal packages, `dhanhq` only inside `engine.broker`); verify `uv run lint-imports` passes
-- [ ] 1.4 Add tests that create a temporary violating module for each contract and assert `lint-imports` fails; verify the tests pass
-- [ ] 1.5 Add a pytest autouse fixture that fails any socket connection to `*.dhan.co`, with a test proving it; verify the test passes
+- [x] 1.1 Create `.python-version` (`3.12`) and `pyproject.toml` (`requires-python = ">=3.12"`, uv) with runtime and dev dependencies, plus the `src/{contracts,engine,api,cli}` and `tests/` package skeleton including an empty `engine/broker` package; verify `uv run python --version` prints 3.12.x, `uv sync` succeeds, and `uv run python -c "import contracts, engine, api, cli"` exits 0
+- [x] 1.2 Configure ruff, mypy (`strict`), pytest (`asyncio_mode`) in `pyproject.toml`, add `.gitignore` (`.env`, `.venv`) and `.gitattributes` (LF for shell/Docker files); verify `uv run ruff format --check .`, `uv run ruff check .`, `uv run mypy src`, and `uv run pytest` all pass on the skeleton
+- [x] 1.3 Add import-linter contracts (api ↛ engine, contracts ↛ internal packages, `dhanhq` only inside `engine.broker`); verify `uv run lint-imports` passes
+- [x] 1.4 Add tests that create a temporary violating module for each contract and assert `lint-imports` fails; verify the tests pass
+- [x] 1.5 Add a pytest autouse fixture that fails any socket connection to `*.dhan.co`, with a test proving it; verify the test passes
 
 ## 2. Runtime configuration
 
