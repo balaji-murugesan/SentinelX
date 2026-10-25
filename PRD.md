@@ -197,6 +197,7 @@ sequenceDiagram
 ```
 
 - The trailing level lives **only in the engine** — no per-tick order modification at Dhan (D-006).
+- **How** the level moves is a selectable method (ATR Chandelier, N-candle low, Supertrend, step trail, Parabolic SAR, EMA close, fixed %, …), chosen per trade with a configured default (D-025). Catalogue and decision guide: [`docs/trailing-sl.md`](docs/trailing-sl.md). Every method only ever tightens the stop.
 - **Exit before cancel:** placing the exit first keeps the position protected during the ~150–300 ms of two broker calls (D-007).
 
 ### 6.3 Kill switch
@@ -279,7 +280,7 @@ All limits are configuration, stored in Postgres, editable from the dashboard. V
 ## 8. Dashboard requirements
 
 - **Positions table:** instrument, qty, avg price, LTP, MTM P&L, trail level, distance to trail — updated live (≤ 1 s staleness).
-- **Trade panel:** instrument search, Buy/Sell, SL distance, computed qty and ₹ risk shown before submit; button disabled while pending; unique idempotency key per click.
+- **Trade panel:** instrument search, Buy/Sell, SL distance, trailing method (pre-filled with the configured default, changeable per trade, with its parameters), computed qty and ₹ risk shown before submit; button disabled while pending; unique idempotency key per click.
 - **Order feedback:** Pending → Placed → Filled / Rejected (with Dhan's reason).
 - **Kill switch:** hold-to-confirm (~1 s), always visible.
 - **Risk status:** today's P&L vs daily limit, trades used, cooldown timer, HALTED banner.
@@ -348,7 +349,7 @@ Each stage is one or more OpenSpec changes (`openspec/changes/<id>/`). A stage i
 - **Accept:** `docker compose up` → all services healthy; one trace visible across engine and api; CI green on an empty skeleton.
 
 ### S1 — Market data · `add-market-data`
-- **Scope:** Dhan auth/token handling, instrument master download + lookup (security ID, lot size, tick size, freeze qty), live feed client with auto-reconnect, `SimulatedFeed` for after-hours dev, internal tick bus.
+- **Scope:** Dhan auth/token handling, instrument master download + lookup (security ID, lot size, tick size, freeze qty), live feed client with auto-reconnect, `SimulatedFeed` for after-hours dev, internal tick bus. Candle builder (ticks → 1m/5m/15m candles, completed candles only) and recent historical candles to warm up indicators, needed by the candle-based trailing methods (D-025).
 - **Accept:** ticks for configured instruments reach engine consumers; forced disconnect recovers automatically; simulated feed drives the same code path.
 
 ### S2 — Orders & positions · `add-order-position-core`
@@ -360,8 +361,8 @@ Each stage is one or more OpenSpec changes (`openspec/changes/<id>/`). A stage i
 - **Accept:** a unit test per rule; kill switch flattens all and blocks entries; fail-closed verified with Postgres down.
 
 ### S4 — Trailing SL & exits · `add-trailing-exits`
-- **Scope:** trailing rules (configurable: points / % / ATR-based later), exit manager with exit-before-cancel, persisted trail state.
-- **Accept:** scripted price paths produce expected exits (property-based tests); trail level survives restart.
+- **Scope:** pluggable trailing-SL methods per [`docs/trailing-sl.md`](docs/trailing-sl.md) (D-025): ATR Chandelier, N-candle lowest low, Supertrend, step trail, Parabolic SAR, Nth-candle-back low, EMA close trail, fixed % / points; long and short; configured default plus per-trade choice (CLI until S6); exit manager with exit-before-cancel; persisted trail state including each method's internal state.
+- **Accept:** scripted price paths produce the expected exits for every method, long and short (property-based tests: the stop never loosens and never starts looser than the initial SL); trail level and method state survive restart.
 
 ### S5 — API bridge · `add-api-bridge`
 - **Scope:** FastAPI REST commands + WebSocket stream (§6.4), auth, OpenAPI → TypeScript type generation. Put the Stage 0 diagnostic `POST /diagnostics/ping` behind auth.

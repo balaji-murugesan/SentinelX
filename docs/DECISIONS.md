@@ -32,6 +32,7 @@ Architecture decisions from the design discussions (Sep–Oct 2026), kept as ref
 | D-022 | Both algo accounts on Dhan; Zerodha stays manual (no integration) | Accepted |
 | D-023 | Market data separated from execution (`MarketDataProvider` vs `BrokerAdapter`) | Accepted |
 | D-024 | Shared runtime telemetry lives in `observability`; `contracts` stays pure models | Accepted |
+| D-025 | Trailing SL is a pluggable method chosen per trade, with a configured default | Proposed |
 
 ---
 
@@ -172,3 +173,11 @@ Architecture decisions from the design discussions (Sep–Oct 2026), kept as ref
 **Decision:** Shared runtime telemetry (logging setup, masking, tracing, the startup banner) lives in a new top-level package `src/observability/`. `contracts` keeps only messages and shared types (including `DiagnosticPing` / `DiagnosticPong`). Import rules, enforced by `import-linter`: `observability` must not import `engine`, `api` or `cli`; `contracts` must not import `observability` (or any other internal package). Extends the layout in D-018.
 **Alternatives:** keep it in `contracts` (blurs its purpose); duplicate it in `engine` and `api` (two masking implementations that can drift, which is a security risk).
 **Revisit when:** a third kind of shared runtime code appears that is not telemetry; then consider a more general shared package.
+
+## D-025 — Pluggable trailing-SL method, chosen per trade
+**Status:** Proposed (2026-10-25); to be confirmed in the Stage 4 change `add-trailing-exits`.
+**Context:** No single trailing method suits every situation: a steady trend wants a wide, volatility-based stop (ATR Chandelier, Supertrend), a quick intraday move wants a tight one (5-candle low, Parabolic SAR), a small target wants breakeven early (step trail). The PRD only planned "points / % / ATR-based later". The owner's catalogue and decision guide are in [`trailing-sl.md`](trailing-sl.md).
+**Decision:** The trailing SL is a pluggable method behind one interface, with eight methods planned: ATR Chandelier, N-candle lowest low, Supertrend, step trail, Parabolic SAR, Nth-candle-back low, EMA close trail, fixed % / fixed points. A default method and parameters are configuration (stored and edited like risk limits); the trader may pick another method and its parameters per trade at entry (developer CLI until the Stage 6 trade panel); strategies (Stage 9+) send their own. Every method obeys the same rules: tighten only; never looser than the initial stop used for position sizing; the trail stays in the engine with no per-tick broker changes (D-006); exit before cancel (D-007); method, parameters, level and internal state are persisted. Changing the method on an open position is allowed only if the new stop is at least as tight. The engine never chooses a method by itself.
+**Consequence:** seven of the eight methods need candles and indicators (ATR, EMA), so Stage 1 market data must build candles from ticks and load recent history to warm indicators up at entry.
+**Alternatives:** one global method (cannot match the method to the situation); free-form per-strategy code for trailing (untestable, and bypasses the shared tighten-only and restart rules).
+**Revisit when:** backtests show some methods add nothing for NSE F&O intraday; drop them rather than carry untested options. The scores in `trailing-sl.md` are hypotheses until then.
