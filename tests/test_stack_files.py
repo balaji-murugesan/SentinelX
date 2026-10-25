@@ -248,11 +248,6 @@ def test_env_example_holds_placeholders_only() -> None:
             assert ":change-me@" in value, f"{name} must use the 'change-me' placeholder"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="waiting for the owner to apply the .env.example update (file tools are denied for "
-    "that path); remove this marker once POSTGRES/ENGINE/MIGRATE_DB_PASSWORD are documented",
-)
 def test_env_example_documents_every_compose_secret() -> None:
     names = example_values()
     for required in ("POSTGRES_PASSWORD", "ENGINE_DB_PASSWORD", "MIGRATE_DB_PASSWORD"):
