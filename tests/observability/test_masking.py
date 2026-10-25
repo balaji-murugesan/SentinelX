@@ -6,7 +6,14 @@ One test case per configured key name, so removing a key from the list fails a t
 import pytest
 from pydantic import SecretStr
 
-from observability.masking import MASK, mask_account, mask_value, scrub_text
+from observability.masking import (
+    MASK,
+    SAFE_FIELD_NAMES,
+    mask_account,
+    mask_value,
+    scrub_text,
+    validate_safe_field_names,
+)
 
 SECRET_VALUE = "s3cr3t-VALUE-123"
 
@@ -158,3 +165,69 @@ def test_plain_text_is_unchanged() -> None:
     text = "order 42 filled at 101.25, tokens of affection (no secret here)"
     # 'tokens of' has no '=' or ':' pair, so nothing should match.
     assert scrub_text(text) == text
+
+
+# ---- allowlist of safe field names ----------------------------------------------------
+
+
+@pytest.mark.parametrize("name", sorted(SAFE_FIELD_NAMES))
+def test_allowlisted_names_are_not_masked(name: str) -> None:
+    assert mask_value(42, name) == 42
+    assert mask_value("2026-10-25T10:00:00Z", name.upper()) == "2026-10-25T10:00:00Z"
+
+
+def test_allowlist_names_are_the_expected_ones() -> None:
+    # Adding a name is a deliberate, reviewed act: this test makes the diff visible.
+    assert SAFE_FIELD_NAMES == {"token_count", "token_expires_at"}
+
+
+def test_allowlisted_name_still_has_secret_looking_content_scrubbed() -> None:
+    assert "hunter2" not in mask_value("password=hunter2", "token_count")
+
+
+def test_near_misses_of_allowlisted_names_are_still_masked() -> None:
+    assert mask_value("x", "token_count_secret") == MASK
+    assert mask_value("x", "access_token") == MASK
+    assert mask_value("x", "token-count") == MASK  # only exact names are safe
+
+
+def test_shipped_allowlist_passes_validation() -> None:
+    validate_safe_field_names(SAFE_FIELD_NAMES)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "token",
+        "access_token",
+        "refresh_token",
+        "secret",
+        "client_secret",
+        "password",
+        "db_password",
+        "api_key",
+        "apikey",
+        "private_key",
+        "authorization",
+        "credentials",
+        "cookie",
+        "dsn",
+        "connection_string",
+        "token_secret",
+        "token_count_password",
+        "Token_Count",
+        "token-count",
+        "token count",
+        "",
+    ],
+)
+def test_allowlist_cannot_contain_secret_looking_names(bad: str) -> None:
+    with pytest.raises(ValueError):
+        validate_safe_field_names(frozenset({"token_count", bad}))
+
+
+def test_every_name_the_masker_would_treat_as_secret_is_rejected_from_the_allowlist() -> None:
+    """Any SECRET_KEYS entry that is not already harmless can never be allowlisted."""
+    for key in SECRET_KEYS:
+        with pytest.raises(ValueError):
+            validate_safe_field_names(frozenset({key.lower().replace("-", "_")}))

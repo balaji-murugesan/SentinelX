@@ -5,7 +5,8 @@ exporter (observability.tracing). CLAUDE.md safety rule 10: no secrets in code, 
 traces; tokens and account IDs are masked.
 
 Three layers, because no single one is enough:
-  1. By key name   - a field called ``access_token`` is masked whatever its value looks like.
+  1. By key name   - a field called ``access_token`` is masked whatever its value looks like
+                     (except the few names in SAFE_FIELD_NAMES, such as ``token_count``).
   2. By type       - pydantic ``SecretStr`` values are masked.
   3. By content    - free text and non-secret keys are scrubbed for URLs with passwords,
                      ``Bearer ...`` headers, JWTs (Dhan access tokens are JWTs) and
@@ -30,6 +31,44 @@ _SECRET_KEY = re.compile(
     re.IGNORECASE,
 )
 
+# Field names that merely *contain* a secret-looking word but hold harmless values, for example
+# a count or an expiry time. Exact, lower-case names only; this is the sole way to opt a name
+# out of key-based masking, and it is validated below so it cannot hide a real secret.
+# token_expires_at: PRD 9.2 requires alerting ahead of access-token expiry.
+SAFE_FIELD_NAMES: frozenset[str] = frozenset({"token_count", "token_expires_at"})
+
+# A safe name may mention "token" but nothing else from the secret vocabulary, and it may not
+# END in a secret word ("access_token" is never safe, "token_count" can be).
+_ALWAYS_SECRET_WORDS = (
+    "secret",
+    "password",
+    "passwd",
+    "authorization",
+    "api_key",
+    "apikey",
+    "access_key",
+    "private_key",
+    "credential",
+    "cookie",
+    "dsn",
+    "connection_string",
+)
+_SECRET_ENDINGS = ("token", "tokens", "key", "keys", "secret", "password", "cookie")
+
+
+def validate_safe_field_names(names: frozenset[str]) -> None:
+    """Raise ValueError if ``names`` contains anything that could be a real secret."""
+    for name in names:
+        if not re.fullmatch(r"[a-z0-9]+(_[a-z0-9]+)*", name):
+            raise ValueError(f"safe field name {name!r} must be lower_snake_case")
+        if any(word in name for word in _ALWAYS_SECRET_WORDS):
+            raise ValueError(f"safe field name {name!r} contains a secret word")
+        if name.endswith(_SECRET_ENDINGS):  # also catches camelCase such as "accesstoken"
+            raise ValueError(f"safe field name {name!r} ends in a secret word")
+
+
+validate_safe_field_names(SAFE_FIELD_NAMES)  # fail at import, not at the first leaked log line
+
 # account_id, client_id, client_code and prefixed forms such as dhan_client_id.
 _ACCOUNT_KEY = re.compile(r"(^|_)(account|client)_(id|code)$", re.IGNORECASE)
 
@@ -46,7 +85,10 @@ _MAX_DEPTH = 8
 
 
 def is_secret_key(key: object) -> bool:
-    return bool(_SECRET_KEY.search(str(key)))
+    name = str(key)
+    if name.lower() in SAFE_FIELD_NAMES:
+        return False
+    return bool(_SECRET_KEY.search(name))
 
 
 def is_account_key(key: object) -> bool:
