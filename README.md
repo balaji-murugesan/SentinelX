@@ -10,19 +10,21 @@ Self-hosted trading platform for Dhan: a headless Python engine that manages ord
 
 ## Status
 
-| Stage | | Status |
-|---|---|---|
-| S0 | Foundation | ✅ Done (`add-foundation`, archived 2026-10-25) |
-| S1 | Market data | ⬜ |
-| S2 | Orders & positions | ⬜ |
-| S3 | Risk engine | ⬜ |
-| S4 | Trailing SL & exits | ⬜ |
-| S5 | API bridge | ⬜ |
-| S6 | Dashboard | ⬜ |
-| S7 | Go-live hardening | ⬜ |
-| S8 | Multi-account | ⬜ |
-| S9 | Semi-auto | ⬜ |
-| S10 | Full auto | ⬜ |
+What each stage builds and its acceptance criteria: [`PRD.md` §11](PRD.md#11-delivery-stages).
+
+| Stage | | OpenSpec change | Status |
+|---|---|---|---|
+| S0 | Foundation | `add-foundation` | ✅ Done (archived 2026-10-25) |
+| S1 | Market data | `add-market-data` | ⬜ Next |
+| S2 | Orders & positions | `add-order-position-core` | ⬜ |
+| S3 | Risk engine | `add-risk-engine` | ⬜ |
+| S4 | Trailing SL & exits | `add-trailing-exits` | ⬜ |
+| S5 | API bridge | `add-api-bridge` | ⬜ |
+| S6 | Dashboard | `add-dashboard` | ⬜ |
+| S7 | Go-live hardening | `add-live-trading` | ⬜ |
+| S8 | Multi-account | `add-multi-account` | ⬜ |
+| S9 | Semi-auto | `add-semi-auto-signals` | ⬜ |
+| S10 | Full auto | `add-full-auto` | ⬜ |
 
 ## Prerequisites
 

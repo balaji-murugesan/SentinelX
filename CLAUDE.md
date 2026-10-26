@@ -56,7 +56,7 @@ scripts/       gen-types.sh, db reset, seed instruments
 
 ## Workflow: OpenSpec, stage by stage
 
-1. **No implementation without an approved change.** Work maps to a stage in `PRD.md` §11. Create the change with the OpenSpec slash command (e.g. `/opsx:propose <change-id>`), producing `proposal.md`, `tasks.md`, optional `design.md`, and spec deltas.
+1. **No implementation without an approved change.** Work maps to a stage in `PRD.md` §11 (its "Stage overview" table lists each stage's change id, scope and acceptance; the README Status table shows progress). Use that change id. Create the change with the OpenSpec slash command (e.g. `/opsx:propose <change-id>`), producing `proposal.md`, `tasks.md`, optional `design.md`, and spec deltas.
 2. Spec deltas use `## ADDED|MODIFIED|REMOVED Requirements`; every requirement uses SHALL/MUST and has at least one `#### Scenario:`.
 3. Run `openspec validate <change-id> --strict` and wait for the owner's approval before coding.
 4. Implement tasks in order; tick boxes in `tasks.md` as each completes.

@@ -344,6 +344,26 @@ flowchart LR
 
 Each stage is one or more OpenSpec changes (`openspec/changes/<id>/`). A stage is done when its acceptance criteria pass in CI and the change is archived.
 
+### Stage overview
+
+S0–S7 are **Phase 1**: one account (the owner's), ending in live trading. S8–S10 add the second account and automation. The detailed scope and acceptance for each stage follow the table; this table is the summary and must be kept in step with them.
+
+| Stage | OpenSpec change | What gets built | Done when |
+|---|---|---|---|
+| **S0 Foundation** | `add-foundation` | Repo layout, uv project, Docker Compose (engine, api, redis, postgres, caddy, otel + one-shot migrate), config with paper/live gate, structured logging with masking, OpenTelemetry, CI, `.env.example` | All services healthy; one trace spans engine and api; CI green |
+| **S1 Market data** | `add-market-data` | Dhan auth/token handling, instrument master (security ID, lot size, tick size, freeze qty), live feed with auto-reconnect, `SimulatedFeed`, internal tick bus, candle builder with historical warm-up | Ticks reach consumers; a forced disconnect recovers on its own; the simulated feed uses the same code path |
+| **S2 Orders & positions** | `add-order-position-core` | Contracts and DB tables carrying `account_id`, `BrokerAdapter` protocol, `PaperBroker`, order state machine, positions and MTM P&L, migrations, restart recovery and reconciliation, test CLI | Paper orders fill against live prices; kill -9 then restart restores identical state; `Unknown` orders are reconciled, never retried |
+| **S3 Risk engine** | `add-risk-engine` | All §7 risk rules, catastrophic SL on entry, kill switch, rate limiter with exit priority, tighten-only edits in market hours | One unit test per rule; the kill switch flattens everything and blocks entries; fail-closed is verified with Postgres down |
+| **S4 Trailing SL & exits** | `add-trailing-exits` | Pluggable trailing-SL methods chosen per trade with a default (D-025, [`docs/trailing-sl.md`](docs/trailing-sl.md)), exit manager with exit-before-cancel, persisted trail and method state | Scripted price paths give the expected exits for every method, long and short (property-based tests); trail state survives restart |
+| **S5 API bridge** | `add-api-bridge` | FastAPI REST commands, WebSocket stream, auth (including the S0 diagnostic endpoint), OpenAPI → TypeScript types | Commands round-trip with idempotency; killing the api container has no effect on the engine |
+| **S6 Dashboard** | `add-dashboard` | React + TS + Vite + Tailwind + shadcn/ui + Zustand UI (§8) | Full manual paper trading from a phone over Tailscale |
+| **S7 Go-live hardening** | `add-live-trading` | `DhanBroker` adapter, Telegram alerts and `/kill`, Dhan P&L-exit backstop, latency dashboards, `docs/runbook.md` | One week of small-size live forward testing with measured latencies and zero unreconciled orders |
+| **S8 Multi-account** | `add-multi-account` | Spouse's Dhan account on the shared static IP, per-account credentials, risk limits, kill switch, rate limits, dashboard account switcher | One account's breach or kill switch never affects the other |
+| **S9 Semi-auto** | `add-semi-auto-signals` | Strategy signal interface, authenticated TradingView webhook, one-click approval queue, optional F&O Validator check | Signal → approval → order, all through the risk engine; a replayed webhook is rejected (HMAC + idempotency) |
+| **S10 Full auto** | `add-full-auto` | Per-strategy auto mode, strategy-level risk budgets, daily summary report | A strategy runs a full session unattended in paper, then live at small size |
+
+Per-stage workflow: `/opsx:propose <change-id>` → `openspec validate <change-id> --strict` → owner approval → implement tasks in order → CI green → `/opsx:archive <change-id>`. Progress per stage is tracked in the README's Status table.
+
 ### S0 — Foundation · `add-foundation`
 - **Scope:** repo layout, `pyproject.toml` (uv), Docker Compose (engine, api, redis, postgres, caddy, otel-collector), config loading, structured logging, OpenTelemetry, CI (ruff, mypy --strict, pytest, import-linter, openspec validate), `.env.example`.
 - **Accept:** `docker compose up` → all services healthy; one trace visible across engine and api; CI green on an empty skeleton.
@@ -399,6 +419,7 @@ Each stage is one or more OpenSpec changes (`openspec/changes/<id>/`). A stage i
 | Q5 | Dhan access-token lifetime and renewal flow | To confirm before S1 |
 | Q6 | VPS provider (Mumbai region) and static IP binding | To confirm before S7 |
 | Q7 | Dhan family static IP mapping for spouse's account | Owner to request via apihelp@dhan.co; needed before S8 |
+| Q8 | Kill path that does not depend on the dashboard before S7 | Open. Telegram `/kill` (D-021) arrives only in S7, so during S3–S6 the kill switch is reachable only from the CLI and (from S6) the dashboard; Dhan's own kill switch remains the backstop. Decide before S3 whether to bring Telegram `/kill` forward |
 
 ## 13. References
 - Decision log with rationale and rejected alternatives: [`docs/DECISIONS.md`](docs/DECISIONS.md)
