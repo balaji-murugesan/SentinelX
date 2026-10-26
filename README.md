@@ -80,7 +80,9 @@ done
 | `MIGRATE_DB_PASSWORD` | Migration role: schema changes; used only by the one-shot `migrate` service | S0 |
 | `CADDY_PORT` | Optional; host port for the stack (default `8080`, always bound to 127.0.0.1) | S0 |
 | `REDIS_URL`, `DATABASE_URL`, `MIGRATE_DATABASE_URL`, `OTEL_EXPORTER_OTLP_ENDPOINT` | Only for running a service outside Docker; Compose sets its own | S0 |
-| `DHAN_CLIENT_ID` / `DHAN_ACCESS_TOKEN` | Broker credentials (from web.dhan.co → DhanHQ Trading APIs) | S1 |
+| `FEED_SOURCE` | Required: `dhan` (real prices) or `simulated` (dev/CI; refused in live mode) | S1 |
+| `FEED_INSTRUMENTS` / `FEED_MAX_SUBSCRIPTIONS` | Instruments streamed at startup (`SEGMENT:ID,…`) and the subscription cap (default 200) | S1 |
+| `DHAN_CLIENT_ID` / `DHAN_ACCESS_TOKEN` | Broker credentials (from web.dhan.co → DhanHQ Trading APIs); the token lasts ~24 h, paste a fresh one daily | S1 |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_ALLOWED_CHAT_IDS` | Alerts and `/kill` fallback | S7 |
 
 The database creates its roles once, when its volume is first made. To change a password later,
@@ -121,8 +123,25 @@ docker stop sx-redis
 In PowerShell, set the variable with `$env:TEST_REDIS_URL = "redis://127.0.0.1:6380/15"` and
 remove it afterwards with `Remove-Item Env:TEST_REDIS_URL`.
 
-Later stages: `MARKET_FEED=simulated` drives the engine with a simulated tick feed outside market
-hours (Stage 1), and `cd src/web && npm install && npm run dev` runs the dashboard (Stage 6).
+`FEED_SOURCE=simulated` drives the engine with simulated ticks outside market hours (refused in
+live mode); `cd src/web && npm install && npm run dev` runs the dashboard (Stage 6).
+
+## Each morning: fresh Dhan token
+
+Dhan access tokens last about 24 hours and the engine never creates or renews them.
+
+1. On web.dhan.co → My Profile → Access DhanHQ APIs, generate a token.
+2. Paste it into `.env` as `DHAN_ACCESS_TOKEN=…`.
+3. Check it (read-only, one `GET /v2/profile`; prints only field names, token expiry in IST and the
+   data-plan status, never the token, client ID or personal details):
+
+   ```bash
+   uv run --env-file .env python -m cli dhan profile
+   ```
+
+   Expect `token expiry : <date> IST (in 23h …)` and `data plan : Active`. If it says
+   `EXPIRED` or the check fails, generate a new token before market open (09:15 IST).
+4. Restart the engine so it picks up the new token: `docker compose up -d engine`.
 
 ## Repository layout
 

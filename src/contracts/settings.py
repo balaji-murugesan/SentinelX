@@ -70,18 +70,20 @@ class ModeSettings(BaseSettings):
         return resolve_trading_mode(self.trading_mode, self.live_confirm)
 
 
-def load_settings[S: ModeSettings](settings_cls: type[S]) -> S:
+def load_settings[S: BaseSettings](settings_cls: type[S]) -> S:
     """Build settings from the environment, or raise SettingsError listing what is wrong.
 
-    ``[S: ModeSettings]`` is a generic method with a constraint, like C#
-    ``T Load<T>() where T : ModeSettings``.
+    ``[S: BaseSettings]`` is a generic method with a constraint, like C#
+    ``T Load<T>() where T : BaseSettings``. Services pass a ModeSettings subclass; small
+    tools (the dev CLI) may pass a narrower settings class.
 
     Entry points catch SettingsError and exit non-zero, so a bad configuration stops the
     process before it does anything.
     """
     try:
-        # Required fields are filled from the environment, which mypy cannot see.
-        return settings_cls()  # type: ignore[call-arg]
+        # Required fields are filled from the environment (BaseSettings' constructor takes no
+        # required arguments, so mypy accepts this call for any settings class).
+        return settings_cls()
     except ValidationError as exc:
         lines = []
         for err in exc.errors(include_input=False, include_url=False):

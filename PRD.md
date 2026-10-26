@@ -395,7 +395,7 @@ Each stage is one or more OpenSpec changes (`openspec/changes/<id>/`). A stage i
 | Q1 | Project name | **Resolved:** SentinelX |
 | Q2 | Family accounts needed at first go-live? | **Resolved:** No. Phase 1 = owner's Dhan account only; `account_id` in the data model from S2; spouse's Dhan account in S8; Zerodha stays manual (D-020, D-022) |
 | Q3 | Bare-bones UI earlier than S6? | No — CLI + tests until S6 |
-| Q4 | Dhan Data API subscription needed for the live feed? | To confirm before S1 |
+| Q4 | Dhan Data API subscription needed for the live feed? | **Resolved (2026-10-27):** Yes. Confirmed via `python -m cli dhan profile`: `dataPlan` Active, `dataValidity` 2026-11-27. Renew before it lapses; the engine refuses to start the feed when the plan is inactive |
 | Q5 | Dhan access-token lifetime and renewal flow | To confirm before S1 |
 | Q6 | VPS provider (Mumbai region) and static IP binding | To confirm before S7 |
 | Q7 | Dhan family static IP mapping for spouse's account | Owner to request via apihelp@dhan.co; needed before S8 |

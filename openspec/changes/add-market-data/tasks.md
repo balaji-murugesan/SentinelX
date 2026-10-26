@@ -16,9 +16,9 @@
 
 ## 3. Dhan session check
 
-- [ ] 3.1 Owner step: run a one-off `GET /v2/profile` with their token (via a small `cli` helper added here that prints only field names, `tokenValidity` and the data-plan fields), then save a redacted fixture under `tests/fixtures/`; verify the fixture contains no token, client ID or personal data, and note the `tokenValidity` format in `session.py`
-- [ ] 3.2 Implement `engine/broker/dhan/session.py` (one profile call, 10 s timeout, result: valid with expiry / expired-or-invalid / plan inactive / unreachable), never retried automatically; verify `httpx.MockTransport` tests for each `broker-session` "Startup session check" and "Failed session check keeps engine running" scenario, and that logged errors contain neither the token nor the unmasked client ID
-- [ ] 3.3 Implement the expiry-warning loop (lead time, repeat interval, "expires before 15:30 IST today" warning at startup) using an injectable clock and no Dhan calls; verify tests for each "Token expiry warnings" scenario and the "Engine never mints tokens" scenario
+- [x] 3.1 Owner step: run a one-off `GET /v2/profile` with their token (via a small `cli` helper added here that prints only field names, `tokenValidity` and the data-plan fields), then save a redacted fixture under `tests/fixtures/`; verify the fixture contains no token, client ID or personal data, and note the `tokenValidity` format in `session.py`
+- [x] 3.2 Implement `engine/broker/dhan/session.py` (one profile call, 10 s timeout, result: valid with expiry / expired-or-invalid / plan inactive / unreachable), never retried automatically; verify `httpx.MockTransport` tests for each `broker-session` "Startup session check" and "Failed session check keeps engine running" scenario, and that logged errors contain neither the token nor the unmasked client ID
+- [x] 3.3 Implement the expiry-warning loop (lead time, repeat interval, "expires before 15:30 IST today" warning at startup) using an injectable clock and no Dhan calls; verify tests for each "Token expiry warnings" scenario and the "Engine never mints tokens" scenario
 
 ## 4. Provider interface, tick bus and SimulatedFeed
 

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from contracts.market import InstrumentKey
 from contracts.mode import TradingMode
@@ -25,6 +26,23 @@ class ClientId(SecretStr):
 
     def _display(self) -> str:
         return mask_account(self.get_secret_value())
+
+
+class DhanCredentials(BaseSettings):
+    """Just the Dhan credentials, for tools such as ``python -m cli dhan profile``."""
+
+    model_config = SettingsConfigDict(extra="ignore", hide_input_in_errors=True)
+
+    dhan_client_id: ClientId
+    dhan_access_token: SecretStr
+    dhan_api_base: str = endpoints.API_BASE
+
+    @field_validator("dhan_client_id", "dhan_access_token")
+    @classmethod
+    def _not_blank(cls, value: SecretStr) -> SecretStr:
+        if not value.get_secret_value().strip():
+            raise ValueError("must not be empty")
+        return value
 
 
 class EngineSettings(ModeSettings):
