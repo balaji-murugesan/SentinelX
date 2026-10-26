@@ -58,7 +58,6 @@ class EngineSettings(ModeSettings):
     dhan_instruments_url: str = endpoints.INSTRUMENTS_URL
 
     instrument_cache_dir: Path = Path("/var/lib/sentinelx/instruments")
-    freeze_qty_file: Path = Path("config/freeze_qty.toml")
     # Daily instrument-master refresh time, IST (before the 09:15 open).
     instrument_refresh_ist: time = time(8, 45)
 

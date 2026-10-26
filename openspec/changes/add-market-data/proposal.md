@@ -7,7 +7,7 @@ Every later stage needs live prices and instrument facts. Paper fills (S2) fill 
 ## What Changes
 
 - **Dhan session check**: the engine reads `DHAN_CLIENT_ID` and `DHAN_ACCESS_TOKEN` from the environment (the owner pastes a fresh token each day). At startup it checks the token and the Data API plan once against Dhan's profile endpoint. It refuses to start the live feed on an expired or invalid token or an inactive plan, and logs warnings ahead of expiry, with an explicit warning when the token will expire before today's market close. The engine never generates or renews tokens.
-- **Instrument master**: downloads Dhan's daily instrument file and keeps only NSE equity, NSE F&O and index rows. It caches the file on disk and serves lookups: by instrument key, by contract (underlying, expiry, strike, CE/PE), and by text search. Each instrument carries security ID, lot size, tick size (as `Decimal`) and freeze quantity. Freeze quantity comes from an owner-maintained config file, because Dhan's file doesn't include it. The master reports whether it is fresh for today.
+- **Instrument master**: downloads Dhan's daily instrument file and keeps only NSE equity, NSE F&O and index rows. It caches the file on disk and serves lookups: by instrument key, by contract (underlying, expiry, strike, CE/PE), and by text search. Each instrument carries security ID, lot size, tick size (as `Decimal`, converted to rupees) and freeze quantity, all taken from Dhan's file. The master reports whether it is fresh for today.
 - **`MarketDataProvider` interface** (D-023), separate from the future `BrokerAdapter`, with two implementations:
   - **Dhan live feed**: an asyncio WebSocket client written for this project (no blocking `dhanhq` SDK). It subscribes in Quote mode in batches of at most 100, and decodes binary packets into ticks with `Decimal` prices and UTC timestamps. It reconnects with backoff and resubscribes automatically. It stops retrying on authentication or plan errors. A watchdog forces a reconnect when the feed goes silent during market hours. It lives in `engine/broker/dhan/`, the only package allowed to talk to Dhan.
   - **SimulatedFeed**: scripted price paths for tests, plus a seeded random walk for after-hours development. It is chosen with `FEED_SOURCE=simulated` and **refused at startup in live mode**.
@@ -38,7 +38,6 @@ None. Existing requirements already cover the rules this change relies on: only 
   - New CLI commands in `src/cli/`.
 - **Config**:
   - New env vars: `FEED_SOURCE`, `FEED_INSTRUMENTS`, `DHAN_CLIENT_ID`, `DHAN_ACCESS_TOKEN`, `INSTRUMENT_CACHE_DIR`, plus optional tuning variables.
-  - New `config/freeze_qty.toml` (filled in by the owner).
   - `docker-compose.yml` passes the new variables and mounts a cache volume.
   - `.env.example` gains placeholders. The agent can't read this file (deny rule), so the owner must approve that edit.
 - **Dependencies**: adds `websockets` (asyncio WebSocket client). Does **not** add `dhanhq`, so the import-linter "only `engine.broker` may import dhanhq" exception still matches nothing, and its alerting stays `"none"`.

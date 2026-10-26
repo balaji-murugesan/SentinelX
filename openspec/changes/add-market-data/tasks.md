@@ -8,11 +8,11 @@
 
 ## 2. Instrument master
 
-- [ ] 2.1 Download the real `api-scrip-master-detailed.csv` once on the dev machine (public file, outside tests), record its header and segment/instrument codes in a code comment, and save a trimmed fixture (a few NSE_EQ, NSE_FNO option/future and IDX_I rows, plus one BSE row) under `tests/fixtures/`; verify the fixture parses with the stdlib `csv` module and contains the columns the parser maps
-- [ ] 2.2 Implement the CSV parser in `engine/broker/dhan/instruments_source.py` (keep NSE_EQ/NSE_FNO/IDX_I, map rows to `Instrument`, reject files missing required columns or with no kept rows); verify unit tests against the fixture, including the BSE-row exclusion and the corrupt-file rejection
-- [ ] 2.3 Implement download-to-cache (httpx streaming, temp file + atomic rename, keep the last 3 files) and the fallback order download → latest cache → empty and unavailable; verify tests using `httpx.MockTransport` and a temp directory for each `instruments` "Cache and fallback" scenario
-- [ ] 2.4 Add `config/freeze_qty.toml` (structure and comments only, **no invented values**) and its `tomllib` loader; verify tests for the configured, unconfigured and malformed scenarios
-- [ ] 2.5 Implement `InstrumentMaster` in `engine/market_data/instruments.py` (immutable snapshot swap, lookups by key, by contract and by text search with limit, freshness by IST date) and the daily refresh loop with parsing in `asyncio.to_thread`; verify tests for every "Instrument lookups" and "Freshness reporting" scenario, plus a test that a refresh with a deliberately slow parse doesn't stop a concurrent heartbeat-style task from running
+- [x] 2.1 Download the real `api-scrip-master-detailed.csv` once on the dev machine (public file, outside tests), record its header and segment/instrument codes in a code comment, and save a trimmed fixture (a few NSE_EQ, NSE_FNO option/future and IDX_I rows, plus one BSE row) under `tests/fixtures/`; verify the fixture parses with the stdlib `csv` module and contains the columns the parser maps
+- [x] 2.2 Implement the CSV parser in `engine/broker/dhan/instruments_source.py` (keep NSE_EQ/NSE_FNO/IDX_I, map rows to `Instrument`, reject files missing required columns or with no kept rows); verify unit tests against the fixture, including the BSE-row exclusion and the corrupt-file rejection
+- [x] 2.3 Implement download-to-cache (httpx streaming, temp file + atomic rename, keep the last 3 files) and the fallback order download → latest cache → empty and unavailable; verify tests using `httpx.MockTransport` and a temp directory for each `instruments` "Cache and fallback" scenario
+- [x] 2.4 Map `SM_FREEZE_QTY` to `freeze_qty` (0, empty or non-numeric → unknown) and convert tick sizes to rupees (÷100 for NSE_EQ/NSE_FNO, as-is for IDX_I, zero/invalid rows dropped and counted), documenting NSE's "frozen at qty ≥ freeze qty" meaning in code; verify tests for every "Freeze quantity source" and "Tick size in rupees" scenario, and owner spot-checks one freeze value against NSE's published limits
+- [x] 2.5 Implement `InstrumentMaster` in `engine/market_data/instruments.py` (immutable snapshot swap, lookups by key, by contract and by text search with limit, freshness by IST date) and the daily refresh loop with parsing in `asyncio.to_thread`; verify tests for every "Instrument lookups" and "Freshness reporting" scenario, plus a test that a refresh with a deliberately slow parse doesn't stop a concurrent heartbeat-style task from running
 
 ## 3. Dhan session check
 
@@ -50,5 +50,6 @@
 
 - Propose `add-candles` (candle builder + historical warm-up, the rest of PRD S1) after this change is merged.
 - Update the Stage 1 import-linter memory note: `dhanhq` is still not imported, so `unmatched_ignore_imports_alerting` stays `"none"`.
-- Note for the S3 proposal: freeze quantity "unknown" must fail closed.
+- Note for the S2/S3 proposals: an order is frozen at `qty >= freeze_qty` (largest single order `freeze_qty - 1`; slice below it); `freeze_qty` is read from the instrument master at order time and never hardcoded (NSE revised index limits seven times in 2026); "unknown" must fail closed.
+- Note for the S3 proposal: owner wants a configurable **max lots per order** risk limit, default 10. It is a separate risk rule (reject), not the exchange freeze quantity.
 - Archive with `openspec archive add-market-data --yes` after review and merge.

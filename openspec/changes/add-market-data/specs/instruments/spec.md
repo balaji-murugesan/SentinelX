@@ -29,19 +29,30 @@ Each instrument SHALL carry an instrument key (exchange segment + security ID), 
 - **THEN** tick size and strike are exact decimal values, not binary floating point
 
 ### Requirement: Freeze quantity source
-Freeze quantity SHALL come from an owner-maintained configuration file mapping underlying symbol to freeze quantity. An instrument with no entry SHALL report freeze quantity as unknown rather than zero or unlimited.
+Freeze quantity SHALL come from the freeze-quantity column of Dhan's instrument file, refreshed with it. It SHALL keep the exchange's meaning: an order whose quantity is at or above it is frozen. A zero, missing or non-numeric value SHALL be reported as unknown, never as zero or unlimited.
 
-#### Scenario: Configured underlying
-- **WHEN** the configuration lists a freeze quantity for an option contract's underlying
-- **THEN** the contract reports that freeze quantity
+#### Scenario: Value present
+- **WHEN** the file lists freeze quantity 3511 for a NIFTY option
+- **THEN** the contract reports freeze quantity 3511, so the largest allowed single order is 3510
 
-#### Scenario: Unconfigured underlying
-- **WHEN** the configuration has no entry for an instrument's underlying
+#### Scenario: Zero or missing
+- **WHEN** the file lists freeze quantity 0 or leaves it empty for an instrument
 - **THEN** the instrument reports freeze quantity as unknown
 
-#### Scenario: Malformed configuration
-- **WHEN** the freeze-quantity file cannot be parsed or contains a non-positive quantity
-- **THEN** the engine refuses to start with an error naming the file and the offending entry
+### Requirement: Tick size in rupees
+Tick size SHALL be reported in rupees. Dhan lists NSE equity and F&O tick sizes in paise and index tick sizes in rupees; rows whose tick size is zero or not a number SHALL be skipped and counted.
+
+#### Scenario: F&O tick in paise
+- **WHEN** the file lists tick size `5.0000` for an NSE F&O contract
+- **THEN** the contract reports tick size `Decimal("0.05")`
+
+#### Scenario: Index tick in rupees
+- **WHEN** the file lists tick size `0.0500` for an NSE index
+- **THEN** the index reports tick size `Decimal("0.05")`
+
+#### Scenario: Zero tick
+- **WHEN** a row lists tick size `0.0000`
+- **THEN** that row is left out of the master and counted in the load summary
 
 ### Requirement: Cache and fallback
 The engine SHALL cache each successful download on disk. If a download fails, it SHALL load the most recent cached file instead and log a warning. If neither exists, the master SHALL be empty and marked unavailable, and the engine SHALL keep running.

@@ -14,7 +14,7 @@ Stage 0 left a skeleton engine. [`src/engine/main.py`](../../../src/engine/main.
   - Server pings every 10 s and drops clients silent for over 40 s.
   - Data API error codes: 805 too many connections, 806 plan not subscribed, 807 token expired, 808–810 auth/token/client invalid.
   - Tokens from the web portal last 24 h. `GET /v2/profile` returns `tokenValidity` and data-plan status.
-  - The instrument CSV (`api-scrip-master-detailed.csv`) has no freeze quantity.
+  - The instrument CSV (`api-scrip-master-detailed.csv`), checked against the real file on 2026-10-26, does contain freeze quantity (`SM_FREEZE_QTY`), although the docs page omits it. Its tick sizes are in **paise** for equity and F&O rows and in rupees for index rows.
 
 ## Goals / Non-Goals
 
@@ -38,7 +38,7 @@ src/contracts/market.py          ExchangeSegment, InstrumentKey, Instrument (pyd
 src/engine/market_data/
     provider.py                  MarketDataProvider Protocol, Tick, FeedStatus
     bus.py                       TickBus (fan-out)
-    instruments.py               InstrumentMaster (pure lookups over parsed rows), freeze-qty loader
+    instruments.py               InstrumentMaster (pure lookups over parsed rows)
     simulated.py                 SimulatedFeed (scripted + random walk)
     service.py                   wires source + master + bus; supervised task for main.py
 src/engine/broker/dhan/
@@ -46,7 +46,6 @@ src/engine/broker/dhan/
     instruments_source.py        CSV download, cache, parse → rows
     feed.py                      DhanFeed (WebSocket client, reconnect, watchdog)
     packets.py                   binary packet decoder (pure functions)
-config/freeze_qty.toml           owner-maintained
 ```
 
 `MarketDataProvider` is a `typing.Protocol`. That is structural typing, close to a C# interface, except that a class satisfies it just by having the right methods, without declaring `: IMarketDataProvider`. `DhanFeed` and `SimulatedFeed` both satisfy it. Consumers depend only on `TickBus` and the protocol, never on `engine.broker`.
@@ -102,20 +101,21 @@ Expiry warnings are computed locally every `DHAN_TOKEN_WARN_INTERVAL_MIN` (defau
 - Text search is a linear scan, which is fine for CLI and future trade-panel use and is not on the tick path.
 - The daily refresh runs at `INSTRUMENT_REFRESH_IST` (default `08:45`). Daily because weekly expiries, new strikes and lot-size revisions only appear in a fresh file. The file is static, served from Dhan's file host rather than an API endpoint: one download per day plus one per engine restart, and it contains no prices. MCX and BSE rows are discarded while parsing.
 
-### 9. Freeze quantity from `config/freeze_qty.toml`
+### 9. Freeze quantity from Dhan's file (`SM_FREEZE_QTY`)
 
-Read with stdlib `tomllib`:
+*Revised 2026-10-26 after inspecting the real file; owner's choice.* The plan originally had an owner-maintained `config/freeze_qty.toml`, because the docs page doesn't list the column. The real file has it, refreshed daily alongside lot sizes, and its values follow NSE's convention: an order is frozen when quantity ≥ freeze quantity. For example:
 
-```toml
-as_of = 2026-10-01                      # date of the NSE circular used
-source = "NSE F&O quantity freeze limits"
-[nse_fno]
-NIFTY = 0                               # placeholder: owner fills real values
-```
+| Underlying | Lot | `SM_FREEZE_QTY` | Largest single order |
+|---|---|---|---|
+| NIFTY options | 65 | 3511 | 3510 (54 lots) |
+| BANKNIFTY options | 30 | 1441 | 1440 (48 lots) |
+| RELIANCE options | 500 | 20001 | 20000 (40 lots) |
 
-The file ships with **no values**, only the structure and a comment. Values come from NSE's published freeze-limit file, which changes a few times a year. The agent must not invent these numbers. Missing entries mean "unknown". S3 will reject or slice orders when freeze quantity is unknown (fail closed).
+The parser stores the raw value as `freeze_qty`; 0, empty or non-numeric becomes `None` ("unknown"). S3 must treat `qty >= freeze_qty` as needing slicing, and must fail closed on `None`. The owner spot-checks one value against NSE's published freeze limits during task 2.2.
 
-*Alternative:* download NSE's freeze file automatically. Rejected for now: it is an extra external dependency with an unstable URL, and the values change rarely.
+*Alternatives:* the TOML file (manual upkeep, drifts from lot-size changes); Dhan value plus a TOML override (more code for a problem not yet seen).
+
+Tick sizes are converted at parse time: NSE_EQ and NSE_FNO rows ÷ 100 (paise → rupees), IDX_I rows as-is; a zero or invalid tick drops the row (counted). Index placeholders (`0001-01-01` expiry, `XX` option type, empty or `0` strike) become `None`.
 
 ### 10. Settings
 
@@ -128,7 +128,6 @@ New `EngineSettings` fields:
 | `DHAN_CLIENT_ID` | when `dhan` | masked to last four characters |
 | `DHAN_ACCESS_TOKEN` | when `dhan` | `SecretStr` |
 | `INSTRUMENT_CACHE_DIR` | no | default `/var/lib/sentinelx/instruments` (compose volume) |
-| `FREEZE_QTY_FILE` | no | default `config/freeze_qty.toml` |
 | `INSTRUMENT_REFRESH_IST` | no | default `08:45` |
 | `FEED_MAX_SUBSCRIPTIONS` | no | default 200, must be 1–5000 |
 | `FEED_RECONNECT_MAX_S` | no | default 30 |
@@ -166,7 +165,7 @@ Only `feed.py` builds the URL, and nothing else stores it. The `websockets` libr
 - [Drop-oldest hides a slow consumer] → The per-consumer drop counter is logged (rate-limited) and exposed for S5 health display.
 - [Instrument CSV is large (tens of MB) and parsing takes seconds] → It runs on a worker thread at startup and 08:45. Ticks don't depend on it. Tick-size rounding falls back to 2 dp until it loads.
 - [Token pasted daily is a manual step that can be forgotten] → Startup check plus warnings. The engine keeps running so exits keep working once S4 exists. Automated renewal can be proposed later as its own change.
-- [Freeze quantities left unfilled] → Reported as unknown, never zero. S3 must fail closed on unknown. That is noted for the S3 proposal.
+- [Dhan's freeze quantity is wrong or its meaning changes] → Spot-checked against NSE in task 2.2. Unknown (0/empty) is never treated as unlimited, and S3 must fail closed on unknown. That is noted for the S3 proposal.
 
 ## Migration Plan
 

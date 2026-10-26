@@ -8,8 +8,8 @@ Trading terms used below:
                    exchange token).
   * lot size     - F&O contracts trade in whole lots; quantity must be a multiple of this.
   * tick size    - the smallest allowed price step, e.g. 0.05 rupees for NSE options.
-  * freeze qty   - the exchange's maximum quantity per single order for an underlying; larger
-                   orders must be split ("sliced").
+  * freeze qty   - the exchange's per-order quantity limit for an underlying: an order at or
+                   above it is frozen, so larger orders must be split ("sliced").
 """
 
 from datetime import date
@@ -103,5 +103,6 @@ class Instrument(BaseModel):
     expiry: date | None = None
     strike: Decimal | None = None
     option_type: Literal["CE", "PE"] | None = None
-    # None means "unknown" (not configured), never zero or unlimited.
+    # Exchange freeze quantity: an order with quantity >= this is frozen (rejected), so the
+    # largest single order is freeze_qty - 1. None means "unknown", never zero or unlimited.
     freeze_qty: int | None = Field(default=None, gt=0)
