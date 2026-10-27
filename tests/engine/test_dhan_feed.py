@@ -11,6 +11,7 @@ import logging
 import socket
 import struct
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta
 from decimal import Decimal
 from http import HTTPStatus
 from typing import Any
@@ -31,7 +32,7 @@ from engine.market_data.provider import (
     Subscriptions,
     Tick,
 )
-from tests.engine.test_dhan_packets import header, quote
+from tests.engine.test_dhan_packets import LTT_UTC, header, quote
 
 TOKEN = "eyJhbGciOiJIUzUxMiJ9.eyJzZWNyZXQiOiJ0b2tlbiJ9.c2lnbmF0dXJl"
 CLIENT_ID = "1000000001"
@@ -342,6 +343,55 @@ async def test_silent_after_hours_no_reconnect() -> None:
     await asyncio.sleep(0.4)
     assert server.connections == 1
     await finish(stop, task, srv)
+
+
+# ---- LTT time-zone guard (packets.LTT_IS_IST_EPOCH, smoke test 7.2) -----------------
+
+
+async def stream_two_quotes(server: FakeDhan, ws: ServerConnection, _n: int) -> None:
+    await wait_for_subscribe(server)
+    await ws.send(quote(24500.05))
+    await ws.send(quote(24500.10))
+    await ws.wait_closed()
+
+
+def ltt_alarms(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [r for r in logs if "LTT_IS_IST_EPOCH" in r["event"]]
+
+
+async def test_live_tick_5h30_off_logs_ltt_error_once() -> None:
+    """What a wrong LTT_IS_IST_EPOCH looks like live: receive time 5h30m after exchange time."""
+    received = LTT_UTC + timedelta(hours=5, minutes=30, seconds=1)
+    with capture_logs() as logs:
+        server = FakeDhan(stream_two_quotes)
+        h, stop, task, srv = await start(
+            server, market_hours=lambda _now: True, now=lambda: received
+        )
+        await until(lambda: len(h.ticks()) == 2)
+        await finish(stop, task, srv)
+    [alarm] = ltt_alarms(logs)  # loud, but only once per run
+    assert alarm["log_level"] == "error"
+    assert alarm["lag_s"] == 19801
+
+
+@pytest.mark.parametrize(
+    ("received", "market_open"),
+    [
+        (LTT_UTC + timedelta(milliseconds=300), True),  # correct constant: normal lag
+        (LTT_UTC + timedelta(hours=5, minutes=30), False),  # after hours: lag is meaningless
+    ],
+)
+async def test_no_ltt_error_for_normal_lag_or_after_hours(
+    received: datetime, market_open: bool
+) -> None:
+    with capture_logs() as logs:
+        server = FakeDhan(stream_two_quotes)
+        h, stop, task, srv = await start(
+            server, market_hours=lambda _now: market_open, now=lambda: received
+        )
+        await until(lambda: len(h.ticks()) == 2)
+        await finish(stop, task, srv)
+    assert ltt_alarms(logs) == []
 
 
 # ---- the token never reaches logs -------------------------------------------------

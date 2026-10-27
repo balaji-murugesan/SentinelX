@@ -36,6 +36,7 @@ from engine.broker.dhan.packets import (
     TradeUpdate,
     Undecodable,
     decode_message,
+    lag_suggests_wrong_ltt_zone,
     round_to_tick,
 )
 from engine.market_data.bus import TickBus
@@ -116,6 +117,7 @@ class DhanFeed:
         self._now = now
         self._ws: ClientConnection | None = None
         self.undecodable = 0  # unknown/truncated packets seen (spec "Unknown packet type")
+        self._ltt_alarm_raised = False  # the LTT time-zone error is logged once per run
 
     # ---- MarketDataProvider ---------------------------------------------------------
 
@@ -207,6 +209,7 @@ class DhanFeed:
                         volume=packet.volume,
                     )  # fmt: skip
                 )
+                self._check_ltt_zone(packet, received_at)
             elif isinstance(packet, Disconnect):
                 if packet.code in TERMINAL_CODES:
                     raise _Terminal(f"Dhan code {packet.code}: {TERMINAL_CODES[packet.code]}")
@@ -218,6 +221,23 @@ class DhanFeed:
                 if self.undecodable == 1:
                     log.warning("undecodable dhan packet skipped", code=packet.code,
                                 reason=packet.reason)  # fmt: skip
+
+    def _check_ltt_zone(self, packet: TradeUpdate, received_at: datetime) -> None:
+        """Log loudly (once) if a live tick's lag is ~5h30m: LTT_IS_IST_EPOCH is then wrong.
+
+        Only during market hours: after the close the last trade is hours old anyway.
+        """
+        if self._ltt_alarm_raised or not self._market_hours(received_at):
+            return
+        lag = received_at - packet.exchange_time
+        if lag_suggests_wrong_ltt_zone(lag):
+            self._ltt_alarm_raised = True
+            log.error(
+                "dhan trade time is ~5h30m off the receive time: packets.LTT_IS_IST_EPOCH is "
+                "probably wrong (or this instrument has not traded for 5.5 hours)",
+                key=str(packet.key),
+                lag_s=int(lag.total_seconds()),
+            )
 
     # ---- helpers --------------------------------------------------------------------
 

@@ -53,6 +53,15 @@ SIZES = {
 # time, flip this one constant.
 LTT_IS_IST_EPOCH = True
 _IST_OFFSET = timedelta(hours=5, minutes=30)
+# Guard for that assumption: if the constant is wrong, every exchange time is off by exactly
+# the IST offset, so a live tick's lag (receive time - exchange time) sits near +5h30m or
+# -5h30m. DhanFeed checks live ticks during market hours with lag_suggests_wrong_ltt_zone.
+LTT_ZONE_TOLERANCE = timedelta(minutes=10)
+
+
+def lag_suggests_wrong_ltt_zone(lag: timedelta) -> bool:
+    """True if ``lag`` is within LTT_ZONE_TOLERANCE of +-5h30m (see LTT_IS_IST_EPOCH)."""
+    return abs(abs(lag) - _IST_OFFSET) <= LTT_ZONE_TOLERANCE
 
 
 @dataclass(frozen=True, slots=True)

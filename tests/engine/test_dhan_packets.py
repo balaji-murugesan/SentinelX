@@ -1,7 +1,7 @@
 """Dhan binary packet decoder (task 5.1). Packets are built with struct.pack per the docs."""
 
 import struct
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -22,6 +22,7 @@ from engine.broker.dhan.packets import (
     TradeUpdate,
     Undecodable,
     decode_message,
+    lag_suggests_wrong_ltt_zone,
     ltt_to_utc,
     price_from_float,
     round_to_tick,
@@ -132,6 +133,22 @@ def test_high_price_needs_tick_rounding() -> None:
     two_dp = price_from_float(as_float32(str(exact)))
     assert abs(two_dp - exact) <= Decimal("0.01")
     assert round_to_tick(two_dp, Decimal("0.05")) == exact
+
+
+@pytest.mark.parametrize(
+    ("lag", "wrong"),
+    [
+        (timedelta(milliseconds=300), False),  # a normal live tick
+        (timedelta(minutes=5), False),  # a thinly traded option
+        (timedelta(hours=5, minutes=30), True),  # constant True but Dhan sends true UTC
+        (-timedelta(hours=5, minutes=30), True),  # constant False but Dhan sends IST epoch
+        (timedelta(hours=5, minutes=30, seconds=590), True),  # inside the 10-minute tolerance
+        (timedelta(hours=5, minutes=41), False),  # outside it
+        (timedelta(hours=5, minutes=19), False),
+    ],
+)
+def test_lag_near_ist_offset_flags_wrong_ltt_zone(lag: timedelta, wrong: bool) -> None:
+    assert lag_suggests_wrong_ltt_zone(lag) is wrong
 
 
 def test_ltt_converted_to_utc() -> None:
