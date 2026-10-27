@@ -146,9 +146,9 @@ def _to_instrument(row: Mapping[str, str], segment: ExchangeSegment) -> Instrume
         underlying_symbol=row["UNDERLYING_SYMBOL"],
         instrument_type=row["INSTRUMENT"],
         lot_size=int(lot),
-        tick_size=tick,
+        tick_size=_trim(tick),
         expiry=None if expiry in _NO_EXPIRY else date.fromisoformat(expiry),
-        strike=strike if strike is not None and strike > 0 else None,
+        strike=_trim(strike) if strike is not None and strike > 0 else None,
         option_type=option_type,
         freeze_qty=int(freeze) if freeze is not None and freeze > 0 else None,
     )
@@ -160,3 +160,14 @@ def _decimal(text: str) -> Decimal | None:
     except InvalidOperation:
         return None
     return value if value.is_finite() else None
+
+
+def _trim(value: Decimal) -> Decimal:
+    """Drop trailing zeros without changing the value: 0.0500 -> 0.05, 24500.00000 -> 24500.
+
+    Decimal keeps the number of places it was written with, and prices rounded to the tick
+    inherit the tick's places (22749.7500). normalize() alone would give 2.45E+4 for whole
+    numbers, so those are quantized back to plain integers.
+    """
+    trimmed = value.normalize()
+    return trimmed.quantize(Decimal(1)) if trimmed == trimmed.to_integral_value() else trimmed

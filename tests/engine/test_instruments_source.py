@@ -20,6 +20,7 @@ from engine.broker.dhan.instruments_source import (
     parse_instrument_file,
     parse_rows,
 )
+from engine.broker.dhan.packets import round_to_tick
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "dhan" / "instruments_detailed.csv"
 
@@ -79,6 +80,18 @@ def test_equity_uses_exchange_symbol(by_key: dict[str, Instrument]) -> None:
     assert reliance.display_name == "Reliance Industries"
     assert reliance.expiry is None
     assert reliance.lot_size == 1
+
+
+def test_decimals_print_without_trailing_zeros(by_key: dict[str, Instrument]) -> None:
+    """Decimal equality ignores trailing zeros, so check the printed form: the file's
+    '24500.00000' and tick '0.0500' must not leak into logs or onto the dashboard."""
+    call, nifty = by_key["NSE_FNO:40003"], by_key["IDX_I:13"]
+    assert (str(call.strike), str(call.tick_size), str(nifty.tick_size)) == (
+        "24500",
+        "0.05",
+        "0.05",
+    )
+    assert str(round_to_tick(Decimal("22749.75"), nifty.tick_size)) == "22749.75"  # feed price
 
 
 def test_index_placeholders_become_none(by_key: dict[str, Instrument]) -> None:
