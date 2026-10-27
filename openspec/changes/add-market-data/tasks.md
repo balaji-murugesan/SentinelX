@@ -22,10 +22,10 @@
 
 ## 4. Provider interface, tick bus and SimulatedFeed
 
-- [ ] 4.1 Define `MarketDataProvider` (Protocol), `Tick` (frozen slotted dataclass) and `FeedStatus` in `engine/market_data/provider.py`, with comments explaining `Protocol` and `dataclass(frozen=True, slots=True)` with C# analogies; verify mypy passes and a test asserts `Tick` is immutable
-- [ ] 4.2 Implement `TickBus` (per-consumer bounded queue, drop-oldest with counter and rate-limited warning, async-iterator subscription, status events on the same queues, last-tick-time per instrument, error isolation); verify tests for every "Fan-out to consumers" and "Feed status events" scenario
-- [ ] 4.3 Implement `SimulatedFeed` scripted mode and runtime subscribe/unsubscribe through a shared, reference-counted subscription registry with the `FEED_MAX_SUBSCRIPTIONS` cap (used by both feeds); verify tests for "Simulated scripted paths", the "Subscribe while running" scenario, and every "Subscriptions only on demand" scenario against the simulated feed
-- [ ] 4.4 Implement the random-walk mode (seeded, tick-grid prices, never below one tick, `SIM_*` settings); verify tests for "Simulated random walk", including a `hypothesis` property test that every generated price is a positive multiple of the tick size
+- [x] 4.1 Define `MarketDataProvider` (Protocol), `Tick` (frozen slotted dataclass) and `FeedStatus` in `engine/market_data/provider.py`, with comments explaining `Protocol` and `dataclass(frozen=True, slots=True)` with C# analogies; verify mypy passes and a test asserts `Tick` is immutable
+- [x] 4.2 Implement `TickBus` (per-consumer bounded queue, drop-oldest with counter and rate-limited warning, async-iterator subscription, status events on the same queues, last-tick-time per instrument, error isolation); verify tests for every "Fan-out to consumers" and "Feed status events" scenario
+- [x] 4.3 Implement `SimulatedFeed` scripted mode and runtime subscribe/unsubscribe through a shared, reference-counted subscription registry with the `FEED_MAX_SUBSCRIPTIONS` cap (used by both feeds); verify tests for "Simulated scripted paths", the "Subscribe while running" scenario, and every "Subscriptions only on demand" scenario against the simulated feed
+- [x] 4.4 Implement the random-walk mode (seeded, tick-grid prices, never below one tick, `SIM_*` settings); verify tests for "Simulated random walk", including a `hypothesis` property test that every generated price is a positive multiple of the tick size
 
 ## 5. Dhan live feed
 
