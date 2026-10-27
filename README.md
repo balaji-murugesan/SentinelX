@@ -7,6 +7,7 @@ Self-hosted trading platform for Dhan: a headless Python engine that manages ord
 - What and why: [`PRD.md`](PRD.md)
 - Working rules for Claude Code: [`CLAUDE.md`](CLAUDE.md)
 - Design decisions: [`docs/DECISIONS.md`](docs/DECISIONS.md)
+- Field notes (external, unverified): [`docs/field-notes-option-buying.md`](docs/field-notes-option-buying.md)
 
 ## Status
 

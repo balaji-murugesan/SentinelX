@@ -166,7 +166,7 @@ sequenceDiagram
     A-->>W: WebSocket push
 ```
 
-In **Paper** mode, the broker adapter is `PaperBroker`: it fills against the live LTP (last traded price) with configurable slippage and never calls Dhan.
+In **Paper** mode, the broker adapter is `PaperBroker`: it fills against the live LTP (last traded price) with configurable slippage, deducts trading costs (brokerage, STT, exchange/SEBI fees, stamp duty, GST), and never calls Dhan.
 
 ### 6.2 Tick → trailing stop-loss → exit
 
@@ -352,12 +352,12 @@ S0–S7 are **Phase 1**: one account (the owner's), ending in live trading. S8�
 |---|---|---|---|
 | **S0 Foundation** | `add-foundation` | Repo layout, uv project, Docker Compose (engine, api, redis, postgres, caddy, otel + one-shot migrate), config with paper/live gate, structured logging with masking, OpenTelemetry, CI, `.env.example` | All services healthy; one trace spans engine and api; CI green |
 | **S1 Market data** | `add-market-data` | Dhan auth/token handling, instrument master (security ID, lot size, tick size, freeze qty), live feed with auto-reconnect, `SimulatedFeed`, internal tick bus, candle builder with historical warm-up | Ticks reach consumers; a forced disconnect recovers on its own; the simulated feed uses the same code path |
-| **S2 Orders & positions** | `add-order-position-core` | Contracts and DB tables carrying `account_id`, `BrokerAdapter` protocol, `PaperBroker`, order state machine, positions and MTM P&L, migrations, restart recovery and reconciliation, test CLI | Paper orders fill against live prices; kill -9 then restart restores identical state; `Unknown` orders are reconciled, never retried |
-| **S3 Risk engine** | `add-risk-engine` | All §7 risk rules, catastrophic SL on entry, kill switch, rate limiter with exit priority, tighten-only edits in market hours | One unit test per rule; the kill switch flattens everything and blocks entries; fail-closed is verified with Postgres down |
+| **S2 Orders & positions** | `add-order-position-core` | Contracts and DB tables carrying `account_id`, `BrokerAdapter` protocol, `PaperBroker` with slippage and trading costs, required `RiskGate` pre-trade seam (paper-only stub gate), read-only Dhan adapter (order book, positions, order-update feed), order state machine, positions and MTM P&L, migrations, restart recovery and reconciliation, test CLI | Paper orders fill against live prices; kill -9 then restart restores identical state; `Unknown` orders are reconciled, never retried; no order path skips the `RiskGate`; reconciliation passes against recorded real Dhan responses |
+| **S3 Risk engine** | `add-risk-engine` | All §7 risk rules behind the S2 `RiskGate` seam (replacing the stub), catastrophic SL on entry, kill switch, rate limiter with exit priority, tighten-only edits in market hours | One unit test per rule; the kill switch flattens everything and blocks entries; fail-closed is verified with Postgres down |
 | **S4 Trailing SL & exits** | `add-trailing-exits` | Pluggable trailing-SL methods chosen per trade with a default (D-025, [`docs/trailing-sl.md`](docs/trailing-sl.md)), exit manager with exit-before-cancel, persisted trail and method state | Scripted price paths give the expected exits for every method, long and short (property-based tests); trail state survives restart |
 | **S5 API bridge** | `add-api-bridge` | FastAPI REST commands, WebSocket stream, auth (including the S0 diagnostic endpoint), OpenAPI → TypeScript types | Commands round-trip with idempotency; killing the api container has no effect on the engine |
 | **S6 Dashboard** | `add-dashboard` | React + TS + Vite + Tailwind + shadcn/ui + Zustand UI (§8) | Full manual paper trading from a phone over Tailscale |
-| **S7 Go-live hardening** | `add-live-trading` | `DhanBroker` adapter, Telegram alerts and `/kill`, Dhan P&L-exit backstop, latency dashboards, `docs/runbook.md` | One week of small-size live forward testing with measured latencies and zero unreconciled orders |
+| **S7 Go-live hardening** | `add-live-trading` | `DhanBroker` order placement (extends the S2 read-only adapter), Telegram alerts and `/kill`, Dhan P&L-exit backstop, latency dashboards, `docs/runbook.md` | One week of small-size live forward testing with measured latencies and zero unreconciled orders |
 | **S8 Multi-account** | `add-multi-account` | Spouse's Dhan account on the shared static IP, per-account credentials, risk limits, kill switch, rate limits, dashboard account switcher | One account's breach or kill switch never affects the other |
 | **S9 Semi-auto** | `add-semi-auto-signals` | Strategy signal interface, authenticated TradingView webhook, one-click approval queue, optional F&O Validator check | Signal → approval → order, all through the risk engine; a replayed webhook is rejected (HMAC + idempotency) |
 | **S10 Full auto** | `add-full-auto` | Per-strategy auto mode, strategy-level risk budgets, daily summary report | A strategy runs a full session unattended in paper, then live at small size |
@@ -373,15 +373,17 @@ Per-stage workflow: `/opsx:propose <change-id>` → `openspec validate <change-i
 - **Accept:** ticks for configured instruments reach engine consumers; forced disconnect recovers automatically; simulated feed drives the same code path.
 
 ### S2 — Orders & positions · `add-order-position-core`
-- **Scope:** `contracts` models and DB tables carrying `account_id` (single account in Phase 1 — D-020), `BrokerAdapter` protocol, `PaperBroker`, order state machine (§5), order-update handling, positions + MTM P&L, Postgres persistence (migrations), restart recovery and reconciliation (§6.5), test CLI.
-- **Accept:** paper orders fill against live prices; kill -9 the engine → restart restores identical state; `Unknown` orders reconciled, never retried.
+- **Scope:** `contracts` models and DB tables carrying `account_id` (single account in Phase 1 — D-020), `BrokerAdapter` protocol, `PaperBroker` (fills with configurable slippage **and** trading costs — brokerage, STT, exchange/SEBI fees, stamp duty, GST — so paper P&L is not overstated; see [`docs/field-notes-option-buying.md`](docs/field-notes-option-buying.md)), order state machine (§5), order-update handling, positions + MTM P&L, Postgres persistence (migrations), restart recovery and reconciliation (§6.5), test CLI. Order contract carries the product type (§12 Q11).
+  - **`RiskGate` seam:** the order service takes a required pre-trade `RiskGate` (a `Protocol`) as a constructor dependency, so every order source (CLI now, API/strategies/exits later) passes through it. S2 ships a stub gate that rejects every order unless the trading mode is paper; S3 replaces it with the real rules at the same seam, without touching call sites.
+  - **Read-only Dhan adapter** (in `engine.broker`): fetches the order book and positions and subscribes to the order-update feed, but exposes no place/modify/cancel. It lets reconciliation and order-update parsing be built against real Dhan responses, recorded as test fixtures, long before S7 turns on order placement.
+- **Accept:** paper orders fill against live prices; kill -9 the engine → restart restores identical state; `Unknown` orders reconciled, never retried; a test shows no order path reaches the broker without the `RiskGate`; reconciliation and order-update parsing pass against recorded real Dhan responses; the read-only adapter has no order-placing methods.
 
 ### S3 — Risk engine · `add-risk-engine`
-- **Scope:** all §7 rules, catastrophic SL placement on entry, kill switch (§6.3), client-side rate limiter with exit priority, tighten-only edits during market hours.
+- **Scope:** all §7 rules implemented as the real `RiskGate` (replacing S2's paper-only stub), product-type-aware where §12 Q11 requires it, catastrophic SL placement on entry (and for carried positions, per §12 Q12), daily-loss treatment of carried positions (§12 Q13), kill switch (§6.3), client-side rate limiter with exit priority, tighten-only edits during market hours.
 - **Accept:** a unit test per rule; kill switch flattens all and blocks entries; fail-closed verified with Postgres down.
 
 ### S4 — Trailing SL & exits · `add-trailing-exits`
-- **Scope:** pluggable trailing-SL methods per [`docs/trailing-sl.md`](docs/trailing-sl.md) (D-025): ATR Chandelier, N-candle lowest low, Supertrend, step trail, Parabolic SAR, Nth-candle-back low, EMA close trail, fixed % / points; long and short; configured default plus per-trade choice (CLI until S6); exit manager with exit-before-cancel; persisted trail state including each method's internal state.
+- **Scope:** pluggable trailing-SL methods per [`docs/trailing-sl.md`](docs/trailing-sl.md) (D-025): ATR Chandelier, N-candle lowest low, Supertrend, step trail, Parabolic SAR, Nth-candle-back low, EMA close trail, fixed % / points; long and short; a named preset "fixed % SL + step at +X%" (e.g. 30% SL, shift at +20% — external hypothesis, to be backtested); the price series each method trails on (option premium vs underlying — §12 Q9) decided in this change; configured default plus per-trade choice (CLI until S6); exit manager with exit-before-cancel; persisted trail state including each method's internal state.
 - **Accept:** scripted price paths produce the expected exits for every method, long and short (property-based tests: the stop never loosens and never starts looser than the initial SL); trail level and method state survive restart.
 
 ### S5 — API bridge · `add-api-bridge`
@@ -389,11 +391,11 @@ Per-stage workflow: `/opsx:propose <change-id>` → `openspec validate <change-i
 - **Accept:** commands round-trip with idempotency; killing the api container has zero effect on the engine.
 
 ### S6 — Dashboard · `add-dashboard` (⚠ ASSUMPTION: stays at S6; CLI used before this)
-- **Scope:** §8 in React + TS + Vite + Tailwind + shadcn/ui + Zustand.
+- **Scope:** §8 in React + TS + Vite + Tailwind + shadcn/ui + Zustand. Trade stats show expectancy (average P&L per trade) and payoff ratio (avg win ÷ avg loss) alongside win rate — engine-computed, UI displays only.
 - **Accept:** full manual paper trading from a phone over Tailscale.
 
 ### S7 — Go-live hardening · `add-live-trading`
-- **Scope:** `DhanBroker` adapter enabled, Telegram alerts + `/kill`, Dhan P&L-exit backstop configured, latency dashboards, runbook (`docs/runbook.md`).
+- **Scope:** `DhanBroker` order placement enabled (extending the S2 read-only adapter), Telegram alerts + `/kill`, Dhan P&L-exit backstop configured, latency dashboards, runbook (`docs/runbook.md`).
 - **Accept:** one week of small-size live forward testing with measured latencies and zero unreconciled orders.
 
 ### S8 — Multi-account · `add-multi-account`
@@ -405,7 +407,7 @@ Per-stage workflow: `/opsx:propose <change-id>` → `openspec validate <change-i
 - **Accept:** signal → approval → order, all through the risk engine; webhook replay rejected (HMAC + idempotency).
 
 ### S10 — Full auto · `add-full-auto`
-- **Scope:** per-strategy auto mode, strategy-level risk budgets, daily summary report.
+- **Scope:** per-strategy auto mode, strategy-level risk budgets, daily summary report (including expectancy and payoff ratio per strategy); rolling expectancy per strategy with an alert — and optional auto-pause — when it falls below a configured floor (edge decay).
 - **Accept:** a strategy runs a full session unattended in paper, then live at small size.
 
 ## 12. Open questions and assumptions
@@ -420,8 +422,14 @@ Per-stage workflow: `/opsx:propose <change-id>` → `openspec validate <change-i
 | Q6 | VPS provider (Mumbai region) and static IP binding | To confirm before S7 |
 | Q7 | Dhan family static IP mapping for spouse's account | Owner to request via apihelp@dhan.co; needed before S8 |
 | Q8 | Kill path that does not depend on the dashboard before S7 | Open. Telegram `/kill` (D-021) arrives only in S7, so during S3–S6 the kill switch is reachable only from the CLI and (from S6) the dashboard; Dhan's own kill switch remains the backstop. Decide before S3 whether to bring Telegram `/kill` forward |
+| Q9 | Trailing SL price source for options: option premium or underlying? | Open; decide in S4 (may refine D-025 via a new decision entry). Both are used in practice — the external notes use 30% of premium for option *buying*; the owner's view is that premium-based stops are mainly an option-*selling* practice. The candle-based methods need candles on whichever series is chosen ([`docs/field-notes-option-buying.md`](docs/field-notes-option-buying.md)) |
+| Q10 | Option selling and multi-leg strategies (straddles, strangles, spreads) in scope? | Open. Not designed for today: the engine models single-leg orders, the risk engine has no margin check, and there is no basket/leg-ordering or combined-premium SL. Decide before S9; would need its own OpenSpec change and decision entries |
+| Q11 | Equity product types in scope: intraday (MIS) only, or delivery (CNC) too? | **Resolved (2026-10-28):** both, chosen by strategy. Product type is a field on every order and position from S2, with each strategy (or manual trade) choosing its own product type. Consequences: a SELL is a short only for intraday products (cash-equity shorts are intraday-only; a CNC SELL is valid only against held quantity); the 15:10 own square-off applies to intraday products only; carried positions enter the next day's reconciliation (S2) and risk (S3). Equity lot size is 1 and freeze quantity does not apply, so the §7 sizing and quantity-sanity rules need per-segment handling. Follow-ups: Q12, Q13 |
+| Q12 | Exchange-side catastrophic SL for positions held overnight | Open; decide in S3. A day SL-M order expires at the close, so a carried CNC position has no exchange-side protection overnight and at the next open unless the SL is re-placed each morning (on engine start, after reconciliation) or a broker-side persistent order (e.g. Dhan Forever Order) is used. Trailing state must also persist across days (S4) |
+| Q13 | Daily max loss with carried positions | Open; decide in S3. Whether a carried position's MTM counts from the previous close (today's change only) or from entry; and whether carried CNC positions count toward max open positions and the kill switch flatten |
 
 ## 13. References
 - Decision log with rationale and rejected alternatives: [`docs/DECISIONS.md`](docs/DECISIONS.md)
+- External field notes on intraday NIFTY option buying (unverified hypotheses): [`docs/field-notes-option-buying.md`](docs/field-notes-option-buying.md)
 - Dhan API docs: https://dhanhq.co/docs/v2/
 - OpenSpec: https://openspec.dev
