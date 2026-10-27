@@ -29,10 +29,10 @@
 
 ## 5. Dhan live feed
 
-- [ ] 5.1 Implement the binary decoder `engine/broker/dhan/packets.py` (header plus codes 1, 2, 4, 5, 6, 7, 8 and 50; float32 → `Decimal` at 2 dp, then tick-size rounding when the instrument is known; LTT → UTC in one function), with comments explaining `struct` format strings and the trading meaning of each field (LTP, LTQ, ATP, OI); verify unit tests with packets built by `struct.pack`, covering every code, unknown codes, truncated packets, and the 24500.05 and >₹1,31,072 price cases
-- [ ] 5.2 Implement `DhanFeed` connect/subscribe (Quote mode, batches of 100, URL built in one place, `websockets` logger at WARNING, errors logged through `scrub_text`); verify tests against a local `websockets.serve` fake server that the subscribe JSON is correct, ticks reach a bus consumer, and a duplicate or over-cap request sends no message to the server, and a DEBUG-level capture test that a failing connection logs neither the token nor `token=`
-- [ ] 5.3 Implement reconnect with back-off and jitter, reset after a stable connection, the 805 long back-off, resubscription of the full set, and terminal stop on 806–810 or HTTP 401/403; verify fake-server tests for "Forced disconnect", "Repeated failures" and "Token expired mid-session"
-- [ ] 5.4 Implement the silence watchdog with an injectable market-hours clock; verify fake-server tests for the "Silent during market hours" and "Silent after hours" scenarios
+- [x] 5.1 Implement the binary decoder `engine/broker/dhan/packets.py` (header plus codes 1, 2, 4, 5, 6, 7, 8 and 50; float32 → `Decimal` at 2 dp, then tick-size rounding when the instrument is known; LTT → UTC in one function), with comments explaining `struct` format strings and the trading meaning of each field (LTP, LTQ, ATP, OI); verify unit tests with packets built by `struct.pack`, covering every code, unknown codes, truncated packets, and the 24500.05 and >₹1,31,072 price cases
+- [x] 5.2 Implement `DhanFeed` connect/subscribe (Quote mode, batches of 100, URL built in one place, `websockets` logger at WARNING, errors logged through `scrub_text`); verify tests against a local `websockets.serve` fake server that the subscribe JSON is correct, ticks reach a bus consumer, and a duplicate or over-cap request sends no message to the server, and a DEBUG-level capture test that a failing connection logs neither the token nor `token=`
+- [x] 5.3 Implement reconnect with back-off and jitter, reset after a stable connection, the 805 long back-off, resubscription of the full set, and terminal stop on 806–810 or HTTP 401/403; verify fake-server tests for "Forced disconnect", "Repeated failures" and "Token expired mid-session"
+- [x] 5.4 Implement the silence watchdog with an injectable market-hours clock; verify fake-server tests for the "Silent during market hours" and "Silent after hours" scenarios
 
 ## 6. Engine wiring, CLI and stack
 
