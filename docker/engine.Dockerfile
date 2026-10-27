@@ -19,6 +19,9 @@ COPY src ./src
 
 # Run as an unprivileged user.
 RUN useradd --system --uid 10001 --no-create-home sentinelx
+# Instrument cache (named volume in compose). Created here so a fresh volume copies this
+# ownership; otherwise Docker creates the mount point as root and the engine can't write it.
+RUN mkdir -p /var/lib/sentinelx/instruments && chown -R sentinelx /var/lib/sentinelx
 USER sentinelx
 
 ENV PATH="/app/.venv/bin:$PATH" \

@@ -70,7 +70,7 @@ async def download_to_cache(
     """Download, verify by parsing, then atomically move into the cache. Raises on failure."""
     # Every filesystem call is blocking I/O, so each one runs on a worker thread
     # (asyncio.to_thread, like Task.Run) and the event loop keeps serving ticks meanwhile.
-    final = cache_dir / f"instruments-{today.isoformat()}.csv"
+    final = cache_path(cache_dir, today)
     part = final.with_name(final.name + ".part")
     handle = await asyncio.to_thread(_open_part, part)
     try:
@@ -91,6 +91,11 @@ async def download_to_cache(
         ignored=result.ignored_rows,
     )
     return result
+
+
+def cache_path(cache_dir: Path, day: date) -> Path:
+    """Where the instrument file for ``day`` (IST) is cached."""
+    return cache_dir / f"instruments-{day.isoformat()}.csv"
 
 
 def _open_part(part: Path) -> BinaryIO:

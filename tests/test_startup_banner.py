@@ -86,6 +86,21 @@ def test_service_start_logs_one_banner_and_no_secrets(
     assert DB_PASSWORD not in rendered
 
 
+@pytest.mark.parametrize(
+    ("source", "shown"), [("simulated", "FEED: SIMULATED"), ("dhan", "FEED: DHAN")]
+)
+def test_engine_banner_names_feed_source(
+    no_telemetry_setup: None, monkeypatch: pytest.MonkeyPatch, source: str, shown: str
+) -> None:
+    """Spec market-feed "Feed source selection": the banner states the feed source."""
+    set_env(monkeypatch, FEED_SOURCE=source)
+    with capture_logs() as logs:
+        engine.main.start()
+    [banner] = logs
+    assert shown in banner["event"]
+    assert banner["feed"] == source
+
+
 @ENTRY_POINTS
 def test_live_start_is_prominent(
     no_telemetry_setup: None, monkeypatch: pytest.MonkeyPatch, entry: Callable[[], None]

@@ -5,6 +5,7 @@ engine neither crashes nor stops beating when Redis is unavailable.
 """
 
 import asyncio
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ from engine.config import EngineSettings
 from engine.diagnostics import answer_pings
 from engine.healthcheck import is_healthy
 from engine.main import run
+from engine.market_data.service import MarketDataService
 
 
 class DownRedis:
@@ -61,7 +63,13 @@ async def test_engine_keeps_beating_with_redis_down_and_stops_cleanly(
     settings = make_settings(monkeypatch, heartbeat)
     stop = asyncio.Event()
 
-    engine = asyncio.create_task(run(settings, redis=DownRedis(), stop=stop))  # type: ignore[arg-type]
+    async def no_instruments(_today: date) -> None:
+        return None  # no instrument download in this test
+
+    market_data = MarketDataService(settings, load=no_instruments)
+    engine = asyncio.create_task(
+        run(settings, redis=DownRedis(), stop=stop, market_data=market_data)  # type: ignore[arg-type]
+    )
     await asyncio.sleep(0.2)
     assert is_healthy(heartbeat), "liveness must not depend on Redis"
     assert not engine.done()

@@ -85,6 +85,10 @@ services:
       FEED_MAX_SUBSCRIPTIONS: ${FEED_MAX_SUBSCRIPTIONS:-200}
       DHAN_CLIENT_ID: ${DHAN_CLIENT_ID:-}
       DHAN_ACCESS_TOKEN: ${DHAN_ACCESS_TOKEN:-}
+      INSTRUMENT_CACHE_DIR: /var/lib/sentinelx/instruments
+    volumes:
+      # Daily Dhan instrument files; kept across restarts so an outage can fall back to cache.
+      - instrument-cache:/var/lib/sentinelx/instruments
     depends_on:
       redis:
         condition: service_healthy
@@ -146,6 +150,7 @@ services:
       retries: 3
 
 volumes:
+  instrument-cache:
   postgres-data:
   caddy-data:
   caddy-config:

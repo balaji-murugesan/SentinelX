@@ -14,6 +14,7 @@ from contracts.settings import SettingsError, load_settings
 from engine.config import EngineSettings
 from engine.diagnostics import answer_pings
 from engine.healthcheck import heartbeat_loop
+from engine.market_data.service import MarketDataService
 from observability.banner import log_startup_banner
 from observability.logging_setup import configure_logging
 from observability.tracing import configure_tracing, shutdown_tracing
@@ -32,7 +33,7 @@ def start() -> EngineSettings:
         raise SystemExit(str(exc)) from None
     configure_logging("engine", settings.log_level)
     configure_tracing("engine", settings.otel_exporter_otlp_endpoint)
-    log_startup_banner("engine", settings.mode)
+    log_startup_banner("engine", settings.mode, settings.feed_source)
     return settings
 
 
@@ -47,14 +48,20 @@ def _stop_on_signals(stop: asyncio.Event) -> None:
 
 
 async def run(
-    settings: EngineSettings, *, redis: Redis | None = None, stop: asyncio.Event | None = None
+    settings: EngineSettings,
+    *,
+    redis: Redis | None = None,
+    stop: asyncio.Event | None = None,
+    market_data: MarketDataService | None = None,
 ) -> None:
     """Run the engine's background tasks until ``stop`` is set (or one of them fails).
 
     asyncio.TaskGroup is like Task.WhenAll with fail-fast: if any task raises, the others are
     cancelled and the error propagates, so the process exits non-zero and Docker restarts it.
+    Market data contains its own failures (design §11), so it never triggers that.
     """
     stop = stop or asyncio.Event()
+    market_data = market_data or MarketDataService(settings)
     owned_redis = redis is None
     redis = redis or Redis.from_url(settings.redis_url.get_secret_value(), decode_responses=True)
     _stop_on_signals(stop)
@@ -64,6 +71,7 @@ async def run(
         async with asyncio.TaskGroup() as group:
             group.create_task(heartbeat_loop(settings.engine_heartbeat_path, stop))
             group.create_task(answer_pings(redis, stop))
+            group.create_task(market_data.run(stop))
     finally:
         if owned_redis:
             await redis.aclose()
