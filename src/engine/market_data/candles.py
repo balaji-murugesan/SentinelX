@@ -91,6 +91,8 @@ class MinuteBuilder:
         self._last_volume: dict[InstrumentKey, int] = {}
         # End of the newest closed interval per key: ticks before it are late.
         self._closed_until: dict[InstrumentKey, datetime] = {}
+        # Keys whose next candle is partial: ticks were lost while no candle was forming.
+        self._tainted: set[InstrumentKey] = set()
         self.late = 0
         self._late_at_warning = 0
         self._last_warning = float("-inf")
@@ -112,6 +114,7 @@ class MinuteBuilder:
         self._seen_since.pop(key, None)
         self._last_volume.pop(key, None)
         self._closed_until.pop(key, None)
+        self._tainted.discard(key)
 
     def add(self, tick: Tick) -> list[Candle]:
         """Fold one tick in. Returns the candle it closed early, if the tick opened a new minute."""
@@ -131,8 +134,9 @@ class MinuteBuilder:
         if forming is None:
             forming = _Forming(
                 start, tick.ltp, tick.ltp, tick.ltp, tick.ltp, delta,
-                partial=self._seen_since[key] > start or not volume_ok,
+                partial=self._seen_since[key] > start or not volume_ok or key in self._tainted,
             )  # fmt: skip
+            self._tainted.discard(key)
             self._forming[key] = forming
         else:
             forming.high = max(forming.high, tick.ltp)
@@ -152,9 +156,11 @@ class MinuteBuilder:
         return [self._close(key, forming) for key, forming in due]
 
     def mark_partial(self) -> None:
-        """The feed went down or ticks were dropped: every forming candle is incomplete."""
+        """The feed went down or ticks were dropped: every forming candle is incomplete, and
+        so is the next candle of each key that has none forming (the lost ticks may be its)."""
         for forming in self._forming.values():
             forming.partial = True
+        self._tainted.update(k for k in self._seen_since if k not in self._forming)
 
     def resync(self, since: datetime) -> None:
         """The feed reconnected at ``since``: intervals that began earlier were not seen whole,
@@ -247,6 +253,17 @@ class CandleStore:
         merged[candle.start] = candle
         held.clear()
         held.extend(merged[start] for start in sorted(merged))  # maxlen keeps the newest
+
+    def add_many(self, candles: Iterable[Candle]) -> None:
+        for candle in candles:
+            self.add(candle)
+
+    def at(self, key: InstrumentKey, minutes: int, start: datetime) -> Candle | None:
+        """The held candle with exactly this start, if any."""
+        for candle in self._candles.get((key, minutes), ()):
+            if candle.start == start:
+                return candle
+        return None
 
     def last(self, key: InstrumentKey, minutes: int, count: int) -> list[Candle]:
         """Up to ``count`` most recent completed candles, oldest first."""

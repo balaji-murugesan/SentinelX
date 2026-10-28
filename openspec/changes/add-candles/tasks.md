@@ -26,10 +26,10 @@
 
 ## 5. Warm-up, join, partial and refill
 
-- [ ] 5.1 Implement warm-up and join in `CandleService` (feed subscribe → history load → install history before the first live interval → live continues; design §6); verify the "Enough history at entry", "Warm-up before first use" and "Started mid-candle" scenarios with `SimulatedFeed` + `SimulatedHistory` and a fake clock, including no duplicate or overlapping intervals
-- [ ] 5.2 Implement partial marking from feed status and the builder's bus drop counter; verify the "Ticks dropped" scenario (1-minute and containing 5/15-minute candles partial) and that a candle seen whole while `CONNECTED` is not partial
-- [ ] 5.3 Implement refill after reconnect (wait for the reconnect interval to complete + 5 s, reload from the outage start, publish missed intervals, replace partial ones with `replaced` events); verify the "Two-minute outage" scenario with a forced status sequence
-- [ ] 5.4 Implement history-failure containment; verify the "History endpoint down" scenario (live candles continue, one error logged with key and reason, reads return live candles only) and that the next reconnect retries the load
+- [x] 5.1 Implement warm-up and join in `CandleService` (feed subscribe → history load → install history before the first live interval → live continues; design §6); verify the "Enough history at entry", "Warm-up before first use" and "Started mid-candle" scenarios with `SimulatedFeed` + `SimulatedHistory` and a fake clock, including no duplicate or overlapping intervals
+- [x] 5.2 Implement partial marking from feed status and the builder's bus drop counter; verify the "Ticks dropped" scenario (1-minute and containing 5/15-minute candles partial) and that a candle seen whole while `CONNECTED` is not partial
+- [x] 5.3 Implement refill after reconnect (wait for the reconnect interval to complete + 5 s, reload from the outage start, publish missed intervals, replace partial ones with `replaced` events); verify the "Two-minute outage" scenario with a forced status sequence
+- [x] 5.4 Implement history-failure containment; verify the "History endpoint down" scenario (live candles continue, one error logged with key and reason, reads return live candles only) and that the next reconnect retries the load
 
 ## 6. Engine wiring and CLI
 

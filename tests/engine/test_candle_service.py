@@ -18,6 +18,7 @@ from engine.market_data.candles import Candle, CandleStore
 from engine.market_data.clock import IST
 from engine.market_data.provider import SubscriptionLimitError, Subscriptions, Tick
 from engine.market_data.simulated import SimulatedFeed
+from tests.engine.candle_fakes import NoHistory
 
 OPTION = InstrumentKey.parse("NSE_FNO:53720")
 NIFTY = InstrumentKey.parse("IDX_I:13")
@@ -52,7 +53,9 @@ def make_service(
     bus = TickBus()
     subscriptions = Subscriptions(cap)
     feed = SimulatedFeed(bus, subscriptions, script=[])
-    service = CandleService(feed, bus, intervals=intervals, history_size=200, grace=GRACE, now=now)
+    service = CandleService(
+        feed, bus, NoHistory(), intervals=intervals, history_size=200, grace=GRACE, now=now
+    )
     return service, subscriptions
 
 
