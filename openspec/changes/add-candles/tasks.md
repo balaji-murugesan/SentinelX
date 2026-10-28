@@ -33,9 +33,9 @@
 
 ## 6. Engine wiring and CLI
 
-- [ ] 6.1 Wire `CandleService` into `MarketDataService` under `_supervise` (choosing `DhanHistory` or `SimulatedHistory` by `FEED_SOURCE`), with no candle requests at startup; verify a `run()` test that a candle request in simulated mode yields warm-up and live candles, and that a crash inside the candle service leaves the feed and heartbeat running
-- [ ] 6.2 Add CLI `candles watch <KEY> --tf <minutes>` (prints the last few warm-up candles, then each completed or replaced candle with its partial flag, until Ctrl+C; on Ctrl+C it re-fetches history for the watched period and prints, per complete live candle, the "Live candles agree with history" check: same start, live high ≤ history high, live low ≥ history low, and the open/close/volume differences); verify `uv run python -m cli --help` lists it, it runs against `FEED_SOURCE=simulated`, and a unit test of the comparison flags a live high above the history high
-- [ ] 6.3 Add the new variables to the README configuration table; verify the documented `candles watch` command runs as written in simulated mode
+- [x] 6.1 Wire `CandleService` into `MarketDataService` under `_supervise` (choosing `DhanHistory` or `SimulatedHistory` by `FEED_SOURCE`), with no candle requests at startup; verify a `run()` test that a candle request in simulated mode yields warm-up and live candles, and that a crash inside the candle service leaves the feed and heartbeat running
+- [x] 6.2 Add CLI `candles watch <KEY> --tf <minutes>` (prints the last few warm-up candles, then each completed or replaced candle with its partial flag, until Ctrl+C; on Ctrl+C it re-fetches history for the watched period and prints, per complete live candle, the "Live candles agree with history" check: same start, live high ≤ history high, live low ≥ history low, and the open/close/volume differences); verify `uv run python -m cli --help` lists it, it runs against `FEED_SOURCE=simulated`, and a unit test of the comparison flags a live high above the history high
+- [x] 6.3 Add the new variables to the README configuration table; verify the documented `candles watch` command runs as written in simulated mode
 
 ## 7. Integration check
 

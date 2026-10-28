@@ -12,13 +12,17 @@ Commands so far:
   instruments search T   Search the instrument master (today's cached file, else a download).
   feed watch KEY...      Print ticks and feed status for KEYs (e.g. IDX_I:13) until Ctrl+C,
                          from FEED_SOURCE (dhan or simulated).
+  candles watch KEY --tf M
+                         Print the last warm-up candles of M minutes for KEY, then each
+                         completed candle until Ctrl+C; on Ctrl+C, compare the live candles
+                         with a fresh history fetch (add-candles acceptance check).
 """
 
 import argparse
 import asyncio
 import json
 import sys
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -31,7 +35,9 @@ from engine.broker.dhan.instrument_cache import cache_path, load_instruments
 from engine.broker.dhan.instruments_source import parse_instrument_file
 from engine.broker.dhan.session import ProfileError, ProfileSummary, fetch_profile
 from engine.config import DhanCredentials, EngineSettings
-from engine.market_data.clock import IST, ist_date, utc_now
+from engine.market_data.candles import Candle, aggregate
+from engine.market_data.clock import IST, ist_date, last_completed_minute, utc_now
+from engine.market_data.history_source import HistoryUnavailable
 from engine.market_data.instruments import InstrumentMaster, Loader
 from engine.market_data.provider import FeedState, FeedStatus, Tick
 from engine.market_data.service import MarketDataService
@@ -65,6 +71,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     watch = feed.add_parser("watch", help="print ticks and feed status until Ctrl+C")
     # argparse calls InstrumentKey.parse on each value; a ValueError becomes a usage error.
     watch.add_argument("keys", nargs="+", type=InstrumentKey.parse, metavar="KEY")
+    candles = groups.add_parser("candles", help="candles built from the feed").add_subparsers(
+        dest="command", required=True
+    )
+    candle_watch = candles.add_parser(
+        "watch", help="print warm-up and live candles; compare with history on Ctrl+C"
+    )
+    candle_watch.add_argument("key", type=InstrumentKey.parse, metavar="KEY")
+    candle_watch.add_argument(
+        "--tf", type=int, default=5, choices=(1, 3, 5, 15), help="interval in minutes"
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -86,6 +102,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return asyncio.run(dhan_profile(credentials))
         if args.group == "instruments":
             return asyncio.run(instruments_search(settings, args.text, args.limit))
+        if args.group == "candles":
+            return asyncio.run(candles_watch(settings, args.key, args.tf))
         return asyncio.run(feed_watch(settings, args.keys))
     except KeyboardInterrupt:  # Ctrl+C: asyncio.run cancels the tasks, then we exit quietly
         return 0
@@ -345,6 +363,159 @@ def format_item(item: Tick | FeedStatus, master: InstrumentMaster) -> str:
         + f"  ltq={item.ltq if item.ltq is not None else '-'}"
         + f"  vol={item.volume if item.volume is not None else '-'}"
         + f"  exch={exchange:%H:%M:%S}  lag={lag_ms}ms"
+    )
+
+
+# ---- candles watch (add-candles task 6.2) ---------------------------------------------------
+
+WARM_UP_SHOWN = 5
+READY_TIMEOUT_S = 120.0  # the first instrument download can take a while
+
+
+async def candles_watch(
+    settings: EngineSettings,
+    key: InstrumentKey,
+    minutes: int,
+    stop: asyncio.Event | None = None,
+    *,
+    out: Callable[[str], None] = _print_now,
+    client: httpx.AsyncClient | None = None,
+    load: Loader | None = None,
+) -> int:
+    """Request candles for ``key``, print warm-up then live ``minutes``-candles; on Ctrl+C (or
+    ``stop``) compare the complete live ones with history. Returns 1 if the feed goes DOWN."""
+    stop = stop or asyncio.Event()
+    intervals = ",".join(str(m) for m in sorted({1, minutes}))
+    watch_settings = settings.model_copy(
+        update={"feed_instruments": "", "candle_intervals": intervals}
+    )
+    live: dict[datetime, Candle] = {}
+    async with client or httpx.AsyncClient() as http:
+        service = MarketDataService(
+            watch_settings, http=http, load=load or cached_loader(settings, http)
+        )
+        events = service.candles.events.subscribe("cli")
+        runner = asyncio.create_task(service.run(stop))
+        code = 0
+        try:
+            if not await _ready(service, key, settings.feed_source):
+                out(f"-- {key} not ready: instrument master or history unavailable")
+                return 1
+            await service.candles.request([key], "cli")
+            warm = service.candles.last(key, minutes, WARM_UP_SHOWN)
+            held = len(service.candles.last(key, minutes, settings.candle_history))
+            out(f"-- warm-up: {held} completed {minutes}-minute candles; last {len(warm)}:")
+            for candle in warm:
+                out(format_candle(candle))
+            out("-- live (Ctrl+C to stop and compare with history):")
+            code = await _print_live(service, events, minutes, live, stop, out)
+        except asyncio.CancelledError:
+            # Ctrl+C: asyncio.run cancelled this task. uncancel() marks the cancellation as
+            # handled, so the comparison below may still await; main() then exits quietly.
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+        finally:
+            stop.set()
+            await runner
+        if code == 0:
+            for line in await _compare_with_history(service, key, minutes, live):
+                out(line)
+    return code
+
+
+async def _ready(service: MarketDataService, key: InstrumentKey, source: str) -> bool:
+    """Wait until history can serve ``key``: Dhan needs the instrument type from the master."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + READY_TIMEOUT_S
+    while loop.time() < deadline:
+        if service.history.source is not None and (
+            source == "simulated" or service.master.get(key) is not None
+        ):
+            return True
+        status = service.bus.status
+        if status is not None and status.state is FeedState.DOWN:
+            return False
+        await asyncio.sleep(0.1)
+    return False
+
+
+async def _print_live(
+    service: MarketDataService,
+    events: AsyncIterator[Candle],
+    minutes: int,
+    live: dict[datetime, Candle],
+    stop: asyncio.Event,
+    out: Callable[[str], None],
+) -> int:
+    while not stop.is_set():
+        try:
+            candle = await asyncio.wait_for(anext(events), timeout=1.0)
+        except TimeoutError:
+            status = service.bus.status
+            if status is not None and status.state is FeedState.DOWN:
+                out(f"-- feed DOWN: {status.reason}")
+                return 1
+            continue
+        if candle.minutes == minutes:
+            live[candle.start] = candle  # a replaced candle supersedes the first version
+            out(format_candle(candle))
+    return 0
+
+
+async def _compare_with_history(
+    service: MarketDataService, key: InstrumentKey, minutes: int, live: dict[datetime, Candle]
+) -> list[str]:
+    complete = [c for c in sorted(live.values(), key=lambda c: c.start) if not c.partial]
+    if not complete:
+        return ["-- comparison: no complete live candles to compare"]
+    try:
+        history = await service.history.minutes(
+            key, complete[0].start, last_completed_minute(utc_now())
+        )
+    except HistoryUnavailable as exc:
+        return [f"-- comparison skipped: history unavailable ({exc})"]
+    return compare_candles(complete, aggregate(history, minutes))
+
+
+def compare_candles(live: Sequence[Candle], history: Sequence[Candle]) -> list[str]:
+    """The "Live candles agree with history" check: for each complete live candle, history
+    has the same start, live high <= history high and live low >= history low (Quote-mode
+    snapshots can miss trades, never invent them). Open, close and volume differences are
+    reported, not failed."""
+    by_start = {c.start: c for c in history}
+    lines, failures = [], 0
+    for candle in live:
+        when = f"{candle.start.astimezone(IST):%H:%M}"
+        match = by_start.get(candle.start)
+        if match is None:
+            failures += 1
+            lines.append(f"FAIL {when}  no history candle with this start")
+            continue
+        problems = []
+        if candle.high > match.high:
+            problems.append(f"live high {candle.high} > history {match.high}")
+        if candle.low < match.low:
+            problems.append(f"live low {candle.low} < history {match.low}")
+        diffs = [
+            f"{name} {getattr(candle, name)} vs {getattr(match, name)}"
+            for name in ("open", "close", "volume")
+            if getattr(candle, name) != getattr(match, name)
+        ]
+        failures += bool(problems)
+        status = "FAIL" if problems else "ok  "
+        detail = "; ".join(problems + diffs) or "identical"
+        lines.append(f"{status} {when}  {detail}")
+    verdict = "PASS" if failures == 0 else f"FAIL ({failures})"
+    return [f"-- comparison with history: {verdict}, {len(live)} complete candles", *lines]
+
+
+def format_candle(c: Candle) -> str:
+    flags = " partial" if c.partial else ""
+    flags += " replaced" if c.replaced else ""
+    return (
+        f"{c.start.astimezone(IST):%Y-%m-%d %H:%M}  {c.minutes}m  O {c.open}  H {c.high}  "
+        f"L {c.low}  C {c.close}  V {c.volume}{flags}"
     )
 
 

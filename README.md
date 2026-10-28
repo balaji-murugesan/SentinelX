@@ -86,6 +86,9 @@ done
 | `FEED_SOURCE` | Required: `dhan` (real prices) or `simulated` (dev/CI; refused in live mode) | S1 |
 | `FEED_INSTRUMENTS` / `FEED_MAX_SUBSCRIPTIONS` | Instruments streamed at startup (`SEGMENT:ID,…`) and the subscription cap (default 200) | S1 |
 | `DHAN_CLIENT_ID` / `DHAN_ACCESS_TOKEN` | Broker credentials (from web.dhan.co → DhanHQ Trading APIs); the token lasts ~24 h, paste a fresh one daily | S1 |
+| `CANDLE_INTERVALS` | Optional; candle intervals in minutes, anchored to 09:15 IST, from `1,3,5,15` (default all four) | S1 |
+| `CANDLE_HISTORY` / `CANDLE_CLOSE_GRACE_S` | Optional; completed candles kept per instrument and interval (default 200) and seconds after an interval ends before it closes (default 2) | S1 |
+| `DHAN_HISTORY_RATE_PER_S` | Optional; Dhan intraday-history requests per second for candle warm-up (default 4; Dhan's limit is 5) | S1 |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_ALLOWED_CHAT_IDS` | Alerts and `/kill` fallback | S7 |
 
 The database creates its roles once, when its volume is first made. To change a password later,
@@ -128,6 +131,13 @@ remove it afterwards with `Remove-Item Env:TEST_REDIS_URL`.
 
 `FEED_SOURCE=simulated` drives the engine with simulated ticks outside market hours (refused in
 live mode); `cd src/web && npm install && npm run dev` runs the dashboard (Stage 6).
+
+To see candles for one instrument, with history warm-up first and then live candles; on Ctrl+C
+it compares the live candles with a fresh history fetch:
+
+```bash
+uv run --env-file .env python -m cli candles watch IDX_I:13 --tf 5
+```
 
 ## Each morning: fresh Dhan token
 

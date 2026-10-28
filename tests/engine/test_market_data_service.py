@@ -10,7 +10,7 @@ feed leaves the heartbeat running, a failed session check keeps the engine up (b
 import asyncio
 import time
 from collections.abc import Callable, Iterable
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -186,3 +186,70 @@ async def test_slow_instrument_refresh_does_not_stall_ticks(
 
     stop.set()
     await asyncio.wait_for(engine, timeout=2)
+
+
+# ---- candles (add-candles task 6.1) -----------------------------------------------------
+
+
+def session_clock(start: datetime) -> Callable[[], datetime]:
+    """A clock running at real speed from ``start`` (a session time), so the boundary timer
+    really fires but candles land inside 09:15-15:30 IST whenever the test runs."""
+    origin = time.monotonic()
+    return lambda: start + timedelta(seconds=time.monotonic() - origin)
+
+
+async def test_candle_request_in_simulated_mode_gets_warm_up_and_live_candles(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # 10:05:59.5 IST: the 10:05 minute closes at 10:06:02 by this clock, ~2.5 s from now.
+    clock = session_clock(datetime(2026, 10, 27, 4, 35, 59, 500_000, tzinfo=UTC))
+    settings = make_settings(monkeypatch, tmp_path, FEED_INSTRUMENTS="")
+    service = MarketDataService(settings, load=no_instruments, now=clock)
+    events = service.candles.events.subscribe("test")
+    engine, stop = start(settings, service)
+
+    await service.candles.request([NIFTY], "test")
+    warm = service.candles.last(NIFTY, 15, 200)
+    assert len(warm) == 200 and not any(c.partial for c in warm)  # simulated history
+    live = await asyncio.wait_for(anext(events), timeout=5)
+    assert live.key == NIFTY and live.minutes == 1
+    assert live.start == datetime(2026, 10, 27, 4, 35, tzinfo=UTC) and live.partial  # mid-minute
+
+    stop.set()
+    await asyncio.wait_for(engine, timeout=2)
+
+
+class CrashingCandles:
+    async def run(self, stop: asyncio.Event) -> None:
+        raise RuntimeError("bug in the candle service")
+
+
+async def test_crashing_candle_service_leaves_feed_and_heartbeat_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = make_settings(monkeypatch, tmp_path)
+    service = MarketDataService(settings, load=no_instruments)
+    service.candles = CrashingCandles()  # type: ignore[assignment]
+    consumer = service.bus.subscribe("test")
+    engine, stop = start(settings, service)
+
+    await next_tick(consumer)
+    await asyncio.sleep(0.1)
+    await next_tick(consumer)  # ticks still flow after the candle service died
+    assert not engine.done()
+    assert is_healthy(settings.engine_heartbeat_path)
+
+    stop.set()
+    await asyncio.wait_for(engine, timeout=2)
+
+
+async def test_stop_before_the_first_load_still_shuts_down(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Regression (found in add-candles 6.2): with stop already set, refresh_loop never loads,
+    # so the feed must not wait for a first load that will never come.
+    settings = make_settings(monkeypatch, tmp_path)
+    service = MarketDataService(settings, load=no_instruments)
+    stop = asyncio.Event()
+    stop.set()
+    await asyncio.wait_for(service.run(stop), timeout=3)
