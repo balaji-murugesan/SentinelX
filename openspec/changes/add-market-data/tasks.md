@@ -43,10 +43,11 @@
 
 ## 7. Integration check
 
-- [ ] 7.1 Run the full definition of done: `uv run ruff format --check .`, `uv run ruff check .`, `uv run mypy src`, `uv run lint-imports`, `uv run pytest`, `openspec validate add-market-data --strict`; verify all pass
-- [ ] 7.2 Owner smoke test during market hours (never in CI): `uv run --env-file .env python -m cli feed watch IDX_I:13 <one NSE_FNO option key>`. Compare LTPs with Dhan's web terminal, confirm exchange time vs receive time (resolves the LTT time-zone question), toggle the network off and on, and confirm automatic reconnect and resumed ticks; record the result in this task
+- [x] 7.1 Run the full definition of done: `uv run ruff format --check .`, `uv run ruff check .`, `uv run mypy src`, `uv run lint-imports`, `uv run pytest`, `openspec validate add-market-data --strict`; verify all pass
+- [x] 7.2 Owner smoke test during market hours (never in CI): `uv run --env-file .env python -m cli feed watch IDX_I:13 <one NSE_FNO option key>`. Compare LTPs with Dhan's web terminal, confirm exchange time vs receive time (resolves the LTT time-zone question), toggle the network off and on, and confirm automatic reconnect and resumed ticks; record the result in this task
   - 2026-10-28 01:18 IST (after hours, `IDX_I:13`, `NSE_FNO:54136`): session check valid; reconnect **verified** (Wi-Fi off → RECONNECTING with back-off 1.1/2.1/3.4/8.1/15.8 s then ~30 s cap, DNS errors not terminal → CONNECTED, both keys resubscribed, ticks resumed); no silence-watchdog reconnect after hours; no token in output. Last-trade times (option 15:39:59 IST, inside NSE's closing window) favour the IST-epoch assumption but are not proof.
-  - **Still open:** LTP comparison and `lag=` during market hours (owner, after 09:20 IST). Guard added meanwhile: `DhanFeed` logs an ERROR (once per run) if a live tick's lag is within 10 min of ±5h30m during market hours (`packets.lag_suggests_wrong_ltt_zone`, tested in `test_dhan_packets.py` / `test_dhan_feed.py`). Do not archive `add-market-data` until this is confirmed.
+  - Guard added after that run: `DhanFeed` logs an ERROR (once per run) if a live tick's lag is within 10 min of ±5h30m during market hours (`packets.lag_suggests_wrong_ltt_zone`, tested in `test_dhan_packets.py` / `test_dhan_feed.py`).
+  - 2026-10-28 10:00 IST (market hours, `FEED_SOURCE=dhan`, `IDX_I:13`, `NSE_FNO:53720` NIFTY 03 Nov 22600 CE, ATM): session check valid; LTPs **match** Dhan's web terminal (owner-confirmed); `lag=` 100–1,100 ms in a once-per-second sawtooth, never near 5h30m, guard silent. **LTT is an IST epoch — resolved.** The sawtooth comes from LTT's 1-second resolution, so the minimum lag (~100–200 ms) is the real feed delay; latency budgets must use the engine's receive time, not LTT. Option `ltq` in multiples of the 65 lot; index `ltq`/`vol` 0 as expected; no token or client ID in output.
 
 ## Workflow follow-up
 
