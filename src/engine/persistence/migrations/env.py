@@ -13,10 +13,13 @@ from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from engine.persistence.tables import metadata
+
 config = context.config
 
-# Stage 2 will point this at the SQLAlchemy models' MetaData for autogenerate.
-target_metadata = None
+# The trading tables' MetaData: lets `alembic check` spot drift between tables.py and the
+# migrations.
+target_metadata = metadata
 
 # Created by infra/postgres/init.sql and owned by the migrate role. Keeping alembic_version
 # here means the engine role has no access to it.

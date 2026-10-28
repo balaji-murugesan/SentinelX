@@ -129,6 +129,16 @@ docker stop sx-redis
 In PowerShell, set the variable with `$env:TEST_REDIS_URL = "redis://127.0.0.1:6380/15"` and
 remove it afterwards with `Remove-Item Env:TEST_REDIS_URL`.
 
+The trading-state tests (orders, fills, positions; Stage 2) also run against a real Postgres
+when `TEST_DATABASE_URL` names a throwaway database ending in `_test` (they migrate and
+truncate it):
+
+```bash
+docker run -d --rm --name sx-pg-test -e POSTGRES_PASSWORD=test -e POSTGRES_DB=sentinelx_test -p 127.0.0.1:5433:5432 postgres:16-alpine
+TEST_DATABASE_URL=postgresql+asyncpg://postgres:test@127.0.0.1:5433/sentinelx_test uv run pytest
+docker stop sx-pg-test
+```
+
 `FEED_SOURCE=simulated` drives the engine with simulated ticks outside market hours (refused in
 live mode); `cd src/web && npm install && npm run dev` runs the dashboard (Stage 6).
 
