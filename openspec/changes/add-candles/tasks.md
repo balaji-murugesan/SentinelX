@@ -13,9 +13,9 @@
 
 ## 3. Store, closing timer and candle subscriptions
 
-- [ ] 3.1 Implement `CandleStore` (`deque(maxlen=CANDLE_HISTORY)` per key and timeframe, last-N read oldest first, replace-by-start for refill), commenting `deque(maxlen=…)`; verify the "Read the last five" and "Fewer candles than asked" scenarios and that the forming candle is never returned
-- [ ] 3.2 Implement the shared boundary timer (sleep to next minute boundary + grace by the injectable clock, close due 1-minute candles, then due aggregates, publish completion events on a `Bus[Candle]`); verify the "Close on time with no further ticks" scenario with a fake clock, and that a tick for a later interval closes the candle before the timer does
-- [ ] 3.3 Implement `CandleService.request` / `release` on top of the feed's owner-based subscriptions (design §9); verify the "Two owners, one releases" and "Over the feed cap" scenarios against `SimulatedFeed`
+- [x] 3.1 Implement `CandleStore` (`deque(maxlen=CANDLE_HISTORY)` per key and timeframe, last-N read oldest first, replace-by-start for refill), commenting `deque(maxlen=…)`; verify the "Read the last five" and "Fewer candles than asked" scenarios and that the forming candle is never returned
+- [x] 3.2 Implement the shared boundary timer (sleep to next minute boundary + grace by the injectable clock, close due 1-minute candles, then due aggregates, publish completion events on a `Bus[Candle]`); verify the "Close on time with no further ticks" scenario with a fake clock, and that a tick for a later interval closes the candle before the timer does
+- [x] 3.3 Implement `CandleService.request` / `release` on top of the feed's owner-based subscriptions (design §9); verify the "Two owners, one releases" and "Over the feed cap" scenarios against `SimulatedFeed`
 
 ## 4. History sources
 

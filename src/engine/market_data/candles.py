@@ -6,6 +6,7 @@ trade) and volume (quantity traded). Trailing-stop methods (S4, D-025) and their
 """
 
 import time
+from collections import deque
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -97,6 +98,10 @@ class MinuteBuilder:
     @property
     def keys(self) -> list[InstrumentKey]:
         return list(self._seen_since)
+
+    def seen_since(self, key: InstrumentKey) -> datetime | None:
+        """When the builder started seeing every tick for ``key`` (None if not watched)."""
+        return self._seen_since.get(key)
 
     def watch(self, key: InstrumentKey, since: datetime) -> None:
         """Start building candles for ``key``; ticks are seen from ``since`` on."""
@@ -219,3 +224,43 @@ def combine(minute_candles: Sequence[Candle], minutes: int, start: datetime) -> 
         volume=sum(c.volume for c in minute_candles),
         partial=any(c.partial for c in minute_candles),
     )
+
+
+class CandleStore:
+    """Completed candles per (instrument, interval), newest last, at most ``size`` each.
+
+    ``deque(maxlen=n)`` is a fixed-size ring buffer: appending to a full deque silently drops
+    the oldest item from the other end (like a bounded queue that discards from the front).
+    """
+
+    def __init__(self, size: int) -> None:
+        self._size = size
+        self._candles: dict[tuple[InstrumentKey, int], deque[Candle]] = {}
+
+    def add(self, candle: Candle) -> None:
+        """Append a newer candle, or replace the one with the same start (refill)."""
+        held = self._candles.setdefault((candle.key, candle.minutes), deque(maxlen=self._size))
+        if not held or candle.start > held[-1].start:
+            held.append(candle)
+            return
+        merged = {c.start: c for c in held}
+        merged[candle.start] = candle
+        held.clear()
+        held.extend(merged[start] for start in sorted(merged))  # maxlen keeps the newest
+
+    def last(self, key: InstrumentKey, minutes: int, count: int) -> list[Candle]:
+        """Up to ``count`` most recent completed candles, oldest first."""
+        held = self._candles.get((key, minutes))
+        if not held or count <= 0:
+            return []
+        return list(held)[-count:]
+
+    def between(
+        self, key: InstrumentKey, minutes: int, start: datetime, end: datetime
+    ) -> list[Candle]:
+        """Held candles whose start is in [start, end), oldest first."""
+        return [c for c in self._candles.get((key, minutes), ()) if start <= c.start < end]
+
+    def drop(self, key: InstrumentKey) -> None:
+        for held_key in [k for k in self._candles if k[0] == key]:
+            del self._candles[held_key]
