@@ -4,7 +4,7 @@
 |---|---|
 | **Owner** | Balaji |
 | **Status** | Draft v2 |
-| **Last updated** | 2026-10-25 |
+| **Last updated** | 2026-10-28 |
 | **Broker** | Dhan (DhanHQ API v2) |
 | **Markets** | NSE F&O intraday (primary), NSE equity |
 | **Related** | [`CLAUDE.md`](CLAUDE.md) · [`docs/DECISIONS.md`](docs/DECISIONS.md) · [`README.md`](README.md) |
@@ -351,7 +351,7 @@ S0–S7 are **Phase 1**: one account (the owner's), ending in live trading. S8�
 | Stage | OpenSpec change | What gets built | Done when |
 |---|---|---|---|
 | **S0 Foundation** | `add-foundation` | Repo layout, uv project, Docker Compose (engine, api, redis, postgres, caddy, otel + one-shot migrate), config with paper/live gate, structured logging with masking, OpenTelemetry, CI, `.env.example` | All services healthy; one trace spans engine and api; CI green |
-| **S1 Market data** | `add-market-data` | Dhan auth/token handling, instrument master (security ID, lot size, tick size, freeze qty), live feed with auto-reconnect, `SimulatedFeed`, internal tick bus, candle builder with historical warm-up | Ticks reach consumers; a forced disconnect recovers on its own; the simulated feed uses the same code path |
+| **S1 Market data** | `add-market-data`, `add-candles` | Dhan auth/token handling, instrument master (security ID, lot size, tick size, freeze qty), live feed with auto-reconnect, `SimulatedFeed`, internal tick bus, candle builder with historical warm-up | Ticks reach consumers; a forced disconnect recovers on its own; the simulated feed uses the same code path |
 | **S2 Orders & positions** | `add-order-position-core` | Contracts and DB tables carrying `account_id`, `BrokerAdapter` protocol, `PaperBroker` with slippage and trading costs, required `RiskGate` pre-trade seam (paper-only stub gate), read-only Dhan adapter (order book, positions, order-update feed), order state machine, positions and MTM P&L, migrations, restart recovery and reconciliation, test CLI | Paper orders fill against live prices; kill -9 then restart restores identical state; `Unknown` orders are reconciled, never retried; no order path skips the `RiskGate`; reconciliation passes against recorded real Dhan responses |
 | **S3 Risk engine** | `add-risk-engine` | All §7 risk rules behind the S2 `RiskGate` seam (replacing the stub), catastrophic SL on entry, kill switch, rate limiter with exit priority, tighten-only edits in market hours | One unit test per rule; the kill switch flattens everything and blocks entries; fail-closed is verified with Postgres down |
 | **S4 Trailing SL & exits** | `add-trailing-exits` | Pluggable trailing-SL methods chosen per trade with a default (D-025, [`docs/trailing-sl.md`](docs/trailing-sl.md)), exit manager with exit-before-cancel, persisted trail and method state | Scripted price paths give the expected exits for every method, long and short (property-based tests); trail state survives restart |
@@ -368,8 +368,8 @@ Per-stage workflow: `/opsx:propose <change-id>` → `openspec validate <change-i
 - **Scope:** repo layout, `pyproject.toml` (uv), Docker Compose (engine, api, redis, postgres, caddy, otel-collector), config loading, structured logging, OpenTelemetry, CI (ruff, mypy --strict, pytest, import-linter, openspec validate), `.env.example`.
 - **Accept:** `docker compose up` → all services healthy; one trace visible across engine and api; CI green on an empty skeleton.
 
-### S1 — Market data · `add-market-data`
-- **Scope:** Dhan auth/token handling, instrument master download + lookup (security ID, lot size, tick size, freeze qty), live feed client with auto-reconnect, `SimulatedFeed` for after-hours dev, internal tick bus. Candle builder (ticks → 1m/5m/15m candles, completed candles only) and recent historical candles to warm up indicators, needed by the candle-based trailing methods (D-025).
+### S1 — Market data · `add-market-data`, `add-candles`
+- **Scope:** `add-market-data` (archived 2026-10-28): Dhan auth/token handling, instrument master download + lookup (security ID, lot size, tick size, freeze qty), live feed client with auto-reconnect, `SimulatedFeed` for after-hours dev, internal tick bus. `add-candles`: candle builder (ticks → 1m/5m/15m candles, completed candles only) and recent historical candles to warm up indicators, needed by the candle-based trailing methods (D-025).
 - **Accept:** ticks for configured instruments reach engine consumers; forced disconnect recovers automatically; simulated feed drives the same code path.
 
 ### S2 — Orders & positions · `add-order-position-core`
@@ -418,7 +418,7 @@ Per-stage workflow: `/opsx:propose <change-id>` → `openspec validate <change-i
 | Q2 | Family accounts needed at first go-live? | **Resolved:** No. Phase 1 = owner's Dhan account only; `account_id` in the data model from S2; spouse's Dhan account in S8; Zerodha stays manual (D-020, D-022) |
 | Q3 | Bare-bones UI earlier than S6? | No — CLI + tests until S6 |
 | Q4 | Dhan Data API subscription needed for the live feed? | **Resolved (2026-10-27):** Yes. Confirmed via `python -m cli dhan profile`: `dataPlan` Active, `dataValidity` 2026-11-27. Renew before it lapses; the engine refuses to start the feed when the plan is inactive |
-| Q5 | Dhan access-token lifetime and renewal flow | To confirm before S1 |
+| Q5 | Dhan access-token lifetime and renewal flow | **Resolved (2026-10-28):** a token lasts ~24 h from generation (observed via the startup session check's `tokenValidity`). Renewal is manual: the owner generates a token on web.dhan.co and pastes it into `.env` before market open; the engine never mints tokens, warns ahead of expiry, and stops the feed on a rejected token (`broker-session` spec) |
 | Q6 | VPS provider (Mumbai region) and static IP binding | To confirm before S7 |
 | Q7 | Dhan family static IP mapping for spouse's account | Owner to request via apihelp@dhan.co; needed before S8 |
 | Q8 | Kill path that does not depend on the dashboard before S7 | Open. Telegram `/kill` (D-021) arrives only in S7, so during S3–S6 the kill switch is reachable only from the CLI and (from S6) the dashboard; Dhan's own kill switch remains the backstop. Decide before S3 whether to bring Telegram `/kill` forward |

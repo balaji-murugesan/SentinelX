@@ -16,7 +16,7 @@ What each stage builds and its acceptance criteria: [`PRD.md` §11](PRD.md#11-de
 | Stage | | OpenSpec change | Status |
 |---|---|---|---|
 | S0 | Foundation | `add-foundation` | ✅ Done (archived 2026-10-25) |
-| S1 | Market data | `add-market-data` | ⬜ Next |
+| S1 | Market data | `add-market-data`, `add-candles` | 🟡 In progress: `add-market-data` ✅ (archived 2026-10-28); `add-candles` next |
 | S2 | Orders & positions | `add-order-position-core` | ⬜ |
 | S3 | Risk engine | `add-risk-engine` | ⬜ |
 | S4 | Trailing SL & exits | `add-trailing-exits` | ⬜ |
