@@ -100,6 +100,19 @@ class EngineSettings(ModeSettings):
     # Dhan intraday-history request starts per second (kept under Dhan's data-API limit).
     dhan_history_rate_per_s: float = Field(default=4, gt=0, le=20)
 
+    # ---- orders and positions (add-order-position-core) ----------------------------------
+    # Label for the owner's account in every order, fill and position record (D-020). Not the
+    # Dhan client ID, so no account secret ever lands in rows or logs.
+    account_id: str = Field(default="main", min_length=1, max_length=32, pattern=r"^[a-z0-9_-]+$")
+    # Paper market fills move this many ticks against the trader (buy higher, sell lower).
+    paper_slippage_ticks: int = Field(default=1, ge=0, le=20)
+    # A paper market order is rejected if the latest price is older than this.
+    paper_price_max_age_s: float = Field(default=5, gt=0, le=300)
+    # Broker acknowledgement wait before an order becomes Unknown (never retried, rule 4).
+    order_ack_timeout_s: float = Field(default=5, gt=0, le=60)
+    # Minimum seconds between Redis snapshot writes.
+    snapshot_interval_s: float = Field(default=1, gt=0, le=60)
+
     @field_validator("database_url")
     @classmethod
     def _database_scheme(cls, value: SecretStr) -> SecretStr:

@@ -4,7 +4,7 @@ Owner pause points (commit-and-pause policy): after groups 2, 3, 4, 6 and 8 (ord
 
 ## 1. Contracts and settings
 
-- [ ] 1.1 Add `contracts/orders.py` (`OrderSide`, `ProductType` INTRADAY/CNC/MARGIN, `OrderType` MARKET/LIMIT, `OrderState`, `Order`, `Fill` with cost breakdown, `Position`) and `contracts/commands.py` (`PlaceOrder`, `CancelOrder`, `CommandResult`, stream and reply-key names), all pydantic v2 with `schema_version` and `account_id`, `Decimal` money, aware UTC times; comment the pydantic idioms with C# analogies; verify unit tests for JSON round trips, the "Limit price on a market order" scenario at model level, and `lint-imports` (contracts imports nothing internal)
+- [x] 1.1 Add `contracts/orders.py` (`OrderSide`, `ProductType` INTRADAY/CNC/MARGIN, `OrderType` MARKET/LIMIT, `OrderState`, `Order`, `Fill` with cost breakdown, `Position`) and `contracts/commands.py` (`PlaceOrder`, `CancelOrder`, `CommandResult`, stream and reply-key names), all pydantic v2 with `schema_version` and `account_id`, `Decimal` money, aware UTC times; comment the pydantic idioms with C# analogies; verify unit tests for JSON round trips, the "Limit price on a market order" scenario at model level, and `lint-imports` (contracts imports nothing internal)
 - [ ] 1.2 Add `ACCOUNT_ID`, `PAPER_SLIPPAGE_TICKS`, `PAPER_PRICE_MAX_AGE_S`, `ORDER_ACK_TIMEOUT_S`, `SNAPSHOT_INTERVAL_S` to `EngineSettings` (design §10) with bounds, add them to the test `CONFIG_VARS`, and (**owner**) to `.env.example` with real values; verify settings tests for defaults and bounds, and `test_env_example_resolves_to_paper`
 
 ## 2. Persistence
