@@ -21,9 +21,9 @@ Owner pause points (commit-and-pause policy): after groups 2, 3, 4, 6 and 8 (ord
 
 ## 4. Broker adapter, paper broker and costs
 
-- [ ] 4.1 Define `BrokerAdapter` (place, cancel, order_book, updates) and `BrokerUpdate`/`BrokerAck`/`BrokerOrder` values in `engine/broker/adapter.py` (design §5); verify mypy accepts `PaperBroker` and a test fake as implementations
-- [ ] 4.2 Implement `PaperBroker` market fills (last price ± slippage, stale/missing price rejects, no network); verify the "Paper market order", "Buy with one tick of slippage" and "Stale price" scenarios, and a test that patches `httpx` and sockets to fail if any network call happens
-- [ ] 4.3 Implement resting limit orders (trade-through at the limit, marketable on arrival at the better price, cancel, rebuild from open orders); verify the "Resting buy limit", "Marketable limit", "Cancel a resting limit order" and "Restart with a resting limit" scenarios (the last at broker level)
+- [x] 4.1 Define `BrokerAdapter` (place, cancel, order_book, updates) and `BrokerUpdate`/`BrokerAck`/`BrokerOrder` values in `engine/broker/adapter.py` (design §5); verify mypy accepts `PaperBroker` and a test fake as implementations
+- [x] 4.2 Implement `PaperBroker` market fills (last price ± slippage, stale/missing price rejects, no network); verify the "Paper market order", "Buy with one tick of slippage" and "Stale price" scenarios, and a test that patches `httpx` and sockets to fail if any network call happens
+- [x] 4.3 Implement resting limit orders (trade-through at the limit, marketable on arrival at the better price, cancel, rebuild from open orders); verify the "Resting buy limit", "Marketable limit", "Cancel a resting limit order" and "Restart with a resting limit" scenarios (the last at broker level)
 - [ ] 4.4 Implement `engine/broker/costs.py` (rate table and calculator per design §7, paisa rounding); verify the "Option sell costs" and "Costs reduce P&L" scenarios with worked numbers in the tests; **owner step**: compare one option and one equity-intraday fill with Dhan's brokerage calculator and correct the table if needed, recording the date checked in `costs.py`
 
 ## 5. Positions
