@@ -8,8 +8,8 @@
 
 ## 2. One-minute builder and aggregation
 
-- [ ] 2.1 Implement the 1-minute tick builder (design §1, §3, §4): OHLC by exchange time, volume from cumulative day-volume deltas (first tick has no baseline, a negative delta counts 0 and marks partial, missing volume adds 0), early close when a later-interval tick arrives, late ticks counted and rate-limit warned; verify tests for "OHLC from ticks", "Volume from cumulative day volume", "Index candle", "Tick after publication" and "Illiquid option"
-- [ ] 2.2 Implement aggregation from 1-minute candles to N minutes with partial propagation; verify the "Derived 15-minute candle" scenario and `hypothesis` properties: aggregating equals building N-minute candles directly from the same ticks, high ≥ max(open, close), low ≤ min(open, close), and an aggregate is partial iff any constituent is
+- [x] 2.1 Implement the 1-minute tick builder (design §1, §3, §4): OHLC by exchange time, volume from cumulative day-volume deltas (first tick has no baseline, a negative delta counts 0 and marks partial, missing volume adds 0), early close when a later-interval tick arrives, late ticks counted and rate-limit warned; verify tests for "OHLC from ticks", "Volume from cumulative day volume", "Index candle", "Tick after publication" and "Illiquid option"
+- [x] 2.2 Implement aggregation from 1-minute candles to N minutes with partial propagation; verify the "Derived 15-minute candle" scenario and `hypothesis` properties: aggregating equals building N-minute candles directly from the same ticks, high ≥ max(open, close), low ≤ min(open, close), and an aggregate is partial iff any constituent is
 
 ## 3. Store, closing timer and candle subscriptions
 
