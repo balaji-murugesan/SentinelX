@@ -15,9 +15,9 @@ Owner pause points (commit-and-pause policy): after groups 2, 3, 4, 6 and 8 (ord
 
 ## 3. Validation, gate and state machine
 
-- [ ] 3.1 Implement `engine/orders/validation.py` (instrument known and master loaded, whole lots, below freeze, unknown F&O freeze rejects, tick grid, product per segment, no index orders, CNC sell ≤ held − open CNC sells); verify one test per `orders` validation scenario plus the "Delivery on an option" and "Selling more than held" scenarios
+- [x] 3.1 Implement `engine/orders/validation.py` (instrument known and master loaded, whole lots, below freeze, unknown F&O freeze rejects, tick grid, product per segment, no index orders, CNC sell ≤ held − open CNC sells); verify one test per `orders` validation scenario plus the "Delivery on an option" and "Selling more than held" scenarios
 - [ ] 3.2 Implement the `RiskGate` Protocol and `PaperOnlyGate` (design §1), commenting `Protocol` with a C# analogy; verify the "Live mode before the risk engine" and "Gate rejection is final" scenarios, and a test that `OrderService` cannot be constructed without a gate
-- [ ] 3.3 Implement the pure transition table (PRD §5) and `transition()`; verify every allowed transition, a parametrised test that every other pair is refused, and the "Update after a final state" scenario
+- [x] 3.3 Implement the pure transition table (PRD §5) and `transition()`; verify every allowed transition, a parametrised test that every other pair is refused, and the "Update after a final state" scenario
 
 ## 4. Broker adapter, paper broker and costs
 
