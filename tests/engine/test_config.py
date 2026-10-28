@@ -139,3 +139,47 @@ def test_prefill_over_cap(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_cap_bounds(monkeypatch: pytest.MonkeyPatch, cap: str) -> None:
     dhan_env(monkeypatch, FEED_MAX_SUBSCRIPTIONS=cap)
     assert "FEED_MAX_SUBSCRIPTIONS" in error_text()
+
+
+# ---- candles (add-candles task 1.1; spec candles "Configured intervals") -----------------
+
+
+def test_default_intervals(monkeypatch: pytest.MonkeyPatch) -> None:
+    dhan_env(monkeypatch)
+    settings = load_settings(EngineSettings)
+    assert settings.candle_interval_minutes == (1, 3, 5, 15)
+    assert settings.candle_history == 200
+    assert settings.candle_close_grace_s == 2
+    assert settings.dhan_history_rate_per_s == 4
+
+
+def test_intervals_sorted_and_deduplicated(monkeypatch: pytest.MonkeyPatch) -> None:
+    dhan_env(monkeypatch, CANDLE_INTERVALS="15, 5,5,1")
+    assert load_settings(EngineSettings).candle_interval_minutes == (1, 5, 15)
+
+
+@pytest.mark.parametrize("bad", ["7", "60", "0", "-5", "1.5", "five", "", " , "])
+def test_interval_that_does_not_divide_the_session(
+    monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    dhan_env(monkeypatch, CANDLE_INTERVALS=f"1,{bad}" if bad.strip(" ,") else bad)
+    text = error_text()
+    assert "CANDLE_INTERVALS" in text
+    if bad.strip(" ,"):
+        assert repr(bad) in text
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("CANDLE_HISTORY", "0"),
+        ("CANDLE_HISTORY", "5001"),
+        ("CANDLE_CLOSE_GRACE_S", "-1"),
+        ("CANDLE_CLOSE_GRACE_S", "31"),
+        ("DHAN_HISTORY_RATE_PER_S", "0"),
+        ("DHAN_HISTORY_RATE_PER_S", "21"),
+    ],
+)
+def test_candle_setting_bounds(monkeypatch: pytest.MonkeyPatch, name: str, value: str) -> None:
+    dhan_env(monkeypatch, **{name: value})
+    assert name in error_text()

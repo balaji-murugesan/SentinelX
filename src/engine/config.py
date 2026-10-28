@@ -87,6 +87,19 @@ class EngineSettings(ModeSettings):
     sim_tick_size: Decimal = Field(default=Decimal("0.05"), gt=0)
     sim_seed: int | None = None
 
+    # ---- candles (add-candles) -------------------------------------------------------------
+    # Candle intervals in minutes, all anchored to the 09:15 IST open. Only intervals that
+    # divide the 375-minute session exactly are allowed, so the day never ends with a short
+    # candle: 1, 3, 5, 15.
+    candle_intervals: str = "1,3,5,15"
+    # Completed candles kept per instrument and interval; also how many warm-up loads aim for.
+    candle_history: int = Field(default=200, ge=1, le=5000)
+    # Seconds after an interval ends before its candle closes: ticks arrive up to ~1.1 s after
+    # their exchange time (smoke test 2026-10-28), so 2 s lets the last trades land.
+    candle_close_grace_s: float = Field(default=2, ge=0, le=30)
+    # Dhan intraday-history request starts per second (kept under Dhan's data-API limit).
+    dhan_history_rate_per_s: float = Field(default=4, gt=0, le=20)
+
     @field_validator("database_url")
     @classmethod
     def _database_scheme(cls, value: SecretStr) -> SecretStr:
@@ -100,6 +113,12 @@ class EngineSettings(ModeSettings):
         for entry in value.split(","):
             if entry.strip():
                 InstrumentKey.parse(entry.strip())  # raises ValueError naming the bad entry
+        return value
+
+    @field_validator("candle_intervals")
+    @classmethod
+    def _candle_intervals(cls, value: str) -> str:
+        _parse_intervals(value)  # raises ValueError naming the bad value
         return value
 
     @model_validator(mode="after")
@@ -129,3 +148,27 @@ class EngineSettings(ModeSettings):
         entries = (e.strip() for e in self.feed_instruments.split(","))
         # dict.fromkeys keeps first-seen order while dropping duplicates (an ordered set).
         return tuple(dict.fromkeys(InstrumentKey.parse(e) for e in entries if e))
+
+    @property
+    def candle_interval_minutes(self) -> tuple[int, ...]:
+        """Parsed ``CANDLE_INTERVALS``, sorted ascending, duplicates removed."""
+        return _parse_intervals(self.candle_intervals)
+
+
+# Intervals up to 15 minutes that divide the 375-minute session (09:15-15:30 IST) exactly.
+ALLOWED_CANDLE_INTERVALS = (1, 3, 5, 15)
+
+
+def _parse_intervals(value: str) -> tuple[int, ...]:
+    entries = [e.strip() for e in value.split(",") if e.strip()]
+    if not entries:
+        raise ValueError("must list at least one interval, e.g. 1,3,5,15")
+    minutes: set[int] = set()
+    for entry in entries:
+        if not entry.isdigit() or int(entry) not in ALLOWED_CANDLE_INTERVALS:
+            raise ValueError(
+                f"{entry!r} is not an allowed interval; use minutes from "
+                f"{', '.join(map(str, ALLOWED_CANDLE_INTERVALS))}"
+            )
+        minutes.add(int(entry))
+    return tuple(sorted(minutes))
