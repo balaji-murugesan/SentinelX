@@ -11,7 +11,7 @@ Owner pause points (commit-and-pause policy): after groups 2, 3, 4, 6 and 8 (ord
 
 - [x] 2.1 Add SQLAlchemy table definitions and migration `0002_trading` (`orders`, `order_events`, `fills`, `positions`, `command_results` with unique `(account_id, idempotency_key)`; `Numeric` money, `timestamptz`, `account_id` on every table); verify the migration applies and downgrades on a fresh database in the integration suite, and that the engine role can read and write but not create tables (existing `service-stack` scenarios)
 - [x] 2.2 Define the `TradingRepository` Protocol (save new order + command result in one transaction, save transition, save fill + position, load open orders / today's fills / positions / command keys) with `MemoryRepository` and `PostgresRepository` (async SQLAlchemy, 3 s timeout per call); verify one shared contract test suite runs against both (Postgres skipped without `TEST_DATABASE_URL`, loudly, like `TEST_REDIS_URL`)
-- [ ] 2.3 Add a Postgres service and `TEST_DATABASE_URL` to `.github/workflows/ci.yml` (migrated by Alembic before the tests) and a README note on running it locally; verify CI runs the Postgres tests (not skipped) and they pass
+- [x] 2.3 Add a Postgres service and `TEST_DATABASE_URL` to `.github/workflows/ci.yml` (migrated by Alembic before the tests) and a README note on running it locally; verify CI runs the Postgres tests (not skipped) and they pass
 
 ## 3. Validation, gate and state machine
 
