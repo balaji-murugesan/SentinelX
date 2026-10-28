@@ -14,12 +14,13 @@ import asyncio
 import random
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 
 from contracts.market import InstrumentKey
 from engine.market_data.bus import TickBus
-from engine.market_data.clock import utc_now
+from engine.market_data.candles import Candle
+from engine.market_data.clock import IST, interval_start, last_completed_minute, utc_now
 from engine.market_data.provider import FeedState, FeedStatus, Subscriptions, Tick
 
 
@@ -135,3 +136,49 @@ async def _stopped_within(stop: asyncio.Event, seconds: float) -> bool:
     except TimeoutError:
         return False
     return True
+
+
+STEPS_PER_MINUTE = 4  # random-walk steps behind each simulated history candle
+
+
+class SimulatedHistory:
+    """``HistorySource`` for FEED_SOURCE=simulated (spec "Simulated history").
+
+    Every weekday session minute in the window gets a candle from a fresh seeded random walk,
+    so the same SIM_SEED, window and clock always give the same candles, on the tick grid.
+    """
+
+    def __init__(
+        self,
+        walk: WalkConfig,
+        *,
+        tick_size: Callable[[InstrumentKey], Decimal | None] = lambda _key: None,
+        now: Callable[[], datetime] = utc_now,
+    ) -> None:
+        self._walk = walk
+        self._tick_size = tick_size
+        self._now = now
+
+    async def minutes(self, key: InstrumentKey, start: datetime, end: datetime) -> list[Candle]:
+        tick = self._tick_size(key) or self._walk.default_tick
+        walk = RandomWalk(self._walk)
+        before = min(end, last_completed_minute(self._now()))
+        candles = []
+        moment = start.replace(second=0, microsecond=0)
+        while moment < before:
+            if moment.astimezone(IST).weekday() < 5 and interval_start(moment, 1) == moment:
+                prices = [walk.next_price(key, tick) for _ in range(STEPS_PER_MINUTE)]
+                candles.append(
+                    Candle(
+                        key,
+                        1,
+                        moment,
+                        prices[0],
+                        max(prices),
+                        min(prices),
+                        prices[-1],
+                        STEPS_PER_MINUTE,
+                    )
+                )
+            moment += timedelta(minutes=1)
+        return candles
