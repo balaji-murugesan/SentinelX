@@ -2,7 +2,7 @@
 
 ## 1. Settings, candle type and generic bus
 
-- [ ] 1.1 Add `CANDLE_INTERVALS`, `CANDLE_HISTORY`, `CANDLE_CLOSE_GRACE_S` and `DHAN_HISTORY_RATE_PER_S` to `EngineSettings` (design §11), with intervals parsed to a sorted tuple from {1, 3, 5, 15}; add the names to the test `CONFIG_VARS` list and as commented lines in `.env.example` (**after owner approval**, the file is agent-denied); verify tests for the "Default intervals" and "Interval that does not divide the session" scenarios and for the bounds of the other three settings
+- [x] 1.1 Add `CANDLE_INTERVALS`, `CANDLE_HISTORY`, `CANDLE_CLOSE_GRACE_S` and `DHAN_HISTORY_RATE_PER_S` to `EngineSettings` (design §11), with intervals parsed to a sorted tuple from {1, 3, 5, 15}; add the names to the test `CONFIG_VARS` list and as commented lines in `.env.example` (**after owner approval**, the file is agent-denied); verify tests for the "Default intervals" and "Interval that does not divide the session" scenarios and for the bounds of the other three settings
 - [x] 1.2 Add `Candle` (frozen slotted dataclass: key, timeframe minutes, start UTC, Decimal OHLC, int volume, `partial`, `replaced`) in `engine/market_data/candles.py` and IST interval helpers in `clock.py` (interval start for a time and timeframe, session bounds, last completed 1-minute boundary); verify unit tests for the "15-minute alignment", "Received late, traded on time" and "Outside the session" scenarios, including 09:15 and 15:29:59 edges
 - [x] 1.3 Generalise `bus.py` into `Bus[T]` with `TickBus = Bus[Tick | FeedStatus]` (design §7), commenting the Python generics syntax with a C# analogy; verify every existing `test_market_bus.py` test passes unchanged and mypy is clean
 
