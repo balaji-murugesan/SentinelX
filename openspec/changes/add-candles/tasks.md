@@ -39,7 +39,7 @@
 
 ## 7. Integration check
 
-- [ ] 7.1 Run the full definition of done: `uv run ruff format --check .`, `uv run ruff check .`, `uv run mypy src`, `uv run lint-imports`, `uv run pytest`, `openspec validate add-candles --strict`; verify all pass
+- [x] 7.1 Run the full definition of done: `uv run ruff format --check .`, `uv run ruff check .`, `uv run mypy src`, `uv run lint-imports`, `uv run pytest`, `openspec validate add-candles --strict`; verify all pass
 - [ ] 7.2 Owner smoke test during market hours (never in CI), `FEED_SOURCE=dhan`, one liquid NSE_FNO option: `uv run --env-file .env python -m cli candles watch <KEY> --tf 3` for at least 30 minutes. Acceptance: (a) the Ctrl+C comparison passes for every complete 3-minute candle (3m from ticks vs 3m aggregated from Dhan's 1m history); (b) candles appear only after their boundary, including an interval with no tick at its end; (c) the warm-up printed before the first live candle holds at least 22 candles per interval; (d) the first live candle is partial and later ones are not; (e) Wi-Fi off for ~2 minutes → the refill replaces the affected candles. Record the result in this task
 
 ## Workflow follow-up
