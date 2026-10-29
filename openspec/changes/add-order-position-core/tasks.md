@@ -24,12 +24,12 @@ Owner pause points (commit-and-pause policy): after groups 2, 3, 4, 6 and 8 (ord
 - [x] 4.1 Define `BrokerAdapter` (place, cancel, order_book, updates) and `BrokerUpdate`/`BrokerAck`/`BrokerOrder` values in `engine/broker/adapter.py` (design §5); verify mypy accepts `PaperBroker` and a test fake as implementations
 - [x] 4.2 Implement `PaperBroker` market fills (last price ± slippage, stale/missing price rejects, no network); verify the "Paper market order", "Buy with one tick of slippage" and "Stale price" scenarios, and a test that patches `httpx` and sockets to fail if any network call happens
 - [x] 4.3 Implement resting limit orders (trade-through at the limit, marketable on arrival at the better price, cancel, rebuild from open orders); verify the "Resting buy limit", "Marketable limit", "Cancel a resting limit order" and "Restart with a resting limit" scenarios (the last at broker level)
-- [ ] 4.4 Implement `engine/broker/costs.py` (rate table and calculator per design §7, paisa rounding); verify the "Option sell costs" and "Costs reduce P&L" scenarios with worked numbers in the tests; **owner step**: compare one option and one equity-intraday fill with Dhan's brokerage calculator and correct the table if needed, recording the date checked in `costs.py`
+- [x] 4.4 Implement `engine/broker/costs.py` (rate table and calculator per design §7, paisa rounding); verify the "Option sell costs" and "Costs reduce P&L" scenarios with worked numbers in the tests; **owner step**: compare one option and one equity-intraday fill with Dhan's brokerage calculator and correct the table if needed, recording the date checked in `costs.py`
 
 ## 5. Positions
 
-- [ ] 5.1 Implement the pure `PositionBook` (increase, reduce, flip, realized P&L, costs, MTM, net P&L); verify the "Scale in then partly out", "Long 65, sell 130" and "Short loses as price rises" scenarios, and `hypothesis` properties: splitting a fill gives the same position and P&L, and rebuilding from fills equals incremental application
-- [ ] 5.2 Add feed subscriptions for open positions under owner `positions` (subscribe on first fill, release when flat); verify the "Position closed" scenario against `SimulatedFeed` with another owner holding the same key
+- [x] 5.1 Implement the pure `PositionBook` (increase, reduce, flip, realized P&L, costs, MTM, net P&L); verify the "Scale in then partly out", "Long 65, sell 130" and "Short loses as price rises" scenarios, and `hypothesis` properties: splitting a fill gives the same position and P&L, and rebuilding from fills equals incremental application
+- [x] 5.2 Add feed subscriptions for open positions under owner `positions` (subscribe on first fill, release when flat); verify the "Position closed" scenario against `SimulatedFeed` with another owner holding the same key
 
 ## 6. Order service
 

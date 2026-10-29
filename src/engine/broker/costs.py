@@ -12,8 +12,12 @@ Trading terms:
   * stamp duty - a state tax, on buys only.
   * GST        - 18% on brokerage + exchange charge + SEBI fee (not on STT or stamp duty).
 
-Rates as known for Dhan and NSE; NOT verified here. Owner check against Dhan's brokerage
-calculator (task 4.4): not yet done.
+Owner check against Dhan's brokerage calculator (task 4.4), 2026-10-28: OPTION corrected
+(STT sell 0.15%, exchange 0.03553%; 65 x 200 sell = 48.56, buy = 29.45). EQUITY_INTRADAY
+brokerage, STT, SEBI, stamp and GST match. Dhan's displayed exchange line (0.00307%) is
+Rs 0.10 per Rs 1L above our 0.00297%, but its own GST base implies 0.00297%; reproduced at
+Rs 1L and Rs 10L, so treated as a Dhan calculator inconsistency and the rate is kept.
+FUTURE and EQUITY_DELIVERY rates are NOT verified.
 """
 
 from dataclasses import dataclass
@@ -54,8 +58,8 @@ SEBI = pct("0.0001")
 RATES: dict[CostCategory, Rates] = {
     CostCategory.OPTION: Rates(
         brokerage_flat=Decimal("20"), brokerage_pct_cap=None,
-        stt_buy=Decimal("0"), stt_sell=pct("0.1"),
-        exchange=pct("0.03503"), sebi=SEBI, stamp_buy=pct("0.003"),
+        stt_buy=Decimal("0"), stt_sell=pct("0.15"),
+        exchange=pct("0.03553"), sebi=SEBI, stamp_buy=pct("0.003"),
     ),
     CostCategory.FUTURE: Rates(
         brokerage_flat=Decimal("20"), brokerage_pct_cap=pct("0.03"),

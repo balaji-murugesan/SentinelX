@@ -108,13 +108,13 @@ This is the same shape the Dhan adapter needs: a REST place and cancel, plus the
 
 `engine/broker/costs.py` holds one rate table, keyed by (segment, product, side). Each rate is a `Decimal` fraction of turnover (premium × quantity for options), except brokerage, which is "flat per order, capped by a percentage". GST applies to brokerage, exchange charges and SEBI fees. Every component is rounded to the paisa (ROUND_HALF_UP), the same as Dhan's contract notes.
 
-The default rates below are as I know Dhan's and NSE's published schedules. They are **not verified** here; task 4.4 has the owner compare one computed fill with Dhan's brokerage calculator and correct the table.
+The option and equity-intraday rates below were checked against Dhan's brokerage calculator on 2026-10-28 (task 4.4). The futures and equity-delivery rates are **not verified**.
 
 | Component | Options | Futures | Equity intraday | Equity delivery |
 |---|---|---|---|---|
 | Brokerage per order | ₹20 | ₹20 or 0.03%, lower | ₹20 or 0.03%, lower | ₹0 |
-| STT | 0.1% sell, on premium | 0.02% sell | 0.025% sell | 0.1% buy and sell |
-| NSE transaction | 0.03503% of premium | 0.00173% | 0.00297% | 0.00297% |
+| STT | 0.15% sell, on premium | 0.02% sell | 0.025% sell | 0.1% buy and sell |
+| NSE transaction | 0.03553% of premium | 0.00173% | 0.00297% | 0.00297% |
 | SEBI | 0.0001% | 0.0001% | 0.0001% | 0.0001% |
 | Stamp duty (buy only) | 0.003% | 0.002% | 0.003% | 0.015% |
 | GST | 18% of brokerage + transaction + SEBI | same | same | same |

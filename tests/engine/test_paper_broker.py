@@ -249,13 +249,13 @@ def test_option_sell_costs_worked_example() -> None:
     costs = fill_costs(CostCategory.OPTION, OrderSide.SELL, 65, Decimal("200.00"))
     assert costs == CostBreakdown(
         brokerage=Decimal("20.00"),  # flat per order
-        stt=Decimal("13.00"),  # 0.1% of 13,000, sell side only
-        exchange=Decimal("4.55"),  # 0.03503% of 13,000 = 4.5539
+        stt=Decimal("19.50"),  # 0.15% of 13,000, sell side only
+        exchange=Decimal("4.62"),  # 0.03553% of 13,000 = 4.6189
         sebi=Decimal("0.01"),  # 0.0001% of 13,000 = 0.013
         stamp_duty=Decimal("0.00"),  # buys only
-        gst=Decimal("4.42"),  # 18% of (20 + 4.55 + 0.01) = 4.4208
+        gst=Decimal("4.43"),  # 18% of (20 + 4.62 + 0.01) = 4.4334
     )
-    assert costs.total == Decimal("41.98")
+    assert costs.total == Decimal("48.56")  # Dhan calculator, checked 2026-10-28
 
 
 def test_option_buy_has_stamp_duty_and_no_stt() -> None:
@@ -281,7 +281,7 @@ def test_costs_reduce_pnl_on_a_flat_round_trip() -> None:
     buy = fill_costs(CostCategory.OPTION, OrderSide.BUY, 65, Decimal("200.00"))
     sell = fill_costs(CostCategory.OPTION, OrderSide.SELL, 65, Decimal("200.00"))
     gross = (Decimal("200.00") - Decimal("200.00")) * 65
-    assert gross - buy.total - sell.total == -(Decimal("29.37") + Decimal("41.98"))
+    assert gross - buy.total - sell.total == -(Decimal("29.45") + Decimal("48.56"))
 
 
 def test_cost_category() -> None:
