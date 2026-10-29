@@ -183,3 +183,34 @@ def test_interval_that_does_not_divide_the_session(
 def test_candle_setting_bounds(monkeypatch: pytest.MonkeyPatch, name: str, value: str) -> None:
     dhan_env(monkeypatch, **{name: value})
     assert name in error_text()
+
+
+# ---- orders (add-order-position-core task 1.2) --------------------------------------------
+
+
+def test_order_setting_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    dhan_env(monkeypatch)
+    settings = load_settings(EngineSettings)
+    assert settings.account_id == "main"
+    assert settings.paper_slippage_ticks == 1
+    assert settings.paper_price_max_age_s == 5
+    assert settings.order_ack_timeout_s == 5
+    assert settings.snapshot_interval_s == 1
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("ACCOUNT_ID", ""),
+        ("ACCOUNT_ID", "Main Account"),
+        ("ACCOUNT_ID", CLIENT_ID + "x" * 30),
+        ("PAPER_SLIPPAGE_TICKS", "-1"),
+        ("PAPER_SLIPPAGE_TICKS", "21"),
+        ("PAPER_PRICE_MAX_AGE_S", "0"),
+        ("ORDER_ACK_TIMEOUT_S", "61"),
+        ("SNAPSHOT_INTERVAL_S", "0"),
+    ],
+)
+def test_order_setting_bounds(monkeypatch: pytest.MonkeyPatch, name: str, value: str) -> None:
+    dhan_env(monkeypatch, **{name: value})
+    assert name in error_text()

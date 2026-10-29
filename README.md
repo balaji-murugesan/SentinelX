@@ -17,7 +17,7 @@ What each stage builds and its acceptance criteria: [`PRD.md` §11](PRD.md#11-de
 |---|---|---|---|
 | S0 | Foundation | `add-foundation` | ✅ Done (archived 2026-10-25) |
 | S1 | Market data | `add-market-data`, `add-candles` | 🟡 In progress: `add-market-data` ✅ (archived 2026-10-28); `add-candles` next |
-| S2 | Orders & positions | `add-order-position-core` | ⬜ |
+| S2 | Orders & positions | `add-order-position-core`, `add-dhan-readonly` | 🟡 Planning `add-order-position-core` (paper end to end); `add-dhan-readonly` after |
 | S3 | Risk engine | `add-risk-engine` | ⬜ |
 | S4 | Trailing SL & exits | `add-trailing-exits` | ⬜ |
 | S5 | API bridge | `add-api-bridge` | ⬜ |
@@ -128,6 +128,16 @@ docker stop sx-redis
 
 In PowerShell, set the variable with `$env:TEST_REDIS_URL = "redis://127.0.0.1:6380/15"` and
 remove it afterwards with `Remove-Item Env:TEST_REDIS_URL`.
+
+The trading-state tests (orders, fills, positions; Stage 2) also run against a real Postgres
+when `TEST_DATABASE_URL` names a throwaway database ending in `_test` (they migrate and
+truncate it):
+
+```bash
+docker run -d --rm --name sx-pg-test -e POSTGRES_PASSWORD=test -e POSTGRES_DB=sentinelx_test -p 127.0.0.1:5433:5432 postgres:16-alpine
+TEST_DATABASE_URL=postgresql+asyncpg://postgres:test@127.0.0.1:5433/sentinelx_test uv run pytest
+docker stop sx-pg-test
+```
 
 `FEED_SOURCE=simulated` drives the engine with simulated ticks outside market hours (refused in
 live mode); `cd src/web && npm install && npm run dev` runs the dashboard (Stage 6).

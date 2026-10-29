@@ -196,13 +196,16 @@ async def test_twenty_instruments_at_once() -> None:
 
 
 async def test_spacer_waits_by_the_clock() -> None:
-    now = [100.0]
-    spacer = RequestSpacer(4, clock=lambda: now[0])
+    # A clock that runs at real speed but is pushed 0.2 s ahead after the first request, so
+    # the second must wait only the remaining 0.05 s of the 0.25 s gap.
+    offset = [0.0]
+    spacer = RequestSpacer(4, clock=lambda: time.perf_counter() + offset[0])
     await spacer.wait()
-    started = time.monotonic()
-    now[0] = 100.2  # 0.05 s short of the 0.25 s gap
+    offset[0] = 0.2
+    started = time.perf_counter()
     await spacer.wait()
-    assert time.monotonic() - started >= 0.04
+    waited = time.perf_counter() - started
+    assert 0.04 <= waited < 0.2
 
 
 @pytest.mark.parametrize(

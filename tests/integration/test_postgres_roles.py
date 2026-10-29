@@ -316,16 +316,24 @@ def run_migrate(monkeypatch: pytest.MonkeyPatch, db: Db) -> None:
     migrate.main()
 
 
-def test_baseline_migration_creates_no_tables(
+HEAD = "0002"  # newest migration; bump with each new one
+TRADING_TABLES = {"orders", "order_events", "fills", "positions", "command_results"}
+
+
+def test_migrations_create_trading_tables_the_engine_role_can_use(
     db: Db, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     run_migrate(monkeypatch, db)
     run_migrate(monkeypatch, db)  # idempotent: running it again changes nothing
 
     version = as_migrate(db, "SELECT version_num FROM migrations.alembic_version")
-    assert [r["version_num"] for r in version] == ["0001"]
+    assert [r["version_num"] for r in version] == [HEAD]
     tables = as_migrate(db, "SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
-    assert tables == [], "Stage 0 creates no application tables"
+    assert {r["tablename"] for r in tables} == TRADING_TABLES  # Stage 2 (0002_trading)
+    # The real engine role (init.sql default privileges) reads and writes them.
+    as_engine(db, "INSERT INTO command_results VALUES ('main', 'k', 'c', false, NULL, 'x', now())")
+    assert as_engine(db, "SELECT count(*) AS n FROM command_results")[0]["n"] == 1
+    as_engine(db, "DELETE FROM command_results")
     out = capsys.readouterr().out
     assert "database migrations applied" in out
     assert not any(p in out for p in db.passwords())
@@ -336,7 +344,7 @@ def test_downgrade_to_base_works(db: Db, monkeypatch: pytest.MonkeyPatch) -> Non
     command.downgrade(migrate.alembic_config(db.migrate_url()), "base")
     assert as_migrate(db, "SELECT version_num FROM migrations.alembic_version") == []
     run_migrate(monkeypatch, db)  # and back up again
-    assert as_migrate(db, "SELECT version_num FROM migrations.alembic_version")[0][0] == "0001"
+    assert as_migrate(db, "SELECT version_num FROM migrations.alembic_version")[0][0] == HEAD
 
 
 def test_failing_migration_exits_nonzero_without_leaking_credentials(
@@ -345,17 +353,18 @@ def test_failing_migration_exits_nonzero_without_leaking_credentials(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    run_migrate(monkeypatch, db)  # database at the real baseline
+    run_migrate(monkeypatch, db)  # database at the real head
 
     scripts = tmp_path / "bad_migrations"
     (scripts / "versions").mkdir(parents=True)
     shutil.copy(MIGRATIONS / "env.py", scripts / "env.py")
     shutil.copy(MIGRATIONS / "script.py.mako", scripts / "script.py.mako")
-    shutil.copy(MIGRATIONS / "versions" / "0001_baseline.py", scripts / "versions")
-    (scripts / "versions" / "0002_bad.py").write_text(
+    for migration in (MIGRATIONS / "versions").glob("0*.py"):
+        shutil.copy(migration, scripts / "versions")
+    (scripts / "versions" / "9999_bad.py").write_text(
         "from collections.abc import Sequence\n"
-        "revision: str = '0002'\n"
-        "down_revision: str | None = '0001'\n"
+        "revision: str = '9999'\n"
+        f"down_revision: str | None = '{HEAD}'\n"
         "branch_labels: str | Sequence[str] | None = None\n"
         "depends_on: str | Sequence[str] | None = None\n"
         "def upgrade() -> None:\n"
@@ -380,8 +389,8 @@ def test_failing_migration_exits_nonzero_without_leaking_credentials(
     assert "database migration failed" in out
     for leaked in ("hunter2", "hunter2pw", *db.passwords()):
         assert leaked not in out
-    # The failed upgrade rolled back: still at the baseline.
-    assert as_migrate(db, "SELECT version_num FROM migrations.alembic_version")[0][0] == "0001"
+    # The failed upgrade rolled back: still at the real head.
+    assert as_migrate(db, "SELECT version_num FROM migrations.alembic_version")[0][0] == HEAD
 
 
 def test_missing_migrate_url_stops_with_a_clear_message(

@@ -188,8 +188,9 @@ class RequestSpacer:
 
     async def wait(self) -> None:
         async with self._lock:  # `async with` on a lock: acquire/release, like SemaphoreSlim
-            delay = self._last + self._gap - self._clock()
-            if delay > 0:
+            # A loop, not one sleep: on Windows the event loop times sleeps with a ~15.6 ms
+            # clock, so a sleep can end a few ms early by the precise clock checked here.
+            while (delay := self._last + self._gap - self._clock()) > 0:  # noqa: ASYNC110 (waits on time, not on another task)
                 await asyncio.sleep(delay)
             self._last = self._clock()
 

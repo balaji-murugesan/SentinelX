@@ -154,7 +154,16 @@ def check_engine_role(stack: Stack) -> str:
     denied = engine_sql(stack, "CREATE TABLE smoke_should_fail (id int)")
     if denied.returncode == 0 or "permission denied" not in denied.stderr:
         raise AssertionError("engine role was able to create a table")
-    return "engine role can query, cannot create tables"
+    # The trading tables (migration 0002) are readable and writable by the engine role: the
+    # insert runs inside a transaction that is rolled back, so nothing is left behind.
+    written = engine_sql(
+        stack,
+        "BEGIN; INSERT INTO command_results VALUES ('smoke', 'smoke', 'smoke', false, NULL, "
+        "NULL, now()); SELECT count(*) FROM orders; ROLLBACK;",
+    )
+    if written.returncode != 0:
+        raise AssertionError(f"engine role cannot use the trading tables: {written.stderr.strip()}")
+    return "engine role can query and write trading tables, cannot create tables"
 
 
 def check_engine_without_api(stack: Stack) -> str:
