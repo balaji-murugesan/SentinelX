@@ -16,7 +16,7 @@ Owner pause points (commit-and-pause policy): after groups 2, 3, 4, 6 and 8 (ord
 ## 3. Validation, gate and state machine
 
 - [x] 3.1 Implement `engine/orders/validation.py` (instrument known and master loaded, whole lots, below freeze, unknown F&O freeze rejects, tick grid, product per segment, no index orders, CNC sell ≤ held − open CNC sells); verify one test per `orders` validation scenario plus the "Delivery on an option" and "Selling more than held" scenarios
-- [ ] 3.2 Implement the `RiskGate` Protocol and `PaperOnlyGate` (design §1), commenting `Protocol` with a C# analogy; verify the "Live mode before the risk engine" and "Gate rejection is final" scenarios, and a test that `OrderService` cannot be constructed without a gate
+- [x] 3.2 Implement the `RiskGate` Protocol and `PaperOnlyGate` (design §1), commenting `Protocol` with a C# analogy; verify the "Live mode before the risk engine" and "Gate rejection is final" scenarios at gate and state-machine level (the "no broker call" half and the "`OrderService` cannot be constructed without a gate" test move to 6.1, where `OrderService` first exists)
 - [x] 3.3 Implement the pure transition table (PRD §5) and `transition()`; verify every allowed transition, a parametrised test that every other pair is refused, and the "Update after a final state" scenario
 
 ## 4. Broker adapter, paper broker and costs
@@ -33,7 +33,7 @@ Owner pause points (commit-and-pause policy): after groups 2, 3, 4, 6 and 8 (ord
 
 ## 6. Order service
 
-- [ ] 6.1 Implement `OrderService.place` (validation → gate → persist Requested + command result in one transaction → submit with timeout → transitions) under the trading lock (design §2), with tracing spans and broker-latency recording; verify the "Place command answered", "Same key twice" (service level), and "One trace per order" scenarios with `MemoryRepository`, `PaperBroker` and an in-memory span exporter
+- [ ] 6.1 Implement `OrderService.place` (validation → gate → persist Requested + command result in one transaction → submit with timeout → transitions) under the trading lock (design §2), with tracing spans and broker-latency recording; verify the "Place command answered", "Same key twice" (service level), and "One trace per order" scenarios with `MemoryRepository`, `PaperBroker` and an in-memory span exporter; also from 3.2: a gate rejection (live mode, and any gate refusal) makes zero broker calls and ends `Rejected` with the gate's reason, and `OrderService` cannot be constructed without a gate
 - [ ] 6.2 Implement broker-update handling (fills → position, costs, transitions), `Unknown` on timeout with reconciliation via `order_book()` and no resubmission, cancel, and end-of-day expiry by the injectable clock; verify the "Submission times out" (fake adapter that never acks; exactly one `place` call), "Cancel a resting limit order", "Limit order never reached" and "Fills update positions exactly once" scenarios
 - [ ] 6.3 Implement fail-closed persistence (pending-write queue, retry with backoff, `persistence_ok`, 3 s write timeout); verify the "Postgres down" and "Postgres back" scenarios with a `FailingRepository`, and that fills for existing orders keep applying while new orders are rejected
 
