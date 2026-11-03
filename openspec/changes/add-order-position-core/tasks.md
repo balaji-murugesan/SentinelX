@@ -40,8 +40,8 @@ Owner pause points (commit-and-pause policy): after groups 2, 3, 4, 6 and 8 (ord
 ## 7. Command stream, snapshot and CLI
 
 - [x] 7.1 Implement the command consumer (consumer group, pending entries first, idempotency lookup, reply stream with TTL, ack after persist, malformed and other-account handling, Redis-down retry like `answer_pings`); verify the "Malformed command", "Other account" and "Crash between persist and acknowledge" scenarios against Redis (`TEST_REDIS_URL`)
-- [ ] 7.2 Implement the Redis snapshot writer (open orders, positions with MTM/realized/net P&L, `schema_version`, taken-at time, at most every `SNAPSHOT_INTERVAL_S`, retries when Redis is down); verify the "Redis down" scenario and that the snapshot JSON round-trips through the contract models
-- [ ] 7.3 Add CLI `order place`, `order cancel`, `orders`, `positions` (fresh idempotency key, 10 s reply wait, "result unknown" without resend, snapshot reads only); verify the "CLI order round trip" and "Engine not answering" scenarios against `TEST_REDIS_URL`, and that `--help` lists them
+- [x] 7.2 Implement the Redis snapshot writer (open orders, positions with MTM/realized/net P&L, `schema_version`, taken-at time, at most every `SNAPSHOT_INTERVAL_S`, retries when Redis is down); verify the "Redis down" scenario and that the snapshot JSON round-trips through the contract models
+- [x] 7.3 Add CLI `order place`, `order cancel`, `orders`, `positions` (fresh idempotency key, 10 s reply wait, "result unknown" without resend, snapshot reads only); verify the "CLI order round trip" and "Engine not answering" scenarios against `TEST_REDIS_URL`, and that `--help` lists them
 
 ## 8. Recovery and engine wiring
 
