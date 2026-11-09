@@ -5,13 +5,17 @@ A "restart" here is a brand-new ``OrderService`` built on the *same* ``MemoryRep
 survives in memory, only what was written to the repository.
 """
 
+import asyncio
 from decimal import Decimal
+
+import pytest
 
 from contracts.commands import CancelOrder
 from contracts.orders import CostBreakdown, OrderState
 from engine.broker.adapter import BrokerOrder, Filled
-from engine.orders.recovery import recover
+from engine.orders.recovery import recover, recover_with_retry
 from engine.orders.service import OrderService
+from engine.persistence.repository import LoadedState, PersistenceError
 from tests.engine.test_order_service import NOW, FakeAdapter, build, command
 from tests.engine.trading_fakes import MemoryRepository
 
@@ -160,3 +164,138 @@ async def test_position_that_disagrees_with_fills_blocks_new_orders() -> None:
 
     assert len(differences) == 1 and "rebuilt from fills" in differences[0]
     assert not restarted.reconciled
+
+
+# ---- persisted halt (task 8.2) --------------------------------------------------------------
+
+
+async def halted_repository() -> tuple[MemoryRepository, str]:
+    """A repository whose engine restarted once against an empty broker book: HALTED, stored."""
+    repo, order_id = await open_order_before_crash()
+    _, _, differences = await restart(repo)  # broker's book is empty: a difference
+    assert differences and repo.halts["main"].differences == tuple(differences)
+    return repo, order_id
+
+
+async def test_difference_stores_the_halt() -> None:
+    repo, _ = await open_order_before_crash()
+
+    service, _, differences = await restart(repo)
+
+    assert repo.halts["main"].differences == tuple(differences)
+    assert service.halt_differences == differences and not service.reconciled
+
+
+async def test_halt_survives_restart_even_when_reconciliation_is_now_clean() -> None:
+    repo, order_id = await halted_repository()
+    adapter = BookAdapter()
+    adapter.entries = [BrokerOrder("b-1", order_id, OrderState.OPEN, 0, None)]  # now it matches
+
+    service, _, differences = await restart(repo, adapter)
+
+    assert not service.reconciled and "not at the broker" in differences[0]  # the stored ones
+    assert service.halt_differences == differences
+    refused = await service.place(command("k2", limit="100"))
+    assert not refused.accepted and "not reconciled" in (refused.reason or "")
+    assert "main" in repo.halts  # still stored: only resume clears it
+
+
+async def test_cleared_halt_lets_recovery_reconcile() -> None:
+    repo, order_id = await halted_repository()
+    await repo.clear_halt("main", NOW)  # what the resume command will do (task 8.3)
+    adapter = BookAdapter()
+    adapter.entries = [BrokerOrder("b-1", order_id, OrderState.OPEN, 0, None)]
+
+    service, _, differences = await restart(repo, adapter)
+
+    assert differences == [] and service.reconciled and service.halt_differences == []
+
+
+async def test_halt_that_cannot_be_stored_still_halts() -> None:
+    class NoHaltWrites(MemoryRepository):
+        async def store_halt(self, account_id: str, differences: list[str], at: object) -> None:
+            raise PersistenceError("database down")
+
+    service, _, repo = build()
+    await service.place(command("k1", limit="100"))
+    broken = NoHaltWrites()
+    broken.orders, broken.events, broken.results = repo.orders, repo.events, repo.results
+
+    restarted, _, differences = await restart(broken)  # empty broker book: a difference
+
+    assert differences and not restarted.reconciled
+
+
+class FlakyLoad(MemoryRepository):
+    """``load`` fails the first ``failures`` times, like Postgres still starting up."""
+
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.failures = failures
+        self.load_calls = 0
+
+    async def load(self, account_id: str) -> LoadedState:
+        self.load_calls += 1
+        if self.load_calls <= self.failures:
+            raise PersistenceError("database down")
+        return await super().load(account_id)
+
+
+async def test_recover_raises_and_refuses_orders_when_the_state_cannot_be_loaded() -> None:
+    repo = FlakyLoad(failures=1)
+    service, adapter, _ = build(repository=repo)
+
+    with pytest.raises(PersistenceError):
+        await recover(service, repo, adapter, account_id="main")
+
+    assert not service.reconciled and not service.persistence_ok
+
+
+async def test_recovery_retries_until_postgres_is_back_then_accepts_orders() -> None:
+    repo = FlakyLoad(failures=2)
+    adapter = BookAdapter()
+    service, _, _ = build(adapter=adapter, repository=repo)
+    task = asyncio.create_task(
+        recover_with_retry(
+            service,
+            repo,
+            adapter,
+            account_id="main",
+            stop=asyncio.Event(),
+            retry_min_s=0.01,
+            retry_max_s=0.02,
+        )  # fmt: skip
+    )
+    await asyncio.sleep(0)  # let it make its first (failing) attempt
+    assert not service.reconciled
+    refused = await service.place(command("k1", limit="100"))  # while still loading
+    assert not refused.accepted
+
+    differences = await asyncio.wait_for(task, 2)
+
+    assert differences == [] and service.reconciled and service.persistence_ok
+    assert repo.load_calls == 3
+    assert (await service.place(command("k2", limit="100"))).accepted
+
+
+async def test_recovery_retry_stops_when_the_engine_is_stopping() -> None:
+    repo = FlakyLoad(failures=10_000)
+    adapter = BookAdapter()
+    service, _, _ = build(adapter=adapter, repository=repo)
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        recover_with_retry(
+            service,
+            repo,
+            adapter,
+            account_id="main",
+            stop=stop,
+            retry_min_s=0.01,
+            retry_max_s=0.02,
+        )  # fmt: skip
+    )
+    await asyncio.sleep(0.05)
+    stop.set()
+
+    assert await asyncio.wait_for(task, 2) == ["stopped before recovery completed"]
+    assert not service.reconciled

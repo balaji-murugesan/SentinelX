@@ -95,6 +95,18 @@ positions = sa.Table(
     sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
 )
 
+# One row per account: set when restart reconciliation finds a difference, cleared only by the
+# explicit resume command (design §9). Kept after clearing (halted = false) as an audit trail.
+recovery_state = sa.Table(
+    "recovery_state",
+    metadata,
+    sa.Column("account_id", sa.Text, primary_key=True),
+    sa.Column("halted", sa.Boolean, nullable=False),
+    sa.Column("differences", sa.JSON, nullable=False),
+    sa.Column("halted_at", sa.DateTime(timezone=True)),
+    sa.Column("cleared_at", sa.DateTime(timezone=True)),
+)
+
 # Every processed command's result, keyed for idempotency (spec "Idempotency key on every
 # command"); kept after restart so a repeated key still returns the first answer.
 command_results = sa.Table(

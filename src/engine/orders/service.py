@@ -114,6 +114,9 @@ class OrderService:
         # Fail-closed flags (spec "fail closed"). 8.1 sets reconciled after recovery.
         self.persistence_ok = True
         self.reconciled = True
+        # What recovery found (or the stored halt holds); empty unless HALTED. Shown in the
+        # snapshot and banner so the owner can see why new orders are refused (design §9).
+        self.halt_differences: list[str] = []
 
     async def place(self, command: PlaceOrder) -> CommandResult:
         """Run one place command to its first stable state and return the answer."""

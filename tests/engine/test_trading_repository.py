@@ -35,7 +35,7 @@ from tests.engine.trading_fakes import MemoryRepository
 
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 IN_CI = os.environ.get("CI") == "true"
-TABLES = ("order_events", "fills", "positions", "command_results", "orders")
+TABLES = ("order_events", "fills", "positions", "command_results", "recovery_state", "orders")
 
 NOW = datetime(2026, 10, 29, 4, 0, tzinfo=UTC)
 OPTION = InstrumentKey.parse("NSE_FNO:53720")
@@ -191,6 +191,38 @@ async def test_other_accounts_are_not_loaded(repo: TradingRepository) -> None:
         order(account_id="other"), result("k-o1").model_copy(update={"account_id": "other"})
     )
     assert (await repo.load("main")).open_orders == []
+
+
+# ---- recovery halt (task 8.2) -------------------------------------------------------------
+
+
+async def test_halt_is_stored_replaced_and_loaded(repo: TradingRepository) -> None:
+    assert (await repo.load("main")).halt is None
+
+    await repo.store_halt("main", ["order o1 is Open here but not at the broker"], NOW)
+    await repo.store_halt("main", ["position x differs", "order o2 differs"], NOW)  # replaces
+
+    halt = (await repo.load("main")).halt
+    assert halt is not None
+    assert halt.differences == ("position x differs", "order o2 differs")
+    assert halt.halted_at == NOW
+
+
+async def test_halt_is_cleared_and_clearing_twice_is_harmless(repo: TradingRepository) -> None:
+    await repo.store_halt("main", ["something differs"], NOW)
+
+    await repo.clear_halt("main", NOW)
+    await repo.clear_halt("main", NOW)
+    await repo.clear_halt("never-halted", NOW)
+
+    assert (await repo.load("main")).halt is None
+
+
+async def test_halt_is_per_account(repo: TradingRepository) -> None:
+    await repo.store_halt("other", ["something differs"], NOW)
+
+    assert (await repo.load("main")).halt is None
+    assert (await repo.load("other")).halt is not None
 
 
 # ---- migration (task 2.1) -----------------------------------------------------------------

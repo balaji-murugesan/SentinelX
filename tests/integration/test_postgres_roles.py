@@ -316,8 +316,10 @@ def run_migrate(monkeypatch: pytest.MonkeyPatch, db: Db) -> None:
     migrate.main()
 
 
-HEAD = "0002"  # newest migration; bump with each new one
-TRADING_TABLES = {"orders", "order_events", "fills", "positions", "command_results"}
+HEAD = "0003"  # newest migration; bump with each new one
+TRADING_TABLES = {
+    "orders", "order_events", "fills", "positions", "command_results", "recovery_state",
+}  # fmt: skip
 
 
 def test_migrations_create_trading_tables_the_engine_role_can_use(
@@ -329,7 +331,7 @@ def test_migrations_create_trading_tables_the_engine_role_can_use(
     version = as_migrate(db, "SELECT version_num FROM migrations.alembic_version")
     assert [r["version_num"] for r in version] == [HEAD]
     tables = as_migrate(db, "SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
-    assert {r["tablename"] for r in tables} == TRADING_TABLES  # Stage 2 (0002_trading)
+    assert {r["tablename"] for r in tables} == TRADING_TABLES  # Stage 2 (0002, 0003)
     # The real engine role (init.sql default privileges) reads and writes them.
     as_engine(db, "INSERT INTO command_results VALUES ('main', 'k', 'c', false, NULL, 'x', now())")
     assert as_engine(db, "SELECT count(*) AS n FROM command_results")[0]["n"] == 1

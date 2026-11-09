@@ -7,6 +7,7 @@ does so in ONE transaction (all or nothing), and every failure surfaces as
 """
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol
 
 from contracts.commands import CommandResult
@@ -18,12 +19,21 @@ class PersistenceError(Exception):
 
 
 @dataclass(frozen=True)
+class RecoveryHalt:
+    """A stored halt: new entries stay refused until the owner resumes (design §9)."""
+
+    differences: tuple[str, ...]  # what reconciliation found, as it was logged
+    halted_at: datetime
+
+
+@dataclass(frozen=True)
 class LoadedState:
     """What restart recovery reads back (design §9)."""
 
     open_orders: list[Order]  # every order not in a final state, including Unknown
     fills: list[Fill]  # all fills, in the order they were applied
     positions: list[Position]
+    halt: RecoveryHalt | None = None  # None = never halted, or cleared by resume
 
 
 class TradingRepository(Protocol):
@@ -46,6 +56,14 @@ class TradingRepository(Protocol):
     async def record_fill(self, order: Order, fill: Fill, position: Position) -> None:
         """Store a fill with its order's new state, an audit record and the updated position:
         one transaction, so a fill is never stored without its position change."""
+        ...
+
+    async def store_halt(self, account_id: str, differences: list[str], at: datetime) -> None:
+        """Set (or replace) the account's halt with these differences."""
+        ...
+
+    async def clear_halt(self, account_id: str, at: datetime) -> None:
+        """Clear the account's halt (the row is kept, marked cleared). No halt: no-op."""
         ...
 
     async def load(self, account_id: str) -> LoadedState: ...
