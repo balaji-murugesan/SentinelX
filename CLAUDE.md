@@ -87,6 +87,10 @@ openspec list                    # active changes
 openspec validate <change-id> --strict
 ```
 
+Command-line habits:
+- To view or search files, use the Read and Grep tools, not `sed`/`grep`/`head`/`cat` in Bash.
+- Never prefix commands with `cd "d:/Trading/src/algo2/SentinelX" &&`; the shell already runs in the repo root, and plain commands match the permission allowlist.
+
 Definition of done for any task: format, lint, mypy, import-linter, and tests all pass; `openspec validate --strict` passes.
 
 ## Safety rules (non-negotiable)
