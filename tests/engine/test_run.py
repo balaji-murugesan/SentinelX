@@ -18,6 +18,7 @@ from engine.diagnostics import answer_pings
 from engine.healthcheck import is_healthy
 from engine.main import run
 from engine.market_data.service import MarketDataService
+from tests.engine.trading_fakes import MemoryRepository
 
 
 class DownRedis:
@@ -34,6 +35,12 @@ class DownRedis:
         self._fail()
 
     async def xread(self, *_a: Any, **_k: Any) -> Any:
+        self._fail()
+
+    async def xgroup_create(self, *_a: Any, **_k: Any) -> Any:
+        self._fail()
+
+    async def set(self, *_a: Any, **_k: Any) -> Any:
         self._fail()
 
 
@@ -68,7 +75,13 @@ async def test_engine_keeps_beating_with_redis_down_and_stops_cleanly(
 
     market_data = MarketDataService(settings, load=no_instruments)
     engine = asyncio.create_task(
-        run(settings, redis=DownRedis(), stop=stop, market_data=market_data)  # type: ignore[arg-type]
+        run(
+            settings,
+            redis=DownRedis(),  # type: ignore[arg-type]
+            stop=stop,
+            market_data=market_data,
+            repository=MemoryRepository(),
+        )
     )
     await asyncio.sleep(0.2)
     assert is_healthy(heartbeat), "liveness must not depend on Redis"
@@ -76,3 +89,17 @@ async def test_engine_keeps_beating_with_redis_down_and_stops_cleanly(
 
     stop.set()  # what SIGTERM does
     await asyncio.wait_for(engine, timeout=2)  # returns normally: a clean shutdown
+
+
+def test_engine_refuses_to_start_without_database_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Trading state needs Postgres: no DATABASE_URL, no engine (design §13)."""
+    from engine.main import start
+
+    monkeypatch.setenv("REDIS_URL", "redis://redis:6379/0")
+    monkeypatch.setenv("FEED_SOURCE", "simulated")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+    with pytest.raises(SystemExit) as stopped:
+        start()
+
+    assert "DATABASE_URL" in str(stopped.value)

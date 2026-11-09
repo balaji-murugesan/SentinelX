@@ -102,6 +102,7 @@ async def recover_with_retry(
     stop: asyncio.Event,
     restore_broker: Callable[[list[Order]], None] | None = None,
     now: Callable[[], datetime] = utc_now,
+    first_attempt: asyncio.Event | None = None,
     retry_min_s: float = 0.5,
     retry_max_s: float = 30.0,
 ) -> list[str]:
@@ -111,6 +112,11 @@ async def recover_with_retry(
     refused. Backoff doubles from ``retry_min_s`` up to ``retry_max_s``. Stops when ``stop`` is
     set. ``asyncio.wait_for(stop.wait(), delay)`` is an interruptible sleep: like awaiting
     ``Task.Delay(delay, cancellationToken)`` in C#.
+
+    ``first_attempt`` is set once the first try has finished, whether it worked or not. The
+    engine starts reading commands then: normally recovery is already done (spec "before
+    consuming any command"); with Postgres down, commands are answered with a rejection instead
+    of waiting unanswered until it comes back.
     """
     service.reconciled = False
     delay = retry_min_s
@@ -126,6 +132,9 @@ async def recover_with_retry(
             )
         except PersistenceError:
             log.warning("recovery_retry", in_s=delay)
+        finally:
+            if first_attempt is not None:
+                first_attempt.set()
         try:
             await asyncio.wait_for(stop.wait(), delay)
         except TimeoutError:
