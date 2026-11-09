@@ -61,7 +61,7 @@ from engine.market_data.provider import SubscriptionLimitError
 from engine.orders.gate import RiskGate
 from engine.orders.machine import InvalidTransition, transition
 from engine.orders.validation import NO_HOLDINGS, Holdings, validate
-from engine.persistence.repository import PersistenceError, TradingRepository
+from engine.persistence.repository import LoadedState, PersistenceError, TradingRepository
 from engine.positions.book import PositionId, apply, flat, position_id
 from engine.positions.feed import PositionFeed
 
@@ -394,6 +394,36 @@ class OrderService:
             await self._position_feed.update(position)
         except SubscriptionLimitError as error:
             log.error("position_not_subscribed", key=str(order.key), error=str(error))
+
+    # ---- restart recovery (task 8.1; ``engine.orders.recovery`` drives these) -----------------
+
+    async def restore(self, state: LoadedState) -> None:
+        """Take over the stored open orders, positions and applied fill ids after a restart."""
+        async with self._lock:
+            self.orders = {o.order_id: o for o in state.open_orders}
+            self.positions = {position_id(p): p for p in state.positions}
+            self._fill_ids = {f.fill_id for f in state.fills}
+            for position in state.positions:
+                try:
+                    await self._position_feed.update(position)
+                except SubscriptionLimitError as error:
+                    log.error("position_not_subscribed", key=str(position.key), error=str(error))
+
+    async def settle_in_flight(self) -> None:
+        """Resolve orders caught mid-submission by the crash. ``Requested`` was stored but never
+        sent (``Submitted`` is stored *before* the broker call), so it is safely ``Rejected``.
+        ``Submitted`` may or may not have reached the broker, so it becomes ``Unknown`` and is
+        reconciled against the order book: never resent (rule 4)."""
+        async with self._lock:
+            for order in list(self.orders.values()):
+                if order.state is OrderState.REQUESTED:
+                    await self._advance(
+                        order, OrderState.REJECTED, reason="engine restarted before sending"
+                    )
+                elif order.state is OrderState.SUBMITTED:
+                    await self._advance(
+                        order, OrderState.UNKNOWN, reason="engine restarted while submitting"
+                    )
 
     # ---- Unknown orders --------------------------------------------------------------------
 

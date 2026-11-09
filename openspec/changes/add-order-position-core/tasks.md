@@ -45,7 +45,7 @@ Owner pause points (commit-and-pause policy): after groups 2, 3, 4, 6 and 8 (ord
 
 ## 8. Recovery and engine wiring
 
-- [ ] 8.1 Implement restart recovery (design §9: load → rebuild paper book → reconcile orders → rebuild-and-compare positions → set `reconciled`) before the command consumer starts; verify the "Duplicate after restart" and "Mismatch after restart" scenarios with `MemoryRepository` and a fake adapter
+- [x] 8.1 Implement restart recovery (design §9: load → rebuild paper book → reconcile orders → rebuild-and-compare positions → set `reconciled`) before the command consumer starts; verify the "Duplicate after restart" and "Mismatch after restart" scenarios with `MemoryRepository` and a fake adapter
 - [ ] 8.2 Wire `OrderService`, `PaperBroker`, the command consumer and the snapshot writer into `engine.main.run` with the existing supervision, paper broker only (no `DhanBroker` yet), banner showing the account label; verify a `run()` test placing a paper order through the command stream, and that a crash in the snapshot writer leaves orders and the heartbeat running
 - [ ] 8.3 Add the kill -9 integration test (engine subprocess against `TEST_REDIS_URL` + `TEST_DATABASE_URL`, positions and a resting limit, `SIGKILL`/`TerminateProcess`, restart, compare persisted and snapshot state); verify the "Kill -9 and restart" and "Restart with a resting limit" scenarios pass in CI
 
