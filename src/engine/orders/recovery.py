@@ -21,12 +21,13 @@ from decimal import Decimal
 
 import structlog
 
+from contracts.commands import CommandResult, ResumeRecovery
 from contracts.orders import Fill, Order, OrderState, Position
 from engine.broker.adapter import BrokerAdapter, BrokerError, BrokerOrder
 from engine.market_data.clock import utc_now
 from engine.orders.service import OrderService
-from engine.persistence.repository import PersistenceError, TradingRepository
-from engine.positions.book import rebuild
+from engine.persistence.repository import LoadedState, PersistenceError, TradingRepository
+from engine.positions.book import PositionId, position_id, rebuild
 
 log = structlog.get_logger("engine.orders.recovery")
 
@@ -70,7 +71,7 @@ async def recover(
         book = {}
     else:
         found += _order_differences(service.orders.values(), book)
-    found += _position_differences(service, state.fills)
+    found += _position_differences(service.positions, state.fills)
 
     # Sticky halt: new differences replace the stored ones; with none, a stored halt stays.
     if found:
@@ -133,6 +134,111 @@ async def recover_with_retry(
             return ["stopped before recovery completed"]
 
 
+async def resume_recovery(
+    service: OrderService,
+    repository: TradingRepository,
+    adapter: BrokerAdapter,
+    command: ResumeRecovery,
+    *,
+    account_id: str,
+    now: Callable[[], datetime] = utc_now,
+) -> CommandResult:
+    """Handle ``cli recovery resume``: re-check, and clear the halt only if nothing differs.
+
+    Idempotent like every command: a repeated key returns the first answer. The check compares
+    the broker's order book and the *database* (not the live in-memory book, which it leaves
+    alone); it also refuses while memory and database disagree, which means the data was edited
+    after this engine loaded it, so the owner must restart the engine first.
+    """
+
+    def result(accepted: bool, reason: str | None) -> CommandResult:
+        return CommandResult(
+            command_id=command.command_id,
+            idempotency_key=command.idempotency_key,
+            account_id=command.account_id,
+            accepted=accepted,
+            reason=reason,
+            decided_at=now(),
+        )
+
+    try:
+        previous = await repository.find_result(command.account_id, command.idempotency_key)
+    except PersistenceError as error:
+        return result(False, f"trading state cannot be saved: {error}")
+    if previous is not None:
+        return previous
+    answer = await _resume(service, repository, adapter, account_id, now, result)
+    try:
+        await repository.save_result(answer)
+    except PersistenceError as error:  # the halt change above is already stored or refused
+        log.error("resume_result_not_stored", error=str(error))
+    return answer
+
+
+async def _resume(
+    service: OrderService,
+    repository: TradingRepository,
+    adapter: BrokerAdapter,
+    account_id: str,
+    now: Callable[[], datetime],
+    result: Callable[[bool, str | None], CommandResult],
+) -> CommandResult:
+    if not service.persistence_ok:
+        return result(False, "trading state cannot be saved: resume is refused until it recovers")
+    found: list[str] = []
+    try:
+        await service.reconcile_unknown()
+        book = {b.engine_order_id: b for b in await adapter.order_book()}
+        state = await repository.load(account_id)
+    except (BrokerError, TimeoutError, OSError) as error:
+        return result(False, f"broker order book unavailable: {error}")
+    except PersistenceError as error:
+        return result(False, f"trading state cannot be saved: {error}")
+    if state.halt is None and service.reconciled:
+        return result(True, None)  # not halted: nothing to clear
+
+    found += _order_differences(state.open_orders, book)
+    found += _position_differences({position_id(p): p for p in state.positions}, state.fills)
+    found += _stale_memory(service, state)
+    try:
+        if found:
+            await repository.store_halt(account_id, found, now())
+        else:
+            await repository.clear_halt(account_id, now())
+    except PersistenceError as error:
+        return result(False, f"trading state cannot be saved: {error}")
+    service.halt_differences = found
+    service.reconciled = not found
+    if found:
+        for difference in found:
+            log.error("reconciliation_difference", difference=difference)
+        return result(False, "still halted: " + "; ".join(found))
+    log.info("recovery_resumed")
+    return result(True, None)
+
+
+def _stale_memory(service: OrderService, state: LoadedState) -> list[str]:
+    """Differences between the live in-memory book and what the database holds now."""
+    out = []
+    for stored in state.open_orders:
+        mine = service.orders.get(stored.order_id)
+        if mine is None or (mine.state, mine.filled_quantity) != (
+            stored.state,
+            stored.filled_quantity,
+        ):
+            out.append(
+                f"order {stored.order_id} changed in the database since this engine loaded it: "
+                "restart the engine, then resume"
+            )
+    in_db = {position_id(p): _figures(p) for p in state.positions}
+    if in_db != {pid: _figures(p) for pid, p in service.positions.items()}:
+        out.append(
+            "positions changed in the database since this engine loaded them: "
+            "restart the engine, then resume"
+        )
+    return out
+
+
 def _order_differences(orders: Iterable[Order], book: dict[str, BrokerOrder]) -> list[str]:
     out = []
     for order in orders:
@@ -150,9 +256,8 @@ def _order_differences(orders: Iterable[Order], book: dict[str, BrokerOrder]) ->
     return out
 
 
-def _position_differences(service: OrderService, fills: list[Fill]) -> list[str]:
+def _position_differences(stored: dict[PositionId, Position], fills: list[Fill]) -> list[str]:
     rebuilt = rebuild(fills)
-    stored = service.positions
     out = []
     for pid in sorted(set(rebuilt) | set(stored), key=str):
         mine, theirs = stored.get(pid), rebuilt.get(pid)

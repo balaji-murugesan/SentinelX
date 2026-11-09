@@ -12,13 +12,16 @@ from redis.asyncio import Redis
 
 from cli import orders as cli
 from cli.__main__ import main
-from contracts.commands import COMMAND_STREAM
-from contracts.orders import OrderSide, ProductType
+from contracts.commands import COMMAND_STREAM, CommandResult, ResumeRecovery
+from contracts.orders import OrderSide, OrderState, ProductType
+from engine.broker.adapter import BrokerOrder
 from engine.broker.paper import PaperBroker
 from engine.market_data.bus import TickBus
 from engine.orders.commands import CommandConsumer
+from engine.orders.recovery import recover, resume_recovery
 from engine.orders.snapshot import SnapshotWriter
-from tests.engine.test_order_service import NOW, OPTION, build, master
+from tests.engine.test_order_service import NOW, OPTION, build, command, master
+from tests.engine.test_recovery import BookAdapter
 from tests.engine.test_snapshot import tick
 
 TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL")
@@ -119,3 +122,61 @@ def test_help_lists_the_order_commands(capsys: pytest.CaptureFixture[str]) -> No
         main(["order", "--help"])
     out = capsys.readouterr().out
     assert "place" in out and "cancel" in out
+
+
+async def test_halted_snapshot_shows_a_halted_block_and_resume_clears_it(redis: Redis) -> None:
+    service, _, repo = build()
+    placed = await service.place(command("k1", limit="100"))
+    adapter = BookAdapter()
+    restarted, _, _ = build(adapter=adapter, repository=repo)
+    await recover(restarted, repo, adapter, account_id="main")  # empty broker book: HALTED
+
+    async def resume(cmd: ResumeRecovery) -> CommandResult:
+        return await resume_recovery(restarted, repo, adapter, cmd, account_id="main")
+
+    bus = TickBus()
+    consumer = CommandConsumer(redis, restarted, account_id="main", resume=resume)
+    snapshots = SnapshotWriter(
+        redis, restarted, bus.subscribe("snapshot"), account_id="main", interval_s=0.05
+    )
+    stop = asyncio.Event()
+    tasks = [
+        asyncio.create_task(consumer.run(stop, block_ms=50)),
+        asyncio.create_task(snapshots.run(stop)),
+    ]
+    shown: list[str] = []
+    try:
+        for _ in range(100):  # wait for the first snapshot
+            shown.clear()
+            if await cli.show_orders(redis, account_id="main", out=shown.append) == cli.ACCEPTED:
+                break
+            await asyncio.sleep(0.05)
+        assert any("HALTED" in line for line in shown)
+        assert any("not at the broker" in line for line in shown)
+        assert any("recovery resume" in line for line in shown)
+
+        lines: list[str] = []
+        refused = await cli.resume_recovery(redis, account_id="main", out=lines.append)
+        assert refused == cli.REJECTED and "still halted" in lines[0]
+
+        adapter.entries = [BrokerOrder("b-1", placed.order_id or "", OrderState.OPEN, 0, None)]
+        lines.clear()
+        accepted = await cli.resume_recovery(redis, account_id="main", out=lines.append)
+        assert accepted == cli.ACCEPTED and lines == ["Accepted."]
+        for _ in range(100):
+            shown.clear()
+            await cli.show_orders(redis, account_id="main", out=shown.append)
+            if not any("HALTED" in line for line in shown):
+                break
+            await asyncio.sleep(0.05)
+    finally:
+        stop.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert not any("HALTED" in line for line in shown)
+
+
+def test_help_lists_recovery_resume(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        main(["recovery", "--help"])
+    assert "resume" in capsys.readouterr().out

@@ -79,6 +79,8 @@ class SnapshotWriter:
             taken_at=self._now(),
             open_orders=[o for o in self._service.orders.values() if not o.state.is_final],
             positions=views,
+            halted=bool(self._service.halt_differences),
+            halt_differences=list(self._service.halt_differences),
         )
 
     async def write_once(self) -> None:

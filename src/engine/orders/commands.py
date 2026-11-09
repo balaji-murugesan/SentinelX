@@ -19,6 +19,7 @@ Either mechanism alone leaves a crash window; together they close it (design §4
 
 import asyncio
 import contextlib
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -34,6 +35,7 @@ from contracts.commands import (
     CancelOrder,
     CommandResult,
     PlaceOrder,
+    ResumeRecovery,
     parse_command,
     reply_stream,
 )
@@ -46,10 +48,20 @@ WRONG_ACCOUNT = "command is for account {theirs!r}, this engine serves {ours!r}"
 
 
 class CommandConsumer:
-    def __init__(self, redis: Redis, service: OrderService, *, account_id: str) -> None:
+    def __init__(
+        self,
+        redis: Redis,
+        service: OrderService,
+        *,
+        account_id: str,
+        resume: Callable[[ResumeRecovery], Awaitable[CommandResult]] | None = None,
+    ) -> None:
         self._redis = redis
         self._service = service
         self._account_id = account_id
+        # Injected (like a C# Func<,> passed to the constructor) so this module does not depend
+        # on engine.orders.recovery; engine.main wires it. None = resume is not available.
+        self._resume = resume
 
     async def run(
         self, stop: asyncio.Event, *, block_ms: int = 500, retry_seconds: float = 1.0
@@ -134,13 +146,24 @@ class CommandConsumer:
         await self._reply(command.command_id, result)
         await self._ack(message_id)
 
-    async def _process(self, command: PlaceOrder | CancelOrder) -> CommandResult:
+    async def _process(self, command: PlaceOrder | CancelOrder | ResumeRecovery) -> CommandResult:
         # match/case on the type is like a C# switch expression with type patterns.
         match command:
             case PlaceOrder():
                 return await self._service.place(command)
             case CancelOrder():
                 return await self._service.cancel(command)
+            case ResumeRecovery():
+                if self._resume is None:
+                    return CommandResult(
+                        command_id=command.command_id,
+                        idempotency_key=command.idempotency_key,
+                        account_id=command.account_id,
+                        accepted=False,
+                        reason="recovery resume is not available in this engine",
+                        decided_at=datetime.now(UTC),
+                    )
+                return await self._resume(command)
 
     async def _reply(self, command_id: str, result: CommandResult) -> None:
         key = reply_stream(command_id)

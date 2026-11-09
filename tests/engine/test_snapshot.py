@@ -120,3 +120,15 @@ async def test_redis_down_keeps_trading_and_retries_the_write() -> None:
         ).tzinfo
         == UTC
     )
+
+
+async def test_snapshot_reports_a_halt_and_its_differences() -> None:
+    bus, redis = TickBus(), FakeRedis()
+    snapshot, service = writer(redis, bus)
+    assert not snapshot.build().halted and snapshot.build().halt_differences == []
+
+    service.halt_differences = ["order o1 is Open here but not at the broker"]
+    built = snapshot.build()
+
+    assert built.halted and built.halt_differences == service.halt_differences
+    assert Snapshot.model_validate_json(built.model_dump_json()) == built

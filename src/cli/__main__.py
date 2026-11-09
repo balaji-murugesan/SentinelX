@@ -16,7 +16,10 @@ Commands so far:
                          Send a place-order command to the engine and print its reply
                          (run inside the engine container; see cli/orders.py).
   order cancel ORDER_ID  Ask the engine to cancel an open order.
-  orders / positions     Show open orders / positions from the engine's Redis snapshot.
+  orders / positions     Show open orders / positions from the engine's Redis snapshot
+                         (a HALTED block lists why new orders are refused, if they are).
+  recovery resume        After reviewing a HALTED state and fixing its cause, ask the engine to
+                         re-check and clear the halt (it stays if differences remain).
   candles watch KEY --tf M
                          Print the last warm-up candles of M minutes for KEY, then each
                          completed candle until Ctrl+C; on Ctrl+C, compare the live candles
@@ -102,6 +105,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     place.add_argument("--limit", type=Decimal, metavar="PRICE", help="limit price")
     cancel = order.add_parser("cancel", help="cancel an open order")
     cancel.add_argument("order_id", metavar="ORDER_ID")
+    recovery = groups.add_parser(
+        "recovery", help="clear a HALTED state after review"
+    ).add_subparsers(dest="command", required=True)
+    recovery.add_parser("resume", help="re-check and clear the halt if nothing differs")
     groups.add_parser("orders", help="open orders from the engine snapshot")
     groups.add_parser("positions", help="positions and P&L from the engine snapshot")
     args = parser.parse_args(argv)
@@ -119,7 +126,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         # asyncio.run is the sync -> async entry point (like `await` at the top of Main): it
         # creates the event loop, runs the coroutine to completion and closes the loop.
-        if args.group in ("order", "orders", "positions"):
+        if args.group in ("order", "orders", "positions", "recovery"):
             return asyncio.run(_order_command(settings, args))
         if args.group == "dhan" and args.command == "history":
             return asyncio.run(dhan_history(settings, credentials, args.key, args.days, args.save))
@@ -144,6 +151,10 @@ async def _order_command(settings: EngineSettings, args: argparse.Namespace) -> 
     if args.group == "positions":
         return await order_cli.run_with_redis(
             url, None, lambda r: order_cli.show_positions(r, account_id=account, out=_print_now)
+        )
+    if args.group == "recovery":
+        return await order_cli.run_with_redis(
+            url, None, lambda r: order_cli.resume_recovery(r, account_id=account, out=_print_now)
         )
     if args.command == "cancel":
         return await order_cli.run_with_redis(

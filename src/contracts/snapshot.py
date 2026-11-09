@@ -38,3 +38,7 @@ class Snapshot(BaseModel):
     taken_at: AwareDatetime
     open_orders: list[Order]
     positions: list[PositionView]
+    # HALTED (design §9): new entries are refused until `recovery resume`. The differences are
+    # the reasons, as logged. Defaults keep older snapshots readable (schema_version stays 1).
+    halted: bool = False
+    halt_differences: list[str] = []

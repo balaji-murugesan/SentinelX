@@ -15,6 +15,7 @@ from contracts.commands import (
     CancelOrder,
     CommandResult,
     PlaceOrder,
+    ResumeRecovery,
     parse_command,
     reply_stream,
 )
@@ -75,6 +76,13 @@ def test_place_command_round_trips_through_the_union() -> None:
     assert parsed == command
     assert isinstance(parsed, PlaceOrder) and parsed.limit_price == Decimal("190.05")
     assert json.loads(command.model_dump_json())["command"] == "place_order"
+
+
+def test_resume_command_round_trips_through_the_union() -> None:
+    command = ResumeRecovery(
+        command_id="c3", idempotency_key="k3", account_id="main", source="cli", sent_at=NOW
+    )
+    assert parse_command(command.model_dump_json()) == command
 
 
 def test_cancel_command_round_trips_through_the_union() -> None:

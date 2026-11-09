@@ -16,7 +16,14 @@ from typing import Any, cast
 
 from redis.asyncio import Redis
 
-from contracts.commands import COMMAND_STREAM, CancelOrder, CommandResult, PlaceOrder, reply_stream
+from contracts.commands import (
+    COMMAND_STREAM,
+    CancelOrder,
+    CommandResult,
+    PlaceOrder,
+    ResumeRecovery,
+    reply_stream,
+)
 from contracts.market import InstrumentKey
 from contracts.orders import Order, OrderSide, OrderType, ProductType
 from contracts.snapshot import PositionView, Snapshot, snapshot_key
@@ -70,7 +77,24 @@ async def cancel_order(
     return await _send(redis, command, out, wait_s)
 
 
-async def _send(redis: Redis, command: PlaceOrder | CancelOrder, out: Out, wait_s: float) -> int:
+async def resume_recovery(
+    redis: Redis, *, account_id: str, out: Out, wait_s: float = REPLY_WAIT_S
+) -> int:
+    """Ask the engine to re-check and clear its HALTED state. Review the differences first
+    (``orders`` / ``positions`` show them): this is the only way a halt is cleared."""
+    command = ResumeRecovery(
+        command_id=uuid.uuid4().hex,
+        idempotency_key=uuid.uuid4().hex,
+        account_id=account_id,
+        source="cli",
+        sent_at=datetime.now(UTC),
+    )
+    return await _send(redis, command, out, wait_s)
+
+
+async def _send(
+    redis: Redis, command: PlaceOrder | CancelOrder | ResumeRecovery, out: Out, wait_s: float
+) -> int:
     await redis.xadd(COMMAND_STREAM, {"data": command.model_dump_json()})
     result = await _wait_for_reply(redis, command.command_id, wait_s)
     if result is None:
@@ -81,7 +105,7 @@ async def _send(redis: Redis, command: PlaceOrder | CancelOrder, out: Out, wait_
         )
         return UNKNOWN
     if result.accepted:
-        out(f"Accepted. order id: {result.order_id}")
+        out(f"Accepted. order id: {result.order_id}" if result.order_id else "Accepted.")
         return ACCEPTED
     out(f"Rejected: {result.reason}")
     return REJECTED
@@ -108,6 +132,7 @@ async def show_orders(redis: Redis, *, account_id: str, out: Out) -> int:
     if snapshot is None:
         out("No snapshot in Redis: the engine is not running or has not written one yet.")
         return UNKNOWN
+    _show_halt(snapshot, out)
     out(_age_line(snapshot))
     if not snapshot.open_orders:
         out("No open orders.")
@@ -121,12 +146,22 @@ async def show_positions(redis: Redis, *, account_id: str, out: Out) -> int:
     if snapshot is None:
         out("No snapshot in Redis: the engine is not running or has not written one yet.")
         return UNKNOWN
+    _show_halt(snapshot, out)
     out(_age_line(snapshot))
     if not snapshot.positions:
         out("No positions today.")
     for view in snapshot.positions:
         out(format_position(view))
     return ACCEPTED
+
+
+def _show_halt(snapshot: Snapshot, out: Out) -> None:
+    if not snapshot.halted:
+        return
+    out("!! HALTED: new orders are refused until the differences below are fixed and you run")
+    out("!!         `python -m cli recovery resume` (cancels and fills are still processed)")
+    for difference in snapshot.halt_differences:
+        out(f"!!   - {difference}")
 
 
 def _age_line(snapshot: Snapshot) -> str:

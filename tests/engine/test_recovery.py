@@ -10,10 +10,10 @@ from decimal import Decimal
 
 import pytest
 
-from contracts.commands import CancelOrder
+from contracts.commands import CancelOrder, ResumeRecovery
 from contracts.orders import CostBreakdown, OrderState
 from engine.broker.adapter import BrokerOrder, Filled
-from engine.orders.recovery import recover, recover_with_retry
+from engine.orders.recovery import recover, recover_with_retry, resume_recovery
 from engine.orders.service import OrderService
 from engine.persistence.repository import LoadedState, PersistenceError
 from tests.engine.test_order_service import NOW, FakeAdapter, build, command
@@ -299,3 +299,129 @@ async def test_recovery_retry_stops_when_the_engine_is_stopping() -> None:
 
     assert await asyncio.wait_for(task, 2) == ["stopped before recovery completed"]
     assert not service.reconciled
+
+
+# ---- resume (task 8.3) ----------------------------------------------------------------------
+
+
+def resume_command(key: str = "r1") -> ResumeRecovery:
+    return ResumeRecovery(
+        command_id=f"c-{key}", idempotency_key=key, account_id="main", source="cli", sent_at=NOW
+    )
+
+
+def matching_book(order_id: str) -> BookAdapter:
+    adapter = BookAdapter()
+    adapter.entries = [BrokerOrder("b-1", order_id, OrderState.OPEN, 0, None)]
+    return adapter
+
+
+async def halted_service(
+    repo: MemoryRepository, adapter: BookAdapter
+) -> tuple[OrderService, BookAdapter]:
+    service, adapter, differences = await restart(repo, adapter)
+    assert differences and not service.reconciled
+    return service, adapter
+
+
+async def resume(
+    service: OrderService, repo: MemoryRepository, adapter: BookAdapter, key: str = "r1"
+):
+    return await resume_recovery(service, repo, adapter, resume_command(key), account_id="main")
+
+
+async def test_resume_after_review_clears_the_halt_and_orders_flow_again() -> None:
+    repo, order_id = await halted_repository()
+    service, adapter = await halted_service(repo, matching_book(order_id))  # cause is fixed
+
+    answer = await resume(service, repo, adapter)
+
+    assert answer.accepted and answer.reason is None
+    assert "main" not in repo.halts and service.reconciled and service.halt_differences == []
+    assert (await service.place(command("k2", limit="100"))).accepted
+    book = BookAdapter()  # the broker now knows both open orders
+    book.entries = [
+        BrokerOrder(f"b-{n}", o.order_id, OrderState.OPEN, 0, None)
+        for n, o in enumerate(repo.orders.values(), 1)
+    ]
+    restarted, _, differences = await restart(repo, book)
+    assert differences == [] and restarted.reconciled  # the clearing was stored
+
+
+async def test_resume_with_differences_remaining_keeps_the_halt_and_lists_them() -> None:
+    repo, _ = await halted_repository()
+    service, adapter = await halted_service(repo, BookAdapter())  # broker still has nothing
+
+    answer = await resume(service, repo, adapter)
+
+    assert not answer.accepted and "still halted" in (answer.reason or "")
+    assert "not at the broker" in (answer.reason or "")
+    assert "main" in repo.halts and not service.reconciled
+    refused = await service.place(command("k2", limit="100"))
+    assert not refused.accepted and "not reconciled" in (refused.reason or "")
+
+
+async def test_resume_when_not_halted_changes_nothing() -> None:
+    repo, order_id = await open_order_before_crash()
+    service, adapter, differences = await restart(repo, matching_book(order_id))
+    assert differences == []
+
+    answer = await resume(service, repo, adapter)
+
+    assert answer.accepted and service.reconciled and "main" not in repo.halts
+
+
+async def test_resume_repeated_key_returns_the_first_answer() -> None:
+    repo, order_id = await halted_repository()
+    service, adapter = await halted_service(repo, matching_book(order_id))
+    first = await resume(service, repo, adapter, "same")
+    await repo.store_halt("main", ["something new"], NOW)  # would change a re-run's outcome
+
+    second = await resume(service, repo, adapter, "same")
+
+    assert second == first and "main" in repo.halts  # not run again
+
+
+async def test_resume_refuses_when_the_database_changed_after_the_engine_loaded() -> None:
+    service, _, repo = build()
+    placed = await service.place(command("k1"))
+    order = repo.orders[placed.order_id or ""]
+    await service.on_update(
+        Filled(order.broker_order_id or "", "f1", 65, Decimal("100"), NOW, CostBreakdown())
+    )
+    for pid, stored in list(repo.positions.items()):  # corrupt, then restart: HALTED
+        repo.positions[pid] = stored.model_copy(update={"average_price": Decimal("999")})
+    halted, adapter, _ = await restart(repo)
+    assert not halted.reconciled
+    for pid, stored in list(repo.positions.items()):  # owner "fixes" the row, no restart
+        repo.positions[pid] = stored.model_copy(update={"average_price": Decimal("100")})
+
+    answer = await resume(halted, repo, adapter)
+
+    assert not answer.accepted and "restart the engine, then resume" in (answer.reason or "")
+    assert "main" in repo.halts and not halted.reconciled
+
+
+async def test_resume_is_refused_while_the_database_cannot_be_written() -> None:
+    repo, order_id = await halted_repository()
+    service, adapter = await halted_service(repo, matching_book(order_id))
+    service.persistence_ok = False
+
+    answer = await resume(service, repo, adapter)
+
+    assert not answer.accepted and "cannot be saved" in (answer.reason or "")
+    assert "main" in repo.halts
+
+
+async def test_resume_when_the_broker_cannot_be_asked_keeps_the_halt() -> None:
+    repo, order_id = await halted_repository()
+    service, _ = await halted_service(repo, matching_book(order_id))
+
+    class Down(BookAdapter):
+        async def order_book(self) -> list[BrokerOrder]:
+            raise TimeoutError("no answer")
+
+    answer = await resume(service, repo, Down())
+
+    assert not answer.accepted and "order book unavailable" in (answer.reason or "")
+    assert "main" in repo.halts and not service.reconciled

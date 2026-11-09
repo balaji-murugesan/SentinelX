@@ -19,11 +19,16 @@ from contracts.commands import (
     REPLY_TTL_SECONDS,
     CommandResult,
     PlaceOrder,
+    ResumeRecovery,
     reply_stream,
 )
+from contracts.orders import OrderState
+from engine.broker.adapter import BrokerOrder
 from engine.orders.commands import CONSUMER, CommandConsumer
+from engine.orders.recovery import recover, resume_recovery
 from engine.orders.service import OrderService
-from tests.engine.test_order_service import build, command
+from tests.engine.test_order_service import NOW, build, command
+from tests.engine.test_recovery import BookAdapter
 from tests.engine.trading_fakes import MemoryRepository
 
 TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL")
@@ -185,3 +190,35 @@ async def test_crash_between_persist_and_acknowledge_replies_again_without_a_sec
     assert reply.order_id == stored.order_id
     assert len(repo.orders) == 1
     assert len(adapter.placed) == 1 and not adapter_after.placed
+
+
+async def test_resume_command_is_answered_through_the_stream(redis: Redis) -> None:
+    service, adapter, repo = build()
+    placed = await service.place(command("k1", limit="100"))  # the order that will go missing
+    adapter = BookAdapter()
+    restarted, _, _ = build(adapter=adapter, repository=repo)
+    await recover(restarted, repo, adapter, account_id="main")  # empty broker book: HALTED
+    assert not restarted.reconciled
+
+    async def resume(cmd: ResumeRecovery) -> CommandResult:
+        return await resume_recovery(restarted, repo, adapter, cmd, account_id="main")
+
+    stop = asyncio.Event()
+    consumer = CommandConsumer(redis, restarted, account_id="main", resume=resume)
+    task = asyncio.create_task(consumer.run(stop, block_ms=50))
+    try:
+        refused_cmd = ResumeRecovery(
+            command_id="c-r1", idempotency_key="r1", account_id="main", source="cli", sent_at=NOW
+        )
+        await redis.xadd(COMMAND_STREAM, {"data": refused_cmd.model_dump_json()})
+        refused = await reply_for(redis, "c-r1")
+        adapter.entries = [BrokerOrder("b-1", placed.order_id or "", OrderState.OPEN, 0, None)]
+        ok_cmd = refused_cmd.model_copy(update={"command_id": "c-r2", "idempotency_key": "r2"})
+        await redis.xadd(COMMAND_STREAM, {"data": ok_cmd.model_dump_json()})
+        accepted = await reply_for(redis, "c-r2")
+        await eventually(lambda: _no_pending(redis))
+    finally:
+        await stop_consumer(stop, task)
+
+    assert not refused.accepted and "still halted" in (refused.reason or "")
+    assert accepted.accepted and restarted.reconciled and "main" not in repo.halts
