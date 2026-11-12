@@ -1,6 +1,6 @@
 # SentinelX
 
-Self-hosted trading platform for Dhan: a headless Python engine that manages orders, trailing stop-losses, and risk limits, with a React dashboard for one-click trading and an emergency kill switch.
+Self-hosted trading platform for personal and family use. Phase 1 trades the owner's Dhan account; phase 2 (Stage 8) adds the spouse's Zerodha account. It is a headless Python engine that manages orders, trailing stop-losses, and risk limits, with a React dashboard for one-click trading and an emergency kill switch.
 
 > **Paper trading is the default.** Live trading is enabled only from Stage 7 and requires explicit configuration.
 
@@ -8,6 +8,7 @@ Self-hosted trading platform for Dhan: a headless Python engine that manages ord
 - Working rules for Claude Code: [`CLAUDE.md`](CLAUDE.md)
 - Design decisions: [`docs/DECISIONS.md`](docs/DECISIONS.md)
 - Field notes (external, unverified): [`docs/field-notes-option-buying.md`](docs/field-notes-option-buying.md)
+- Product teardowns behind PRD v3 (external, unverified): [`docs/research/`](docs/research/). Covers TradeBridge (webhook signals), TradeMate (manual options execution) and the RMS Tool (risk rules and Dhan backstops)
 
 ## Status
 
@@ -16,14 +17,14 @@ What each stage builds and its acceptance criteria: [`PRD.md` §11](PRD.md#11-de
 | Stage | | OpenSpec change | Status |
 |---|---|---|---|
 | S0 | Foundation | `add-foundation` | ✅ Done (archived 2026-10-25) |
-| S1 | Market data | `add-market-data`, `add-candles` | 🟡 In progress: `add-market-data` ✅ (archived 2026-10-28); `add-candles` next |
-| S2 | Orders & positions | `add-order-position-core`, `add-dhan-readonly` | 🟡 Planning `add-order-position-core` (paper end to end); `add-dhan-readonly` after |
-| S3 | Risk engine | `add-risk-engine` | ⬜ |
+| S1 | Market data | `add-market-data`, `add-candles` | 🟡 `add-market-data` ✅ (archived 2026-10-28); `add-candles` 20/21 tasks, not yet archived |
+| S2 | Orders & positions | `add-order-position-core`, `add-dhan-readonly` | 🟡 `add-order-position-core` 24/27 tasks (engine wiring done); `add-dhan-readonly` after |
+| S3 | Risk engine | `add-risk-engine`, `add-risk-guards` | ⬜ |
 | S4 | Trailing SL & exits | `add-trailing-exits` | ⬜ |
 | S5 | API bridge | `add-api-bridge` | ⬜ |
 | S6 | Dashboard | `add-dashboard` | ⬜ |
 | S7 | Go-live hardening | `add-live-trading` | ⬜ |
-| S8 | Multi-account | `add-multi-account` | ⬜ |
+| S8 | Multi-account (spouse's Zerodha) | `add-multi-account` | ⬜ |
 | S9 | Semi-auto | `add-semi-auto-signals` | ⬜ |
 | S10 | Full auto | `add-full-auto` | ⬜ |
 
@@ -178,7 +179,7 @@ src/
   web/            React dashboard (Stage 6)
 tests/            mirrors src/; integration/ needs Redis or Docker
 openspec/         specs and changes
-docs/             decisions, architecture, runbook
+docs/             decisions, architecture, runbook; research/ = external teardowns
 docker/           Dockerfiles        infra/   postgres, caddy, otel config
 scripts/          smoke_test.py      docker-compose.yml, alembic.ini at the root
 ```
@@ -195,6 +196,9 @@ scripts/          smoke_test.py      docker-compose.yml, alembic.ini at the root
 
 - **Dashboard:** hold the kill switch for 1 second.
 - **Dashboard down:** send `/kill` to the Telegram bot (Stage 7+).
-- **Engine down:** use Dhan's own kill switch at web.dhan.co; static catastrophic SLs remain at the exchange.
+- **Engine down:** use Dhan's own kill switch at web.dhan.co; static catastrophic SLs remain at the exchange. From Stage 7, Dhan's P&L-based exit is armed every morning as a wider backstop.
+- **Positions won't flatten:** the engine escalates to Dhan's Exit All on its own (Stage 7+). Manually, use Exit All in the Dhan app; it also cancels the catastrophic SLs.
+- **You closed a position in the Dhan app:** check that its catastrophic SL was cancelled too. A resting SL on a flat book opens a new position if it triggers. The engine does this automatically from Stage 7.
+- **Dhan's kill switch locks the account for the rest of the day** and needs a flat book first. Use it after flattening, not instead of it. From Stage 7 the engine presses it for you after every automatic stop (loss floor or profit target). A risk halt can't be resumed the same day; that's deliberate.
 
 Full procedures: `docs/runbook.md` (Stage 7).

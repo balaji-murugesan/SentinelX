@@ -29,10 +29,16 @@ Architecture decisions from the design discussions (Sep–Oct 2026), kept as ref
 | D-019 | OpenSpec spec-driven delivery in stages; paper until Stage 7 | Accepted |
 | D-020 | `account_id` in the data model from Stage 2; multi-account in Stage 8 | Accepted |
 | D-021 | Telegram `/kill` and alerts handled inside the engine | Proposed |
-| D-022 | Both algo accounts on Dhan; Zerodha stays manual (no integration) | Accepted |
+| D-022 | Both algo accounts on Dhan; Zerodha stays manual (no integration) | Superseded by D-029 |
 | D-023 | Market data separated from execution (`MarketDataProvider` vs `BrokerAdapter`) | Accepted |
 | D-024 | Shared runtime telemetry lives in `observability`; `contracts` stays pure models | Accepted |
 | D-025 | Trailing SL is a pluggable method chosen per trade, with a configured default | Proposed |
+| D-026 | Risk rules are pluggable `RiskCheck`s with monotonic, engine-owned state; daily loss becomes an equity-floor ratchet | Proposed |
+| D-027 | Exits are bounded limit-price chases, never MARKET orders | Proposed |
+| D-028 | External (manual) orders detected continuously; orphan catastrophic SLs cancelled first | Proposed |
+| D-029 | Spouse's Zerodha account integrated in Stage 8 (execution only); market data stays on Dhan | Proposed |
+| D-030 | Automatic stops lock the account for the day at the broker; risk halts have no intraday resume | Proposed |
+| D-031 | Webhooks: own scripts over Tailscale; TradingView through one public, IP-allowlisted route | Proposed |
 
 ---
 
@@ -155,7 +161,7 @@ Architecture decisions from the design discussions (Sep–Oct 2026), kept as ref
 **Decision:** The Telegram bot (alerts + `/kill`) runs inside the engine process, so the fallback works when the API, Redis consumer, or dashboard is down. Only whitelisted chat IDs are accepted.
 
 ## D-022 — Both algo accounts on Dhan; Zerodha stays manual
-**Status:** Accepted (2026-10-25)
+**Status:** Superseded by D-029 (2026-11-12). Originally accepted 2026-10-25.
 **Context:** Owner considered running his Dhan account and his spouse's Zerodha account from the platform on one static IP. Family IP sharing (spouse, dependent children, dependent parents) is documented within a broker, but sharing across two brokers isn't explicitly covered. Zerodha would also need a second broker adapter, instrument-ID mapping, and a fragile daily password + TOTP login.
 **Decision:** The spouse opens a Dhan account for algo trading; her Zerodha account stays for manual long-term investing, outside the platform (no static IP needed, since the rule applies only to API orders). Family static IP mapping is requested by email from the registered address to apihelp@dhan.co, CC'ing her registered email.
 **Trade-off:** broker concentration — a Dhan outage affects both algo accounts; exchange-side catastrophic SLs still protect open positions.
@@ -181,3 +187,76 @@ Architecture decisions from the design discussions (Sep–Oct 2026), kept as ref
 **Consequence:** seven of the eight methods need candles and indicators (ATR, EMA), so Stage 1 market data must build candles from ticks and load recent history to warm indicators up at entry.
 **Alternatives:** one global method (cannot match the method to the situation); free-form per-strategy code for trailing (untestable, and bypasses the shared tighten-only and restart rules).
 **Revisit when:** backtests show some methods add nothing for NSE F&O intraday; drop them rather than carry untested options. The scores in `trailing-sl.md` are hypotheses until then.
+
+## D-026 — Pluggable risk checks with monotonic state; equity-floor ratchet
+**Status:** Proposed (2026-11-11); to be confirmed in the Stage 3 change `add-risk-engine`.
+**Context:** The PRD's §7 listed rules but gave no shape for adding more, and "daily max loss" was a single static number. The RMS research ([`research/rms-tool.md`](research/rms-tool.md) R2) shows that five vendor settings, Max Loss, Trail Max Loss, Lock Minimum Profit, Trail Profits and Lock & Trail, are all versions of one number that only rises. It also shows that vendor tools lose that state on restart.
+**Decision:**
+- **One interface.** Every risk rule implements one `RiskCheck` protocol with a pre-trade phase, a continuous phase, or both. Each returns a decision ranked by severity (ALLOW < REJECT < HALT_NEW_ENTRIES < TARGET_HALT < KILL), and the gate acts on the most severe. A check that raises fails closed.
+- **Equity floor.** The daily max loss becomes a per-account, per-day **equity floor** that never decreases, defined in PRD §7.1.
+- **Monotonic state.** Ratchet state (floor, peak MTM, halt state, day counters) is engine-owned and never editable from the UI. It is persisted *before* the engine acts, with `GREATEST(existing, new)` writes, and restored on restart as `max(persisted, recomputed)`.
+- **Declared tightening direction.** Every parameter declares its tightening direction, which makes D-012's "tighten-only during market hours" mechanical. A change is also rejected if it would lower the floor.
+- **No loss debounce.** The kill switch on the loss side is never debounced. Only the profit target may require consecutive confirmations.
+**Alternatives:** keep separate max-loss / trail / lock rules (five interacting thresholds, hard to prove monotonic); vendor-style in-memory rules that reset on restart (TradeMate does this on purpose; unsafe for automation).
+**Revisit when:** strategy- or household-scope floors (S8–S10) need a scope model beyond per account.
+
+## D-027 — Exits as bounded limit-price chases, never MARKET
+**Status:** Proposed (2026-11-11); to be confirmed in the Stage 4 change `add-trailing-exits` and verified against Dhan in Stage 7.
+**Context:** Since SEBI's retail-algo framework, Dhan converts API market orders into limit orders with Market Price Protection (MPP), a cap near LTP. These can sit unfilled on a fast or illiquid strike (research: [`research/rms-tool.md`](research/rms-tool.md) R10, Part D — *verify*). The PRD's exit flow assumed "market / marketable limit". This refines D-007 (exit before cancel still holds) and stays within D-006 (no per-tick modification).
+**Decision:**
+- **Limit orders only.** Exits are placed as aggressive LIMIT orders at LTP ± a buffer.
+- **Bounded chase.** The engine re-prices an exit every `chase_interval_ms`, at most `max_chase_steps` times. That is always fewer than the per-order modification cap, which is below Dhan's 25. It never re-prices beyond `max_exit_slippage_pct`.
+- **Escalation.** If a kill leaves the book unflattened after `exit_escalate_s`, the engine calls Dhan's Exit All and sends a critical alert.
+- **Leg order.** Short option legs are exited before their hedges.
+- **No MARKET orders.** The engine never sends a MARKET order.
+- **Parameters.** All of the above are configuration; the research's values are examples only.
+**Open:** whether the catastrophic SL can stay an SL-M under MPP (PRD §12 Q17). If not, a further entry refines D-007.
+**Alternatives:** MARKET exits (converted to MPP limits anyway, with no control over the price); unbounded chasing (breaches the modification cap and rate limits).
+
+## D-028 — Continuous detection of external orders
+**Status:** Proposed (2026-11-11); groundwork in the Stage 2 change `add-dhan-readonly`, policy in Stage 7 `add-live-trading`.
+**Context:** Reconciliation (PRD §6.5) catches drift only at startup. A manual order or exit from the Dhan app during the day goes unseen. In particular, a manual exit leaves the engine's catastrophic SL resting on a flat book, where it would *open* a new position if it triggered. Dhan's order-update WebSocket reports orders from every platform with a `Source` field (research: [`research/rms-tool.md`](research/rms-tool.md) R7 — *verify*).
+**Decision:**
+- **What counts as external.** An order is external if its broker order ID is unknown to the engine or its source isn't the API. Detection uses the order-update feed plus a position poll.
+- **Drift.** Net-quantity drift that lasts beyond a grace period raises the account to HALT_NEW_ENTRIES.
+- **Orphan SL first.** When an engine position turns flat because of an external exit, its catastrophic SL is cancelled **before any other action**.
+- **Policy.** Other handling follows a configured `external_order_policy` (PRD §12 Q14).
+- **Audit.** Every external order is audited.
+**Alternatives:** detect at startup only (the current state; leaves orphan SLs live all day); forbid manual trading by policy alone (unenforceable).
+
+## D-029 — Spouse's Zerodha account in Stage 8; market data stays on Dhan
+**Status:** Proposed (2026-11-12); supersedes D-022. To be confirmed in the Stage 8 change.
+**Context:** The owner decided that phase 1 (S0–S7) runs the owner's Dhan account only, and phase 2 (S8) adds the spouse's **existing Zerodha account**, not a new Dhan account as D-022 planned. SentinelX is for personal and family use only, not commercial.
+**Decision:**
+- **Phase 1 unchanged:** Dhan only; no Zerodha code before Stage 8.
+- **S8 adds a `ZerodhaBroker` adapter (Kite Connect)** behind the existing `BrokerAdapter` protocol, used for **execution** on the spouse's account: orders, order updates, positions.
+- **Market data stays on the Dhan feed** for both accounts (D-023). This needs a mapping from the common instrument key to Zerodha's instrument identifiers.
+- **Broker-specific features become optional capabilities.** Dhan's P&L exit, kill switch and Exit All are modelled as optional capabilities of a broker adapter, not as core steps. Where a broker lacks one (Zerodha appears to have no API kill switch or P&L exit — *verify*), the engine's own lock still applies and the owner is alerted to use the broker's manual control.
+- **Only `engine.broker`** may import `dhanhq` or `kiteconnect`.
+**Static IP (PRD §12 Q7):** each broker registers the static IP for its own client, so the same VPS IP serves the owner's Dhan app and the spouse's Kite Connect app, with no family mapping needed. D-022's IP concern applied only to two accounts at one broker. If a second Dhan account is ever opened, Dhan's family static IP mapping is decided then.
+**Open:** Zerodha's daily login (Kite Connect access tokens expire daily and need an interactive login) and its API subscription cost.
+**Trade-off:** a second adapter, instrument mapping and a second daily login, in exchange for no broker concentration (a Dhan outage no longer affects both accounts) and no new account for the spouse.
+
+## D-030 — Automatic stops lock the account for the day
+**Status:** Proposed (2026-11-12); to be confirmed in Stage 3 (engine lock) and Stage 7 (broker lock).
+**Context:** The owner wants the day's rules to act as an emotional circuit breaker: once a rule stops trading, nothing, including the owner, can trade that account until the next day. The engine's HALTED state only blocks orders that go *through SentinelX*; the owner could still trade from the broker's own app.
+**Decision:**
+- **Automatic stops** (equity-floor breach, daily profit target) halt the account until the post-close reset. **No intraday resume command exists for a risk halt.** The recovery-halt resume (reconciliation) is a separate command and never clears a risk halt.
+- **Broker lock after flat:** once the book is flat and no orders are pending, the engine activates the broker's own kill switch (Dhan: `POST /killswitch`), so the broker app is locked too.
+- **Manual kills:** a manual kill (dashboard or Telegram) activates the broker lock only after a second confirmation, so a mistaken kill doesn't lock the day.
+- **Limits stay tighten-only** during market hours (D-012); they aren't fully frozen.
+- **Brokers without a lock API:** for a broker with no lock API (Zerodha, *verify*), the engine lock applies and an alert asks the owner to activate the broker-side lock manually.
+**Alternatives:** engine lock only (bypassable from the broker app); lock on loss stops only (the owner chose both).
+**Risk:** Dhan's kill switch can't be manually undone after a second activation in a day (*verify*). That is accepted as the point of the rule.
+
+## D-031 — Webhook ingress: private for own scripts, one narrow public route for TradingView
+**Status:** Proposed (2026-11-12); refines D-016; to be confirmed in Stage 9.
+**Context:** The owner wants both their own scripts and TradingView alerts in Stage 9, without exposing the server to random traffic. TradingView sends only from published public IPs to ports 80/443 and can't reach a Tailscale address.
+**Decision:**
+- **Own scripts** post over **Tailscale** to a private webhook route, authenticated with an HMAC signature, a per-strategy token and a `request_id` idempotency key.
+- **TradingView** posts over HTTPS to **one public route**, `/hook/tv/<strategy>/<token>`. The VPS firewall accepts public 443 traffic **only from TradingView's published IPs** and drops everything else before Caddy. Caddy serves nothing else publicly, and rate-limits the route.
+- **Tokens.** Each URL token is per strategy and revocable by regeneration. TradingView can't sign its requests, so the token, the IP allowlist and idempotency together authenticate it.
+- **Fast acknowledgement.** Both routes acknowledge quickly and process asynchronously; TradingView cancels after 3 s.
+- **Dashboard and API stay Tailscale-only** (D-016 unchanged for them).
+**Alternatives:** Tailscale only (TradingView impossible); a third-party tunnel or relay (another dependency that sees the payloads); a fully public endpoint (random traffic and scanning).
+**Revisit when:** TradingView changes its source IPs (the allowlist must be kept current), or a signal source can join the tailnet.
