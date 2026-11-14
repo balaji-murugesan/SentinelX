@@ -53,7 +53,7 @@ Owner pause points (commit-and-pause policy): after groups 2, 3, 4, 6 and 8 (ord
 
 ## 9. Integration check
 
-- [ ] 9.1 Run the full definition of done: `uv run ruff format --check .`, `uv run ruff check .`, `uv run mypy src`, `uv run lint-imports`, `uv run pytest` (with `TEST_REDIS_URL` and `TEST_DATABASE_URL` set), `openspec validate add-order-position-core --strict`; verify all pass
+- [x] 9.1 Run the full definition of done: `uv run ruff format --check .`, `uv run ruff check .`, `uv run mypy src`, `uv run lint-imports`, `uv run pytest` (with `TEST_REDIS_URL` and `TEST_DATABASE_URL` set), `openspec validate add-order-position-core --strict`; verify all pass
 - [ ] 9.2 Owner smoke test (paper, market hours, `FEED_SOURCE=dhan` for real prices): `docker compose up -d --build`, then via `docker compose exec engine python -m cli`: place a market buy of one lot of a liquid option, check `positions` against Dhan's LTP, place a far limit sell and cancel it, place a near limit sell and watch it fill, `docker kill --signal=KILL` the engine, let it restart, and confirm `orders`/`positions` are unchanged; record the results in this task
 
 ## Workflow follow-up
