@@ -223,6 +223,24 @@ def crash_invariant_view(state: LoadedState, snapshot: Snapshot) -> dict[str, An
     }
 
 
+def changed_fields(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
+    """Name each field that differs ("snapshot_orders[0].state: 'submitted' -> 'open'").
+
+    pytest truncates the nested dicts, which hides exactly the part that matters."""
+    lines: list[str] = []
+    for section, old_rows in before.items():
+        new_rows = after[section]
+        if len(old_rows) != len(new_rows):
+            lines.append(f"{section}: {len(old_rows)} rows -> {len(new_rows)} rows")
+        for index, (old, new) in enumerate(zip(old_rows, new_rows, strict=False)):
+            lines += [
+                f"{section}[{index}].{field}: {old[field]!r} -> {new[field]!r}"
+                for field in old
+                if old[field] != new[field]
+            ]
+    return lines
+
+
 async def test_kill_minus_9_then_restart_keeps_state_and_the_resting_limit(
     redis: Redis, tmp_path: Path
 ) -> None:
@@ -243,9 +261,16 @@ async def test_kill_minus_9_then_restart_keeps_state_and_the_resting_limit(
         )
         resting = await send(redis, far_limit_sell("sell-far"))
         assert resting.accepted and resting.order_id
+        # Wait for the order in state OPEN, not just present: the snapshot also lists Requested and
+        # Submitted orders and is written without the order lock, so a snapshot taken mid-place
+        # can contain the order in an earlier state than the one stored in Postgres.
         await eventually(
             lambda: snapshot_shows(
-                redis, lambda s: any(o.order_id == resting.order_id for o in s.open_orders)
+                redis,
+                lambda s: any(
+                    o.order_id == resting.order_id and o.state is OrderState.OPEN
+                    for o in s.open_orders
+                ),
             ),
             seconds=10,
         )
@@ -265,8 +290,9 @@ async def test_kill_minus_9_then_restart_keeps_state_and_the_resting_limit(
 
         # -- second life: same Redis, same Postgres ------------------------------------------
         engine.start()
-        # The consumer reads commands only after recovery, so this answer proves recovery is
-        # done. Same idempotency key, new command id: the ORIGINAL result must come back.
+        # The consumer reads commands only after recovery's FIRST ATTEMPT has ended (even one that
+        # failed on a slow Postgres connect), so this answer normally means recovery is done.
+        # Same idempotency key, new command id: the ORIGINAL result must come back.
         again = await send(
             redis,
             command(buy_key, instrument=OPTION, quantity=LOT).model_copy(
@@ -278,9 +304,9 @@ async def test_kill_minus_9_then_restart_keeps_state_and_the_resting_limit(
         after_state = await repo.load(ACCOUNT)
 
         assert again.accepted and again.order_id == buy_order_id  # command keys survived
-        assert crash_invariant_view(after_state, after_snapshot) == crash_invariant_view(
-            before_state, before_snapshot
-        )
+        before_view = crash_invariant_view(before_state, before_snapshot)
+        after_view = crash_invariant_view(after_state, after_snapshot)
+        assert after_view == before_view, "\n".join(changed_fields(before_view, after_view))
         assert not after_snapshot.halted  # recovery found nothing to disagree about
         still_open = [o.order_id for o in after_state.open_orders if o.state is OrderState.OPEN]
         assert still_open == [resting.order_id]  # the resting limit order is rebuilt
