@@ -12,6 +12,14 @@ Commands so far:
   instruments search T   Search the instrument master (today's cached file, else a download).
   feed watch KEY...      Print ticks and feed status for KEYs (e.g. IDX_I:13) until Ctrl+C,
                          from FEED_SOURCE (dhan or simulated).
+  order place KEY SIDE QTY --product P [--limit PRICE]
+                         Send a place-order command to the engine and print its reply
+                         (run inside the engine container; see cli/orders.py).
+  order cancel ORDER_ID  Ask the engine to cancel an open order.
+  orders / positions     Show open orders / positions from the engine's Redis snapshot
+                         (a HALTED block lists why new orders are refused, if they are).
+  recovery resume        After reviewing a HALTED state and fixing its cause, ask the engine to
+                         re-check and clear the halt (it stays if differences remain).
   candles watch KEY --tf M
                          Print the last warm-up candles of M minutes for KEY, then each
                          completed candle until Ctrl+C; on Ctrl+C, compare the live candles
@@ -24,11 +32,14 @@ import json
 import sys
 from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import httpx
 
+from cli import orders as order_cli
 from contracts.market import Instrument, InstrumentKey
+from contracts.orders import OrderSide, ProductType
 from contracts.settings import SettingsError, load_settings
 from engine.broker.dhan.history import HistoryError, fetch_intraday, intraday_body
 from engine.broker.dhan.instrument_cache import cache_path, load_instruments
@@ -81,6 +92,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     candle_watch.add_argument(
         "--tf", type=int, default=5, choices=(1, 3, 5, 15), help="interval in minutes"
     )
+    order = groups.add_parser(
+        "order", help="place or cancel an order via the engine"
+    ).add_subparsers(dest="command", required=True)
+    place = order.add_parser("place", help="place an order (market, or limit with --limit)")
+    place.add_argument("key", type=InstrumentKey.parse, metavar="KEY")
+    place.add_argument("side", type=str.upper, choices=[s.value for s in OrderSide])
+    place.add_argument("quantity", type=int, metavar="QTY", help="units (lots x lot size)")
+    place.add_argument(
+        "--product", type=str.upper, choices=[p.value for p in ProductType], required=True
+    )
+    place.add_argument("--limit", type=Decimal, metavar="PRICE", help="limit price")
+    cancel = order.add_parser("cancel", help="cancel an open order")
+    cancel.add_argument("order_id", metavar="ORDER_ID")
+    recovery = groups.add_parser(
+        "recovery", help="clear a HALTED state after review"
+    ).add_subparsers(dest="command", required=True)
+    recovery.add_parser("resume", help="re-check and clear the halt if nothing differs")
+    groups.add_parser("orders", help="open orders from the engine snapshot")
+    groups.add_parser("positions", help="positions and P&L from the engine snapshot")
     args = parser.parse_args(argv)
 
     try:
@@ -96,6 +126,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         # asyncio.run is the sync -> async entry point (like `await` at the top of Main): it
         # creates the event loop, runs the coroutine to completion and closes the loop.
+        if args.group in ("order", "orders", "positions", "recovery"):
+            return asyncio.run(_order_command(settings, args))
         if args.group == "dhan" and args.command == "history":
             return asyncio.run(dhan_history(settings, credentials, args.key, args.days, args.save))
         if args.group == "dhan":
@@ -107,6 +139,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(feed_watch(settings, args.keys))
     except KeyboardInterrupt:  # Ctrl+C: asyncio.run cancels the tasks, then we exit quietly
         return 0
+
+
+async def _order_command(settings: EngineSettings, args: argparse.Namespace) -> int:
+    url = settings.redis_url.get_secret_value()
+    account = settings.account_id
+    if args.group == "orders":
+        return await order_cli.run_with_redis(
+            url, None, lambda r: order_cli.show_orders(r, account_id=account, out=_print_now)
+        )
+    if args.group == "positions":
+        return await order_cli.run_with_redis(
+            url, None, lambda r: order_cli.show_positions(r, account_id=account, out=_print_now)
+        )
+    if args.group == "recovery":
+        return await order_cli.run_with_redis(
+            url, None, lambda r: order_cli.resume_recovery(r, account_id=account, out=_print_now)
+        )
+    if args.command == "cancel":
+        return await order_cli.run_with_redis(
+            url,
+            None,
+            lambda r: order_cli.cancel_order(
+                r, account_id=account, order_id=args.order_id, out=_print_now
+            ),
+        )
+    return await order_cli.run_with_redis(
+        url,
+        None,
+        lambda r: order_cli.place_order(
+            r, account_id=account, key=args.key, side=OrderSide(args.side), quantity=args.quantity,
+            product=ProductType(args.product), limit_price=args.limit, out=_print_now,
+        ),
+    )  # fmt: skip
 
 
 async def dhan_profile(

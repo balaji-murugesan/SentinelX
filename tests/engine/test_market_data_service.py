@@ -25,6 +25,7 @@ from engine.market_data.bus import Subscription
 from engine.market_data.provider import FeedState, Tick
 from engine.market_data.service import MarketDataService
 from tests.engine.test_run import DownRedis
+from tests.engine.trading_fakes import MemoryRepository
 
 NIFTY = InstrumentKey.parse("IDX_I:13")
 
@@ -72,7 +73,13 @@ def start(
 ) -> tuple["asyncio.Task[None]", asyncio.Event]:
     stop = asyncio.Event()
     engine = asyncio.create_task(
-        run(settings, redis=DownRedis(), stop=stop, market_data=service)  # type: ignore[arg-type]
+        run(
+            settings,
+            redis=DownRedis(),  # type: ignore[arg-type]
+            stop=stop,
+            market_data=service,
+            repository=MemoryRepository(),
+        )
     )
     return engine, stop
 

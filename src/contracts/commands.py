@@ -56,12 +56,18 @@ class CancelOrder(_CommandBase):
     order_id: str = Field(min_length=1)
 
 
+class ResumeRecovery(_CommandBase):
+    """Ask the engine to re-check itself and, only if clean, clear its recovery halt."""
+
+    command: Literal["resume_recovery"] = "resume_recovery"
+
+
 # Annotated[..., Field(discriminator=...)] tells pydantic to choose the class by `command`.
-Command = Annotated[PlaceOrder | CancelOrder, Field(discriminator="command")]
+Command = Annotated[PlaceOrder | CancelOrder | ResumeRecovery, Field(discriminator="command")]
 _COMMAND = TypeAdapter(Command)
 
 
-def parse_command(raw: str | bytes) -> PlaceOrder | CancelOrder:
+def parse_command(raw: str | bytes) -> PlaceOrder | CancelOrder | ResumeRecovery:
     """Parse one stream entry. Raises pydantic.ValidationError for anything malformed."""
     return _COMMAND.validate_json(raw)
 

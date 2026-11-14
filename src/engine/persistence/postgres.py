@@ -9,6 +9,7 @@ lock (design, Risks).
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -31,7 +32,7 @@ from contracts.orders import (
     ProductType,
 )
 from engine.persistence import tables as t
-from engine.persistence.repository import LoadedState, PersistenceError
+from engine.persistence.repository import LoadedState, PersistenceError, RecoveryHalt
 
 DEFAULT_TIMEOUT_S = 3.0
 _OPEN_STATES = [s.value for s in OrderState if not s.is_final]
@@ -92,6 +93,30 @@ class PostgresRepository:
             await conn.execute(sa.insert(t.fills).values(_fill_row(fill)))
             await _upsert_position(conn, position)
 
+    async def store_halt(self, account_id: str, differences: list[str], at: datetime) -> None:
+        values = {
+            "account_id": account_id,
+            "halted": True,
+            "differences": differences,
+            "halted_at": at,
+            "cleared_at": None,
+        }
+        statement = pg_insert(t.recovery_state).values(values)
+        statement = statement.on_conflict_do_update(
+            index_elements=["account_id"],
+            set_={k: v for k, v in values.items() if k != "account_id"},
+        )
+        async with self._transaction() as conn:
+            await conn.execute(statement)
+
+    async def clear_halt(self, account_id: str, at: datetime) -> None:
+        async with self._transaction() as conn:
+            await conn.execute(
+                sa.update(t.recovery_state)
+                .where(t.recovery_state.c.account_id == account_id)
+                .values(halted=False, differences=[], cleared_at=at)
+            )
+
     async def load(self, account_id: str) -> LoadedState:
         async with self._transaction() as conn:
             orders = (
@@ -116,7 +141,24 @@ class PostgresRepository:
                 )
             ).mappings()
             positions = [_position(r) for r in position_rows]
-        return LoadedState(open_orders, fills, positions)
+            halt_row = (
+                (
+                    await conn.execute(
+                        sa.select(t.recovery_state).where(
+                            t.recovery_state.c.account_id == account_id,
+                            t.recovery_state.c.halted.is_(True),
+                        )
+                    )
+                )
+                .mappings()
+                .first()
+            )
+        halt = (
+            None
+            if halt_row is None
+            else RecoveryHalt(tuple(halt_row["differences"]), halt_row["halted_at"])
+        )
+        return LoadedState(open_orders, fills, positions, halt)
 
 
 async def _update_order(conn: AsyncConnection, order: Order) -> None:

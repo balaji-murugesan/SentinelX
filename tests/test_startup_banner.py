@@ -9,7 +9,7 @@ from structlog.testing import capture_logs
 import api.main
 import engine.main
 from contracts.mode import TradingMode, startup_banner
-from observability.banner import log_startup_banner
+from observability.banner import log_halted_banner, log_startup_banner
 
 REDIS_PASSWORD = "r3dis-pw-SECRET"
 DB_PASSWORD = "db-pw-SECRET"
@@ -70,6 +70,26 @@ def test_live_banner_logged_at_warning() -> None:
     assert logs[0]["log_level"] == "warning"
     assert logs[0]["mode"] == "live"
     assert "REAL ORDERS" in logs[0]["event"]
+
+
+def test_banner_names_the_account_label() -> None:
+    assert "ACCOUNT: MAIN" in startup_banner("engine", TradingMode.PAPER, "simulated", "main")
+    with capture_logs() as logs:
+        log_startup_banner("engine", TradingMode.PAPER, "simulated", "main")
+    assert logs[0]["account"] == "main" and "ACCOUNT: MAIN" in logs[0]["event"]
+
+
+def test_halted_banner_is_logged_at_error_with_every_difference() -> None:
+    with capture_logs() as logs:
+        log_halted_banner("engine", "main", ["order o1 differs", "position x differs"])
+
+    assert {entry["log_level"] for entry in logs} == {"error"}
+    events = [entry["event"] for entry in logs]
+    assert (
+        "HALTED" in events[0] and "NEW ORDERS REFUSED" in events[0] and "2 DIFFERENCE" in events[0]
+    )
+    assert "HALTED: order o1 differs" in events and "HALTED: position x differs" in events
+    assert "recovery resume" in events[-1]
 
 
 @ENTRY_POINTS

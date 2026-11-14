@@ -1,21 +1,38 @@
 """Engine entry point (``uv run --env-file .env python -m engine.main``).
 
-Stage 0 engine: validates configuration, announces its mode, keeps a liveness heartbeat and
-answers diagnostic pings. No trading logic yet.
+Validates configuration, announces its mode and account, keeps a liveness heartbeat, answers
+diagnostic pings, streams market data, and runs the order path: recovery, then the command
+consumer, paper broker, order updates and the Redis snapshot. Paper broker only (no
+``DhanBroker`` yet).
 """
 
 import asyncio
+import contextlib
 import signal
+from collections.abc import Awaitable, Callable
+from datetime import timedelta
 
 import structlog
+from opentelemetry import trace
 from redis.asyncio import Redis
 
+from contracts.commands import CommandResult, ResumeRecovery
+from contracts.mode import TradingMode
 from contracts.settings import SettingsError, load_settings
+from engine.broker.paper import PaperBroker
 from engine.config import EngineSettings
 from engine.diagnostics import answer_pings
 from engine.healthcheck import heartbeat_loop
 from engine.market_data.service import MarketDataService
-from observability.banner import log_startup_banner
+from engine.orders.commands import CommandConsumer
+from engine.orders.gate import PaperOnlyGate
+from engine.orders.recovery import recover_with_retry, resume_recovery
+from engine.orders.service import OrderService
+from engine.orders.snapshot import SnapshotWriter
+from engine.persistence.postgres import PostgresRepository
+from engine.persistence.repository import TradingRepository
+from engine.positions.feed import PositionFeed
+from observability.banner import log_halted_banner, log_startup_banner
 from observability.logging_setup import configure_logging
 from observability.tracing import configure_tracing, shutdown_tracing
 
@@ -33,7 +50,7 @@ def start() -> EngineSettings:
         raise SystemExit(str(exc)) from None
     configure_logging("engine", settings.log_level)
     configure_tracing("engine", settings.otel_exporter_otlp_endpoint)
-    log_startup_banner("engine", settings.mode, settings.feed_source)
+    log_startup_banner("engine", settings.mode, settings.feed_source, settings.account_id)
     return settings
 
 
@@ -47,23 +64,120 @@ def _stop_on_signals(stop: asyncio.Event) -> None:
             pass
 
 
+async def _after(event: asyncio.Event, make: Callable[[], Awaitable[None]]) -> None:
+    """Start the work once ``event`` is set (like awaiting a TaskCompletionSource in C#). It takes
+    a factory, not a coroutine, so nothing is created if the engine stops before the event."""
+    await event.wait()
+    await make()
+
+
+async def _until_stopped(stop: asyncio.Event, work: Awaitable[None]) -> None:
+    """Run ``work`` (which has no stop event of its own) until it ends or ``stop`` is set, then
+    cancel it. A failure in ``work`` propagates."""
+    task = asyncio.ensure_future(work)
+    stopper = asyncio.ensure_future(stop.wait())
+    await asyncio.wait({task, stopper}, return_when=asyncio.FIRST_COMPLETED)
+    stopper.cancel()
+    if not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    else:
+        task.result()  # re-raise its exception, if any
+
+
+async def _keep_alive(
+    name: str, stop: asyncio.Event, make: Callable[[], Awaitable[None]], *, restart_s: float = 5.0
+) -> None:
+    """Run a read-model task, restarting it if it crashes: its failure must never stop orders or
+    the heartbeat (the Redis snapshot is a read model only; spec "State snapshot in Redis")."""
+    log = structlog.get_logger("engine")
+    while not stop.is_set():
+        try:
+            await make()
+            return
+        except Exception:
+            log.exception("task crashed; restarting", task=name, restart_in=restart_s)
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=restart_s)
+
+
 async def run(
     settings: EngineSettings,
     *,
     redis: Redis | None = None,
     stop: asyncio.Event | None = None,
     market_data: MarketDataService | None = None,
+    repository: TradingRepository | None = None,
+    snapshot_restart_s: float = 5.0,
 ) -> None:
     """Run the engine's background tasks until ``stop`` is set (or one of them fails).
 
     asyncio.TaskGroup is like Task.WhenAll with fail-fast: if any task raises, the others are
     cancelled and the error propagates, so the process exits non-zero and Docker restarts it.
     Market data contains its own failures (design §11), so it never triggers that.
+
+    ``repository`` exists only so tests can inject ``MemoryRepository``: in production it is
+    always Postgres, built from ``DATABASE_URL`` (design §13). If Postgres is down the engine
+    stays up with new orders refused and keeps retrying recovery.
     """
     stop = stop or asyncio.Event()
     market_data = market_data or MarketDataService(settings)
     owned_redis = redis is None
     redis = redis or Redis.from_url(settings.redis_url.get_secret_value(), decode_responses=True)
+    postgres = (
+        PostgresRepository(settings.database_url.get_secret_value()) if repository is None else None
+    )
+    repository = repository or postgres
+    assert repository is not None
+    account = settings.account_id
+    broker = PaperBroker(
+        market_data.bus,
+        market_data.master.get,
+        slippage_ticks=settings.paper_slippage_ticks,
+        max_price_age=timedelta(seconds=settings.paper_price_max_age_s),
+    )
+    service = OrderService(
+        account_id=account,
+        paper=settings.mode is TradingMode.PAPER,
+        gate=PaperOnlyGate(settings.mode),
+        adapter=broker,
+        repository=repository,
+        instruments=market_data.master,
+        position_feed=PositionFeed(market_data.provider),
+        tracer=trace.get_tracer("engine.orders"),
+        ack_timeout_s=settings.order_ack_timeout_s,
+    )
+
+    async def resume(command: ResumeRecovery) -> CommandResult:
+        return await resume_recovery(service, repository, broker, command, account_id=account)
+
+    consumer = CommandConsumer(redis, service, account_id=account, resume=resume)
+    snapshots = SnapshotWriter(
+        redis,
+        service,
+        market_data.bus.subscribe("snapshot"),
+        account_id=account,
+        interval_s=settings.snapshot_interval_s,
+    )
+    recovery_started = asyncio.Event()
+
+    async def recover() -> None:
+        try:
+            differences = await recover_with_retry(
+                service,
+                repository,
+                broker,
+                account_id=account,
+                stop=stop,
+                restore_broker=broker.restore,
+                first_attempt=recovery_started,
+            )
+        finally:
+            recovery_started.set()  # never leave the order tasks waiting if recovery fails
+        if differences and not stop.is_set():
+            log_halted_banner("engine", account, differences)
+
     _stop_on_signals(stop)
     log = structlog.get_logger("engine")
     log.info("engine running")
@@ -72,9 +186,27 @@ async def run(
             group.create_task(heartbeat_loop(settings.engine_heartbeat_path, stop))
             group.create_task(answer_pings(redis, stop))
             group.create_task(market_data.run(stop))
+            group.create_task(recover())
+            # Commands are read only after recovery's first attempt (design §9, §13).
+            group.create_task(_after(recovery_started, lambda: consumer.run(stop)))
+            group.create_task(
+                _after(recovery_started, lambda: _until_stopped(stop, service.run_updates()))
+            )
+            group.create_task(service.run_pending_writes(stop))
+            group.create_task(broker.run(stop))
+            group.create_task(
+                _keep_alive(
+                    "snapshot writer",
+                    stop,
+                    lambda: snapshots.run(stop),
+                    restart_s=snapshot_restart_s,
+                )
+            )
     finally:
         if owned_redis:
             await redis.aclose()
+        if postgres is not None:
+            await postgres.close()
         log.info("engine stopped")
 
 

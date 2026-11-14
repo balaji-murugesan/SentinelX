@@ -25,9 +25,9 @@ Stage 1 gives the engine prices and candles, but it cannot yet hold an order or 
   - Every fill is charged **trading costs** (brokerage, STT, exchange and SEBI fees, stamp duty, GST) from a configurable rate table, so paper P&L is not overstated.
   - Unfilled orders expire at the 15:30 close.
 - **Positions and P&L**: net quantity and average price per account, instrument and product. Realized P&L, costs and mark-to-market (MTM) P&L are updated on every tick. Open positions keep their instruments subscribed on the feed.
-- **Persistence and recovery**: orders, order transitions (audit), fills, positions and command results go to Postgres in a new migration. If persistence is unavailable, **new orders are rejected** (fail closed, safety rule 9). On restart the engine reloads its state and reconciles open orders with the broker before accepting commands. Kill -9 then restart restores identical state.
+- **Persistence and recovery**: orders, order transitions (audit), fills, positions and command results go to Postgres in a new migration. If persistence is unavailable, **new orders are rejected** (fail closed, safety rule 9). On restart the engine reloads its state and reconciles open orders with the broker before accepting commands. Kill -9 then restart restores identical state. A reconciliation difference puts the engine in a **persisted HALTED state** (new entries rejected, shown in the banner, snapshot and CLI) that a restart cannot clear; only `cli recovery resume`, after review and a clean re-check, does. Production never falls back to in-memory storage.
 - **State snapshot** in Redis: open orders and positions with MTM, refreshed on change, for the CLI now and the API later.
-- **Developer CLI**: `order place`, `order cancel`, `orders` and `positions`. Commands go through the Redis stream, run inside the engine container (`docker compose exec engine python -m cli …`).
+- **Developer CLI**: `order place`, `order cancel`, `orders`, `positions` and `recovery resume`. Commands go through the Redis stream, run inside the engine container (`docker compose exec engine python -m cli …`).
 
 Out of scope:
 - **Next change (`add-dhan-readonly`):** the read-only Dhan adapter, Dhan order-update parsing, and reconciliation against recorded Dhan responses.
@@ -70,7 +70,7 @@ None. This change relies on existing requirements unchanged:
   - `PAPER_SLIPPAGE_TICKS`.
   - Trading-cost rate settings, with defaults from Dhan's published charges for the owner to confirm.
   - Order timeout and snapshot interval.
-- **Database**: new tables `orders`, `order_events`, `fills`, `positions` and `command_results`, all carrying `account_id`.
+- **Database**: new tables `orders`, `order_events`, `fills`, `positions` and `command_results` (migration `0002`), and `recovery_state` (migration `0003`), all carrying `account_id`.
 - **Redis**: a new command stream, per-command reply streams with a TTL, and a snapshot key.
 - **CI**: a Postgres service container for the persistence and recovery integration tests, following the existing Redis pattern (`TEST_DATABASE_URL`).
 - **Dependencies**: none new (SQLAlchemy async, asyncpg, Alembic and redis are already present).

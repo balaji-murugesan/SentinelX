@@ -31,7 +31,7 @@ The owner's choices for this change are: Stage 2 is split, with the read-only Dh
 | Path | Contents |
 |---|---|
 | `contracts/orders.py` | `OrderSide`, `ProductType`, `OrderType`, `OrderState`, `Order`, `Fill`, `Position` values (pydantic v2, `schema_version`, `account_id`) |
-| `contracts/commands.py` | `PlaceOrder`, `CancelOrder`, `CommandResult`, stream and key names |
+| `contracts/commands.py` | `PlaceOrder`, `CancelOrder`, `ResumeRecovery`, `CommandResult`, stream and key names |
 | `engine/orders/validation.py` | Pure checks against an `Instrument` and held quantity |
 | `engine/orders/gate.py` | `RiskGate` Protocol and `PaperOnlyGate` |
 | `engine/orders/machine.py` | Pure transition table and `transition()` |
@@ -40,7 +40,7 @@ The owner's choices for this change are: Stage 2 is split, with the read-only Dh
 | `engine/broker/adapter.py` | `BrokerAdapter` Protocol and `BrokerUpdate` values |
 | `engine/broker/paper.py`, `engine/broker/costs.py` | `PaperBroker`; trading-cost rate table and calculator |
 | `engine/positions/book.py` | Pure `PositionBook` (apply fill, MTM) |
-| `engine/persistence/` | SQLAlchemy tables, `TradingRepository` Protocol, `PostgresRepository`, `MemoryRepository` (tests) and migration `0002_trading` |
+| `engine/persistence/` | SQLAlchemy tables, `TradingRepository` Protocol, `PostgresRepository`, `MemoryRepository` (tests) and migrations `0002_trading` and `0003_recovery_halt` |
 
 `contracts` imports nothing internal, and `api` never imports `engine` (import-linter, unchanged). `PaperBroker` lives in `engine.broker` beside the future `DhanBroker`.
 
@@ -136,7 +136,13 @@ Before the command consumer starts, recovery runs these steps in order:
 3. Reconcile: compare each open or `Unknown` order with `adapter.order_book()`.
 4. Compare positions rebuilt from fills with the stored positions (spec: Rebuild from fills).
 
-Any difference sets `reconciled = false`. New orders are then rejected with the difference logged, and existing orders are still managed (spec: Mismatch after restart). Clearing it is a manual step in this stage: the owner fixes the data and restarts. An automatic resolution flow is deferred.
+Any difference sets `reconciled = false` and **stores a halt**. New entry orders are then rejected with the differences logged, and existing orders are still managed (spec: Mismatch after restart).
+
+The halt lives in a one-row-per-account `recovery_state` table (migration `0003_recovery_halt`; `0002` has run, so it is not edited). It holds the differences and the time. Recovery treats it as sticky: `reconciled` is true only when no differences are found **and** no halt is stored, so a restart cannot clear it.
+
+Clearing is explicit: the owner reviews, fixes the data, and runs `cli recovery resume`. That sends a `ResumeRecovery` command, which re-runs the recovery comparison. If it is clean, the halt is cleared and the clearing is stored; otherwise the halt stays and the reply lists what still differs. There is no force option in this stage. The halt gates new entries only, so later exit and kill-switch paths must not be gated by it. The halt is shown in the startup banner (error level), the snapshot and the CLI.
+
+If the stored state cannot be loaded at all, the engine keeps running with new orders rejected and retries the load with backoff. It only accepts orders after a load and reconciliation have succeeded, so an empty in-memory book is never traded against.
 
 ### 10. Settings
 
@@ -165,8 +171,15 @@ Redis isn't published to the host (it's a Stage 0 decision), so the owner runs t
   - the command stream with redelivery;
   - **kill -9 and restart**: the engine runs as a subprocess and is killed with `SIGKILL` (`TerminateProcess` on Windows), then state is compared.
 
+### 13. Engine wiring and startup
+
+`engine.main.run` builds the Postgres repository from `database_url` and has a `repository` parameter that only tests use to inject `MemoryRepository`; production never falls back to it. A missing `DATABASE_URL` already stops startup in settings validation. An unreachable database does not: the engine stays up, rejects new orders and retries recovery (§9).
+
+Startup order: repository → `PaperBroker` → `OrderService` → recovery (before any command is read) → then, under the existing `TaskGroup`, the command consumer, update loop, pending-write retry, paper broker and heartbeat. The snapshot writer runs inside a wrapper that logs its own crash and does not propagate it, so a snapshot failure never stops orders or the heartbeat (the snapshot is a read model). The banner shows the account label, and an error-level HALTED block when the engine starts halted.
+
 ## Risks / Trade-offs
 
+- [A persisted halt could lock the owner out of trading] → It is cleared by `cli recovery resume` once reconciliation is clean, and cancels keep working while halted.
 - [A Postgres write that hangs, not fails, stalls the lock and therefore all orders] → Every repository call has a timeout (`asyncio.timeout`, 3 s). A timeout counts as a failure, so the operation goes to the pending-write queue (Decision 3).
 - [The cost rates may be outdated (exchange and tax rates change)] → Task 4.4 has the owner verify them against Dhan's calculator. The table is one file, and changes are covered by the cost tests.
 - [Paper fills are more generous than live: no queue position, no partial fills, no rejections for margin] → This is documented. S3 adds margin and risk checks, and live forward testing in S7 measures the real gap.
@@ -175,7 +188,7 @@ Redis isn't published to the host (it's a Stage 0 decision), so the owner runs t
 
 ## Migration Plan
 
-Migration `0002_trading` adds tables and never changes `0001`. The migrate service applies it on `docker compose up`. Rollback means running `alembic downgrade` to `0001` with the stack stopped, which drops the new tables (paper data only at this stage). CI adds a Postgres service for the integration tests.
+Migrations `0002_trading` (the five trading tables) and `0003_recovery_halt` (`recovery_state`) add tables and never change `0001` or each other. The migrate service applies it on `docker compose up`. Rollback means running `alembic downgrade` to `0001` with the stack stopped, which drops the new tables (paper data only at this stage). CI adds a Postgres service for the integration tests.
 
 ## Open Questions
 

@@ -42,6 +42,28 @@ The engine SHALL read commands as a consumer group and acknowledge each only aft
 - **WHEN** the engine is killed after persisting a command's result but before acknowledging it
 - **THEN** after restart the command is redelivered, the stored result is replied again, and no second order is created
 
+### Requirement: Resume after a recovery halt
+The engine SHALL accept a resume-recovery command through the same stream, with an idempotency key and the account check. On receipt it SHALL re-run reconciliation. If no differences remain it SHALL clear the stored halt and reply accepted; otherwise the halt SHALL stay and the reply SHALL list the differences. Resuming when not halted SHALL change nothing and be accepted.
+
+#### Scenario: Resume after review
+- **WHEN** the owner has fixed the cause and sends the resume command
+- **THEN** reconciliation is clean, the halt is cleared and stored as cleared, and new orders are accepted again
+
+#### Scenario: Resume with differences remaining
+- **WHEN** the resume command arrives while a difference still exists
+- **THEN** the halt stays, the reply lists the differences, and new orders are still rejected
+
+#### Scenario: Resume when not halted
+- **WHEN** the resume command arrives and no halt is stored
+- **THEN** it is accepted and nothing changes
+
+### Requirement: CLI shows and clears a halt
+The developer CLI SHALL provide `recovery resume`, sending the resume command with a fresh idempotency key and printing the reply. Its `orders` and `positions` output SHALL show a HALTED line with each difference whenever the snapshot reports a halt.
+
+#### Scenario: CLI shows HALTED
+- **WHEN** the snapshot reports a halt and the owner runs `orders`
+- **THEN** the output starts with a HALTED line listing each difference
+
 ### Requirement: Developer CLI uses the command stream
 The developer CLI SHALL place and cancel orders by writing commands to the command stream with a fresh idempotency key per invocation, and SHALL print the engine's reply. It SHALL show orders and positions from the engine's Redis snapshot, never computing P&L itself.
 

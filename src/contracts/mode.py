@@ -68,10 +68,13 @@ def resolve_trading_mode(trading_mode: str | None, live_confirm: str | None) -> 
     raise ModeConfigError(f"TRADING_MODE must be {allowed} (or unset), got {mode!r}{hint}")
 
 
-def startup_banner(service: str, mode: TradingMode, feed: str | None = None) -> str:
+def startup_banner(
+    service: str, mode: TradingMode, feed: str | None = None, account: str | None = None
+) -> str:
     """One-line, hard-to-miss banner naming the service, its trading mode and (engine only)
-    its market-data feed source."""
+    its market-data feed source and account label."""
     feed_part = f" | FEED: {feed.upper()}" if feed else ""
+    feed_part += f" | ACCOUNT: {account.upper()}" if account else ""
     if mode is TradingMode.LIVE:
         return (
             f"=== SENTINELX {service.upper()} | TRADING MODE: LIVE | REAL ORDERS WILL BE SENT"

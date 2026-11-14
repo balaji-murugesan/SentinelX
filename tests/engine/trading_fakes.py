@@ -4,9 +4,11 @@ The shared contract suite (test_trading_repository.py) runs against both, so thi
 quietly drift from the real database's behaviour.
 """
 
+from datetime import datetime
+
 from contracts.commands import CommandResult
 from contracts.orders import Fill, Order, Position
-from engine.persistence.repository import LoadedState, PersistenceError
+from engine.persistence.repository import LoadedState, PersistenceError, RecoveryHalt
 
 
 class MemoryRepository:
@@ -16,6 +18,7 @@ class MemoryRepository:
         self.fills: list[Fill] = []
         self.positions: dict[tuple[str, str, str], Position] = {}
         self.results: dict[tuple[str, str], CommandResult] = {}
+        self.halts: dict[str, RecoveryHalt] = {}
 
     async def find_result(self, account_id: str, idempotency_key: str) -> CommandResult | None:
         return self.results.get((account_id, idempotency_key))
@@ -45,6 +48,12 @@ class MemoryRepository:
         self.fills.append(fill)
         self.positions[(position.account_id, str(position.key), position.product.value)] = position
 
+    async def store_halt(self, account_id: str, differences: list[str], at: datetime) -> None:
+        self.halts[account_id] = RecoveryHalt(tuple(differences), at)
+
+    async def clear_halt(self, account_id: str, at: datetime) -> None:
+        self.halts.pop(account_id, None)
+
     async def load(self, account_id: str) -> LoadedState:
         return LoadedState(
             open_orders=sorted(
@@ -57,6 +66,7 @@ class MemoryRepository:
             ),
             fills=[f for f in self.fills if f.account_id == account_id],
             positions=[p for p in self.positions.values() if p.account_id == account_id],
+            halt=self.halts.get(account_id),
         )
 
     def _check_new_result(self, result: CommandResult) -> None:
