@@ -45,3 +45,14 @@ A tick that moves more than the configured outlier percentage from the last acce
 #### Scenario: Genuine gap
 - **WHEN** a price jumps 30% and the next tick stays within the outlier percentage of the new level
 - **THEN** the new level is accepted and the peak may rise
+
+### Requirement: Garbage ticks are ignored
+A tick whose price is not a finite number above zero (a damaged packet can yield NaN or infinity) SHALL be ignored and logged. It SHALL NOT change any price, and SHALL NOT count as a tick for freshness, so garbage can neither move a price nor make a silent feed look alive.
+
+#### Scenario: NaN price
+- **WHEN** a tick with a NaN price arrives for an instrument last priced at 100.00 five seconds ago
+- **THEN** the price stays 100.00 and the instrument's last-tick time is unchanged
+
+#### Scenario: Zero price as the first tick
+- **WHEN** the first tick of an instrument has price 0
+- **THEN** the instrument stays unpriced, and the day's MTM stays unknown while it is held

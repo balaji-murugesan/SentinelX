@@ -28,6 +28,13 @@ For the quantity a position held at the start of the day, the day's P&L SHALL co
 - **WHEN** the engine was down at yesterday's close and holds a carried position
 - **THEN** the average price is the reference and `RISK_REFERENCE_MISSING` is recorded
 
+### Requirement: A carried position closed today without a reference makes MTM unknown
+If a carried position was sold or bought back in full today and no previous-close reference exists, `MTM_day` SHALL be unknown, not a number, because a flat position keeps no average price from which to measure. While `MTM_day` is unknown the engine SHALL reject new entries.
+
+#### Scenario: Closed carried position without a reference
+- **WHEN** a carried holding was sold in full today and no previous-close reference exists
+- **THEN** `MTM_day` is unknown and new entries are rejected, instead of counting the whole sale as profit
+
 ### Requirement: The floor starts at the maximum loss and only rises
 For each account and trading day the floor SHALL start at the negative of the configured daily maximum loss. The day's peak `MTM_day` SHALL start at zero and rise to each new higher value, using only fresh, non-outlier prices. The floor SHALL be the highest of its starting value and every configured term below, and SHALL NEVER decrease during the day, whatever path `MTM_day` takes or limit edits are made.
 
@@ -62,6 +69,10 @@ The trail term SHALL raise the floor by a configured amount for each configured 
 #### Scenario: Trail steps
 - **WHEN** the trail raises the floor by 500 for each 1,000 of peak and the peak is 2,500
 - **THEN** the floor is 1,000
+
+#### Scenario: Trail below its first step
+- **WHEN** the trail raises the floor by 500 for each 1,000 of peak and the peak is 999
+- **THEN** the floor stays at its starting value, because no whole step has been reached
 
 ### Requirement: Giveback term
 Once the peak reaches a configured arm level, the giveback term SHALL set the floor to the peak minus the larger of an absolute amount and a percentage of the peak.

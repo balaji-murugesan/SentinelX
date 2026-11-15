@@ -34,8 +34,9 @@ Motivation: see proposal.md. Requirements: the eight spec deltas. Owner decision
 | `engine/orders/intent.py` | Pure `classify(order, positions) -> ENTRY \| EXIT`, shared by the service, the gate and the limiter |
 | `engine/risk/decision.py` | `Severity` (ranked), `Decision`, reason-code constants |
 | `engine/risk/limits.py` | `RiskLimits` model, parameter registry (unit, direction), `validate_edit` |
-| `engine/risk/floor.py` | Pure functions: `floor_of(limits, peak)`, `day_pnl(...)` |
-| `engine/risk/mtm.py` | `MtmTracker`: last accepted price per instrument, outlier filter, `MTM_day` |
+| `engine/risk/floor.py` | `FloorParams`, `LockMode` and the pure `floor_of(params, peak)` and `next_floor(previous, params, peak)`. `RiskLimits` (task 4.1) will hand these parameters over, so the floor math has no dependency on the limits model |
+| `engine/risk/pnl.py` | The pure `day_pnl(...)` (cash-flow formula, previous-close basis, net of charges) and `estimate_exit_cost` |
+| `engine/risk/mtm.py` | `MtmTracker`: latest and accepted price per instrument, outlier filter, `MTM_day` and the day's peak |
 | `engine/risk/checks/` | One module per rule, each a `RiskCheck` |
 | `engine/risk/gate.py` | `RiskEngine` (implements `RiskGate`), audit, shadow/enforce |
 | `engine/risk/monitor.py` | The continuous loop: ticks and a 1 s timer |
@@ -119,7 +120,7 @@ The estimated exit cost is `fill_costs(category, closing side, |qty_now|, last_p
 
 ### 8. The floor
 
-`floor_of(limits, peak)` implements PRD §7.1 exactly, as a pure function over `Decimal`. The runtime floor is `max(floor_prev, floor_of(limits, peak))`. The pre-trade headroom check, the breach check and the edit re-simulation all call the same function, so the three can't disagree. Property tests (`hypothesis`) generate MTM paths and assert the floor never decreases and equals `max` of the formula terms.
+`floor_of(params, peak)` implements PRD §7.1 as a pure function over `Decimal`, with two deliberate refinements. The trail term applies only once a whole step of peak is reached (the literal formula is 0 at peak 0 and would put the floor at 0 from the first tick). `FloorParams` refuses settings that would put the floor at or above the peak that armed it (an instant kill), and amounts that would overflow the 28-digit arithmetic. `giveback_pct` is a percent number like every `_pct` limit, strictly between 0 and 100. The runtime floor is `max(floor_prev, floor_of(params, peak))`. The pre-trade headroom check, the breach check and the edit re-simulation all call the same function, so the three can't disagree. Property tests (`hypothesis`) generate MTM paths and assert the floor never decreases and equals `max` of the formula terms.
 
 ### 9. Limits storage and tightening
 
@@ -149,6 +150,8 @@ Seeding: there is no default. A fresh account has no `risk_limits` row and rejec
 ### 10. The monitor
 
 One supervised task. It subscribes to the tick bus as consumer `risk` and also wakes every second. On each wake it updates `MtmTracker`, builds the context, runs the continuous checks (equity floor, feed-down, MTM-blind, square-off, cooldown expiry, day rollover) and acts on the most severe decision. Tick-path work is arithmetic only; persistence is throttled (decision 6). Because the bus drops the oldest tick when the queue is full, the monitor needs only the latest price per instrument, which this suits.
+
+*Known limitation.* The first tick of an instrument is accepted with nothing to compare it with, so a corrupt but positive and finite first tick (say ten times the real price) could raise the peak for good. Ticks that are not finite or not above zero are rejected outright, but this case is not caught by the tracker alone: task 7.1 seeds a baseline for each open position's instrument from its previous close or average price, so such a tick needs a confirming tick like any other jump.
 
 *Liveness.* The monitor stamps a heartbeat each loop. The gate rejects entries with `RISK_STATE_UNAVAILABLE` if the stamp is older than three intervals, so a dead monitor can't leave the account unwatched. `_keep_alive` restarts it, as it does for the snapshot writer. Because that rule multiplies the interval, `RISK_MONITOR_INTERVAL_S` is capped at 5 s (a stalled monitor is noticed within 15 s) and `RISK_PERSIST_INTERVAL_S` at 10 s (at most that much peak movement can be lost on a crash); configuration cannot loosen either.
 
