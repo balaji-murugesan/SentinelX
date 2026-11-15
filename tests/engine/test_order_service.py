@@ -26,7 +26,7 @@ from engine.market_data.bus import TickBus
 from engine.market_data.instruments import InstrumentMaster
 from engine.market_data.provider import Subscriptions, Tick
 from engine.market_data.simulated import SimulatedFeed
-from engine.orders.gate import LIVE_NOT_READY, PaperOnlyGate
+from engine.orders.gate import LIVE_NOT_READY, PaperOnlyGate, RiskGate
 from engine.orders.service import OrderService
 from engine.persistence.repository import PersistenceError
 from engine.positions.book import position_id
@@ -119,6 +119,7 @@ def build(
     exporter: InMemorySpanExporter | None = None,
     now: Callable[[], datetime] = lambda: NOW,
     retry_min_s: float = 0.5,
+    gate: RiskGate | None = None,
 ) -> tuple[OrderService, FakeAdapter, MemoryRepository]:
     adapter = adapter or FakeAdapter()
     repository = repository or MemoryRepository()
@@ -126,7 +127,7 @@ def build(
     if exporter:
         provider.add_span_processor(SimpleSpanProcessor(exporter))
     service = OrderService(
-        account_id="main", paper=mode is TradingMode.PAPER, gate=PaperOnlyGate(mode),
+        account_id="main", paper=mode is TradingMode.PAPER, gate=gate or PaperOnlyGate(mode),
         adapter=adapter, repository=repository, instruments=master(), position_feed=position_feed(),
         tracer=provider.get_tracer("test"), ack_timeout_s=timeout_s, now=now,
         retry_min_s=retry_min_s,

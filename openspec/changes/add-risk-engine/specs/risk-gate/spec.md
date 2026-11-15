@@ -18,7 +18,7 @@ While the engine has no live broker adapter, the gate SHALL reject every order w
 - **THEN** it is accepted or rejected by the risk rules, not by its mode
 
 ### Requirement: Rules are checks with ranked decisions
-Every risk rule SHALL be a check with a pre-trade phase, a continuous phase (on a tick, MTM update, order update or timer), or both. A check SHALL return one decision with a reason code, ranked ALLOW < REJECT < HALT_NEW_ENTRIES < TARGET_HALT < KILL. The gate SHALL act on the most severe decision among all checks. A check that raises SHALL count as REJECT in the pre-trade phase and HALT_NEW_ENTRIES in the continuous phase.
+Every risk rule SHALL be a check with a pre-trade phase, a continuous phase (on a tick, MTM update, order update or timer), or both. A check SHALL return one decision with a reason code, ranked ALLOW < REJECT < HALT_NEW_ENTRIES < TARGET_HALT < KILL. The gate SHALL act on the most severe decision among all checks. A check that raises SHALL count as REJECT when it judges an entry order in the pre-trade phase, and as HALT_NEW_ENTRIES in the continuous phase.
 
 #### Scenario: Most severe wins
 - **WHEN** one check returns REJECT and another returns KILL for the same event
@@ -27,6 +27,13 @@ Every risk rule SHALL be a check with a pre-trade phase, a continuous phase (on 
 #### Scenario: A check crashes before a trade
 - **WHEN** a check raises an exception while judging an entry order
 - **THEN** the order is rejected with a reason code naming that check
+
+### Requirement: A faulty check never blocks an exit
+A check that raises while judging an exit SHALL NOT refuse the exit. The fault SHALL be audited and the exit SHALL go through, because a bug in a rule must never leave the account unable to reduce its risk.
+
+#### Scenario: A check crashes before an exit
+- **WHEN** a check raises an exception while judging an order that only reduces a position
+- **THEN** the order is accepted and an audit record shows the failed check
 
 ### Requirement: Entries and exits are told apart by position effect
 An order SHALL be an exit only if it reduces the absolute quantity of the account's existing position in that instrument and product, up to its size. Any quantity that opens a position or grows one SHALL make the order an entry, including the part of an order that flips through zero. Orders from the engine's own protective logic SHALL be classified the same way.
@@ -47,7 +54,11 @@ Entry limits, cutoffs, caps, cooldowns, halts and the equity-floor pre-trade che
 - **THEN** the order is accepted by the gate
 
 ### Requirement: Fail closed for entries, keep managing exits
-If risk state, limits or persistence are unavailable, or the gate has not yet been connected to trading state, the gate SHALL reject every entry with a reason code naming what is missing. It SHALL keep accepting exits. A continuous check that cannot run SHALL raise the account to at least HALT_NEW_ENTRIES.
+If risk state, limits or persistence are unavailable, or the gate has not yet been connected to trading state, the gate SHALL reject every entry with a reason code naming what is missing. It SHALL keep accepting exits. A gate that is not yet connected to trading state cannot tell entries from exits, so it SHALL reject every order until it is connected. A continuous check that cannot run SHALL raise the account to at least HALT_NEW_ENTRIES.
+
+#### Scenario: Gate not yet connected
+- **WHEN** an order arrives before the gate has been connected to trading state
+- **THEN** the order is rejected with `RISK_STATE_UNAVAILABLE`
 
 #### Scenario: Postgres down
 - **WHEN** risk state cannot be loaded and an entry arrives

@@ -18,6 +18,13 @@ Safety rules in play: the gate is a required constructor argument, so no order s
 command result is stored in the same transaction as the order, so a repeat key returns the
 first answer (rule 5).
 
+Entries are refused while persistence is down or reconciliation is pending, but an *exit* is not
+(add-risk-engine design §4, safety rule 9: keep managing exits): it is accepted, held in memory,
+its create-write queued behind the earlier ones, and sent to the broker. If the engine then
+crashes, the broker holds an order the database never saw; restart reconciliation treats that as
+a difference and halts entries, which is the safe outcome. This is the one place where the
+"persist before send" rule of Stage 2 is relaxed, and only for exits.
+
 After submission the broker reports back on its update stream. ``on_update`` applies fills
 (exactly once each, in order), cancellations and rejections under the same lock;
 ``reconcile_unknown`` resolves ``Unknown`` orders from the broker's order book without ever
@@ -59,6 +66,7 @@ from engine.market_data.clock import ist_date, market_close_utc, utc_now
 from engine.market_data.instruments import InstrumentMaster
 from engine.market_data.provider import SubscriptionLimitError
 from engine.orders.gate import RiskGate
+from engine.orders.intent import Intent, classify
 from engine.orders.machine import InvalidTransition, transition
 from engine.orders.validation import NO_HOLDINGS, Holdings, validate
 from engine.persistence.repository import LoadedState, PersistenceError, TradingRepository
@@ -68,6 +76,8 @@ from engine.positions.feed import PositionFeed
 log = structlog.get_logger()
 
 type Write = Callable[[], Awaitable[None]]  # a deferred database write, replayable later
+# Called with each fill and the position it produced; see ``OrderService.add_fill_listener``.
+type FillListener = Callable[[Fill, Position], Awaitable[None]]
 CANNOT_SAVE = "trading state cannot be saved"
 PROBE_KEY = "persistence-probe"  # a read that proves the database answers again
 RETRY_MIN_S = 0.5  # first wait before retrying failed writes; doubles up to RETRY_MAX_S
@@ -104,6 +114,7 @@ class OrderService:
         self._retry_min_s = retry_min_s
         self._retry_max_s = retry_max_s
         self._pending: deque[Write] = deque()  # writes not yet in the database, oldest first
+        self._fill_listeners: list[FillListener] = []
         self._lock = asyncio.Lock()
         self.orders: dict[str, Order] = {}
         self.positions: dict[PositionId, Position] = {}
@@ -127,21 +138,42 @@ class OrderService:
                 return await self._place(command, span)
 
     async def _place(self, command: PlaceOrder, span: Span) -> CommandResult:
-        try:
-            stored = await self._repo.find_result(command.account_id, command.idempotency_key)
-        except PersistenceError as error:
-            return self._refuse(
-                command.command_id, command.idempotency_key, f"{CANNOT_SAVE}: {error}"
-            )
+        # An exit only reduces a position: it keeps working when the engine is degraded (below).
+        # The command is classified, not an Order: building the Order comes after validation.
+        is_exit = classify(command, self.positions) is Intent.EXIT
+        if is_exit and (not self.persistence_ok or self._pending):
+            # Writes are queued, so the database may not hold this key's result yet even if it is
+            # up again: an exit placed during the outage is only known to this process. Ask the
+            # orders held in memory first (rule 5), and do not spend a database timeout per exit
+            # while the database is known to be away (a kill sends many).
+            if (known := self._known_in_memory(command)) is not None:
+                return known
+            stored = None
+        else:
+            try:
+                stored = await self._repo.find_result(command.account_id, command.idempotency_key)
+            except PersistenceError as error:
+                if not is_exit:
+                    return self._refuse(
+                        command.command_id, command.idempotency_key, f"{CANNOT_SAVE}: {error}"
+                    )
+                # The database has only just failed and cannot say whether this key was seen.
+                # The orders held in memory can, at least for this run; beyond that an exit must
+                # not wait for the database.
+                if (known := self._known_in_memory(command)) is not None:
+                    return known
+                log.warning("exit_idempotency_unchecked", key=command.idempotency_key)
+                stored = None
         if stored is not None:
             return stored  # same key twice: the first answer, nothing else happens (rule 5)
 
-        if not self.persistence_ok:
-            return await self._reject(
-                command, f"{CANNOT_SAVE}: new orders are refused until it recovers"
-            )
-        if not self.reconciled:
-            return await self._reject(command, "state is not reconciled with the broker")
+        if not is_exit:
+            if not self.persistence_ok:
+                return await self._reject(
+                    command, f"{CANNOT_SAVE}: new orders are refused until it recovers"
+                )
+            if not self.reconciled:
+                return await self._reject(command, "state is not reconciled with the broker")
 
         with self._tracer.start_as_current_span("order.validate"):
             reason = validate(
@@ -162,11 +194,11 @@ class OrderService:
             # Final: the order is stored as Rejected and never reaches the broker.
             rejected = transition(order, OrderState.REJECTED, at=self._now(), reason=refusal)
             result = self._result(command, accepted=False, order_id=order.order_id, reason=refusal)
-            return await self._persist_new(rejected, result)
+            return await self._persist_new(rejected, result, queue_if_down=is_exit)
 
         result = self._result(command, accepted=True, order_id=order.order_id)
         with self._tracer.start_as_current_span("order.persist"):
-            created = await self._persist_new(order, result)
+            created = await self._persist_new(order, result, queue_if_down=is_exit)
         if created is not result:  # the write failed: nothing was stored, nothing is sent
             return created
 
@@ -256,18 +288,64 @@ class OrderService:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), timeout=wait)
 
-    async def _persist_new(self, order: Order, result: CommandResult) -> CommandResult:
-        """Create the order and its result in one transaction; on failure refuse the command."""
+    async def _persist_new(
+        self, order: Order, result: CommandResult, *, queue_if_down: bool = False
+    ) -> CommandResult:
+        """Create the order and its result in one transaction; on failure refuse the command.
+
+        ``queue_if_down`` is for exits: when the database is down (or earlier writes are still
+        queued, because this one must not jump ahead of them), keep the order in memory and queue
+        its create-write instead of refusing. The order is then sent, and stored when the
+        database returns."""
+        if queue_if_down and (not self.persistence_ok or self._pending):
+            return self._queue_new(order, result, "the database is down or behind")
         try:
             await self._repo.create_order(order, result)
         except PersistenceError as error:
             self.persistence_ok = False
+            if queue_if_down:
+                return self._queue_new(order, result, str(error))
             log.error("order_not_saved", order_id=order.order_id, error=str(error))
             return self._refuse(
                 result.command_id, result.idempotency_key, f"{CANNOT_SAVE}: {error}"
             )
         self.orders[order.order_id] = order
         return result
+
+    def _queue_new(self, order: Order, result: CommandResult, why: str) -> CommandResult:
+        """Hold an exit in memory with its create-write queued (the first of its writes)."""
+        self.persistence_ok = False
+        self.orders[order.order_id] = order
+        self._pending.append(lambda: self._replay_create(order, result))
+        log.warning("exit_not_stored_yet", order_id=order.order_id, why=why)
+        return result
+
+    async def _replay_create(self, order: Order, result: CommandResult) -> None:
+        """Store a queued exit. The first attempt may have committed and then reported a failure
+        (a timeout after COMMIT), so a failed insert is not final: if the result for this key is
+        in the database the order is stored, and the queue moves on instead of failing on the
+        duplicate key at its head for ever."""
+        try:
+            await self._repo.create_order(order, result)
+        except PersistenceError:
+            stored = await self._repo.find_result(order.account_id, result.idempotency_key)
+            if stored is None or stored.order_id != order.order_id:
+                # Not stored (or the key belongs to another order): the failure stands, the queue
+                # keeps this write at its head and retries, and entries stay refused meanwhile.
+                raise
+
+    def _known_in_memory(self, command: PlaceOrder) -> CommandResult | None:
+        """The answer for a repeat of ``command`` while the database cannot be asked: the order
+        this run already created for its key, as an accepted result. None if there is none."""
+        for held in self.orders.values():
+            if held.idempotency_key == command.idempotency_key:
+                return self._result(
+                    command,
+                    accepted=held.state is not OrderState.REJECTED,
+                    order_id=held.order_id,
+                    reason=held.reason if held.state is OrderState.REJECTED else None,
+                )
+        return None
 
     async def _reject(self, command: PlaceOrder | CancelOrder, reason: str) -> CommandResult:
         """Answer a command that created no order, and remember the answer for repeats."""
@@ -398,6 +476,24 @@ class OrderService:
             await self._position_feed.update(position)
         except SubscriptionLimitError as error:
             log.error("position_not_subscribed", key=str(order.key), error=str(error))
+        for listener in self._fill_listeners:
+            try:
+                await listener(fill, position)
+            except Exception:
+                # A listener is a client of the fill, never part of applying it: the fill and
+                # the position are already stored, so a failing listener cannot undo them.
+                log.error("fill_listener_failed", fill_id=fill.fill_id, exc_info=True)
+
+    def add_fill_listener(self, listener: FillListener) -> None:
+        """Call ``listener(fill, position)`` after every applied fill, in registration order.
+
+        The listener runs *inside* the service lock, right after the fill and the position it
+        produced are in memory and queued for storage. So it sees a consistent book, and it
+        must not call ``place`` or ``cancel`` itself: those take the same (non-reentrant)
+        ``asyncio.Lock`` and would wait on it forever, like re-entering a C# ``SemaphoreSlim(1)``.
+        A listener that has orders to send puts the work on a queue and returns.
+        """
+        self._fill_listeners.append(listener)
 
     # ---- restart recovery (task 8.1; ``engine.orders.recovery`` drives these) -----------------
 
