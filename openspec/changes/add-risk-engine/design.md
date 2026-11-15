@@ -139,9 +139,11 @@ The estimated exit cost is `fill_costs(category, closing side, |qty_now|, last_p
 | `giveback_pct` | PCT | down |
 | `exit_buffer_pct` | PCT | up (more aggressive exits) |
 | `max_chase_steps` | COUNT | up |
-| `lock_mode` | ENUM | `enum_order` OFF < LOCK < LOCK_AND_TRAIL; TRAIL is guarded by the floor re-simulation |
-| each optional floor term (on or off) | BOOL | `enable_only` |
+| `lock_mode` | ENUM | `enum_order` OFF < LOCK < LOCK_AND_TRAIL. TRAIL counts its steps from a different start than LOCK_AND_TRAIL, so the ranking cannot place it: only OFF → TRAIL tightens, and every other move involving TRAIL waits for the close (stricter than the floor re-simulation alone, which only looks at today's peak) |
+| each optional floor term (on or off) | BOOL | `enable_only`, except a *leg* of the giveback term (`giveback_abs`, `giveback_pct`): the giveback is the larger of its legs, so adding a leg to a term that is already on loosens, and dropping one tightens |
 | each rule's `mode` | ENUM | shadow → enforce only |
+
+*Why the floor re-simulation is not enough on its own:* it replays only today's peak, so an edit that lowers the floor at a higher peak than today's passes it. The directions above therefore have to be right at **every** peak, and a `hypothesis` property test checks that: for random pairs of floor settings, an edit that `loosened_keys` calls a tightening never gives a lower floor at any peak.
 
 The table is a proposal for the owner to review: a wrong direction here is a hole in the tighten-only rule. `TIME_OF_DAY` is a new unit beyond PRD §7.2's list, so §7.2 is updated in the docs task.
 

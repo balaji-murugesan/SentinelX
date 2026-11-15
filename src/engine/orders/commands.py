@@ -59,13 +59,16 @@ class CommandConsumer:
         *,
         account_id: str,
         resume: Callable[[ResumeRecovery], Awaitable[CommandResult]] | None = None,
+        set_limits: Callable[[SetRiskLimits], Awaitable[CommandResult]] | None = None,
     ) -> None:
         self._redis = redis
         self._service = service
         self._account_id = account_id
         # Injected (like a C# Func<,> passed to the constructor) so this module does not depend
-        # on engine.orders.recovery; engine.main wires it. None = resume is not available.
+        # on engine.orders.recovery or engine.risk; engine.main wires them. None = that command
+        # is not available.
         self._resume = resume
+        self._set_limits = set_limits
 
     async def run(
         self, stop: asyncio.Event, *, block_ms: int = 500, retry_seconds: float = 1.0
@@ -168,9 +171,11 @@ class CommandConsumer:
                         decided_at=datetime.now(UTC),
                     )
                 return await self._resume(command)
+            case SetRiskLimits() if self._set_limits is not None:
+                return await self._set_limits(command)
             case KillSwitch() | SetRiskLimits() | SizeOrder():
-                # These three parse already but have no handler until the risk engine is wired
-                # (add-risk-engine groups 4, 6 and 10), which replaces this arm one command at a
+                # These parse already but have no handler until the risk engine is wired
+                # (add-risk-engine groups 6, 10 and 11), which replaces this arm one command at a
                 # time. Answer them: a command nobody handles must not crash this loop, and the
                 # reply fails closed. They are listed, not caught by a default arm (``case _``,
                 # like ``_ =>`` in a C# switch expression), so that mypy flags a missing arm when
