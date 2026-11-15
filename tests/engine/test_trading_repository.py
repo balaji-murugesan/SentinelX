@@ -35,7 +35,10 @@ from tests.engine.trading_fakes import MemoryRepository
 
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 IN_CI = os.environ.get("CI") == "true"
-TABLES = ("order_events", "fills", "positions", "command_results", "recovery_state", "orders")
+TABLES = (
+    "order_events", "fills", "positions", "command_results", "recovery_state",
+    "risk_event", "risk_day_state", "risk_limits", "orders",
+)  # fmt: skip
 
 NOW = datetime(2026, 10, 29, 4, 0, tzinfo=UTC)
 OPTION = InstrumentKey.parse("NSE_FNO:53720")
@@ -191,6 +194,45 @@ async def test_other_accounts_are_not_loaded(repo: TradingRepository) -> None:
         order(account_id="other"), result("k-o1").model_copy(update={"account_id": "other"})
     )
     assert (await repo.load("main")).open_orders == []
+
+
+# ---- stop prices on orders (add-risk-engine task 2.2) -------------------------------------
+
+
+async def test_orders_with_an_initial_stop_and_a_stop_market_round_trip(
+    repo: TradingRepository,
+) -> None:
+    entry = order(initial_stop=Decimal("180.00"))
+    stop = order(
+        "o2", side=OrderSide.SELL, order_type=OrderType.STOP_MARKET, limit_price=None,
+        trigger_price=Decimal("160.00"), source="risk-stop", idempotency_key="k-o2",
+        created_at=NOW + timedelta(seconds=1), updated_at=NOW + timedelta(seconds=1),
+    )  # fmt: skip
+    await repo.create_order(entry, result("k-o1"))
+    await repo.create_order(stop, result("k-o2", order_id="o2"))
+
+    stored = {o.order_id: o for o in (await repo.load("main")).open_orders}
+
+    assert stored == {"o1": entry, "o2": stop}
+    assert stored["o1"].initial_stop == Decimal("180.00") and stored["o1"].trigger_price is None
+    assert stored["o2"].trigger_price == Decimal("160.00") and stored["o2"].initial_stop is None
+
+
+async def test_the_stop_prices_survive_an_order_update(repo: TradingRepository) -> None:
+    await repo.create_order(order(initial_stop=Decimal("180.00")), result("k-o1"))
+
+    opened = order(initial_stop=Decimal("180.00"), state=OrderState.OPEN, broker_order_id="p-1")
+    await repo.update_order(opened)
+
+    assert (await repo.load("main")).open_orders == [opened]
+
+
+async def test_an_order_without_stop_prices_still_stores_nulls(repo: TradingRepository) -> None:
+    await repo.create_order(order(), result("k-o1"))
+
+    [stored] = (await repo.load("main")).open_orders
+
+    assert stored.initial_stop is None and stored.trigger_price is None
 
 
 # ---- recovery halt (task 8.2) -------------------------------------------------------------

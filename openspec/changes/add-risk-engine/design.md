@@ -42,7 +42,8 @@ Motivation: see proposal.md. Requirements: the eight spec deltas. Owner decision
 | `engine/risk/kill.py` | `KillSwitch`, the `Flattener` Protocol and its simple S3 implementation |
 | `engine/risk/stops.py` | `CatastrophicStops` |
 | `engine/risk/ratelimit.py` | `RateLimitedAdapter`, a `BrokerAdapter` wrapper |
-| `engine/risk/repository.py` | `RiskRepository` Protocol, `MemoryRiskRepository`, Postgres implementation |
+| `engine/risk/state.py` | `DayState` and the pure `merge_day_state` (the one-way rule for persisted day state) |
+| `engine/risk/repository.py` | `RiskRepository` Protocol and its records (`StoredLimits`, `RiskEvent`). As for the order repository, the Postgres implementation is `engine/persistence/postgres_risk.py` and the in-memory fake is `tests/engine/risk_fakes.py`, so production can never fall back to in-memory storage |
 
 `engine.risk` imports `engine.orders` and `engine.broker`; the reverse never happens, except through the existing `RiskGate` Protocol and two small hooks (decision 4). `contracts` stays free of internal imports (import-linter, unchanged).
 
