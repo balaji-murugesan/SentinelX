@@ -32,10 +32,14 @@ from contracts.commands import (
     COMMAND_GROUP,
     COMMAND_STREAM,
     REPLY_TTL_SECONDS,
+    AnyCommand,
     CancelOrder,
     CommandResult,
+    KillSwitch,
     PlaceOrder,
     ResumeRecovery,
+    SetRiskLimits,
+    SizeOrder,
     parse_command,
     reply_stream,
 )
@@ -146,7 +150,7 @@ class CommandConsumer:
         await self._reply(command.command_id, result)
         await self._ack(message_id)
 
-    async def _process(self, command: PlaceOrder | CancelOrder | ResumeRecovery) -> CommandResult:
+    async def _process(self, command: AnyCommand) -> CommandResult:
         # match/case on the type is like a C# switch expression with type patterns.
         match command:
             case PlaceOrder():
@@ -164,6 +168,21 @@ class CommandConsumer:
                         decided_at=datetime.now(UTC),
                     )
                 return await self._resume(command)
+            case KillSwitch() | SetRiskLimits() | SizeOrder():
+                # These three parse already but have no handler until the risk engine is wired
+                # (add-risk-engine groups 4, 6 and 10), which replaces this arm one command at a
+                # time. Answer them: a command nobody handles must not crash this loop, and the
+                # reply fails closed. They are listed, not caught by a default arm (``case _``,
+                # like ``_ =>`` in a C# switch expression), so that mypy flags a missing arm when
+                # a command is added to ``AnyCommand``. ``A | B`` here is an or-pattern.
+                return CommandResult(
+                    command_id=command.command_id,
+                    idempotency_key=command.idempotency_key,
+                    account_id=command.account_id,
+                    accepted=False,
+                    reason=f"{command.command} is not supported by this engine version",
+                    decided_at=datetime.now(UTC),
+                )
 
     async def _reply(self, command_id: str, result: CommandResult) -> None:
         key = reply_stream(command_id)

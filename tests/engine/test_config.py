@@ -214,3 +214,68 @@ def test_order_setting_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_order_setting_bounds(monkeypatch: pytest.MonkeyPatch, name: str, value: str) -> None:
     dhan_env(monkeypatch, **{name: value})
     assert name in error_text()
+
+
+# ---- risk engine (add-risk-engine task 1.3) -------------------------------------------------
+
+
+def test_risk_setting_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    dhan_env(monkeypatch)
+    settings = load_settings(EngineSettings)
+    assert settings.order_rate_per_s == 3
+    assert settings.order_rate_per_min == 120
+    assert settings.order_rate_exit_share == 0.4
+    assert settings.risk_persist_interval_s == 1
+    assert settings.risk_monitor_interval_s == 1
+
+
+def test_rates_at_their_ceilings_are_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    dhan_env(monkeypatch, ORDER_RATE_PER_S="5", ORDER_RATE_PER_MIN="200")
+    settings = load_settings(EngineSettings)
+    assert (settings.order_rate_per_s, settings.order_rate_per_min) == (5, 200)
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "ceiling"),
+    [
+        ("ORDER_RATE_PER_S", "6", "5"),
+        ("ORDER_RATE_PER_S", "10", "5"),  # SEBI's own threshold is far above the ceiling
+        ("ORDER_RATE_PER_MIN", "201", "200"),
+        ("ORDER_RATE_PER_MIN", "250", "200"),  # Dhan's published limit is above the ceiling
+    ],
+)
+def test_cap_above_the_ceiling_refuses_to_start(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str, ceiling: str
+) -> None:
+    """Scenario "Cap above the ceiling": the message names the setting and its ceiling."""
+    dhan_env(monkeypatch, **{name: value})
+    assert f"{name}: Input should be less than or equal to {ceiling}" in error_text()
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("ORDER_RATE_PER_S", "0"),
+        ("ORDER_RATE_PER_MIN", "0"),
+        ("ORDER_RATE_EXIT_SHARE", "0"),
+        ("ORDER_RATE_EXIT_SHARE", "1"),
+        ("ORDER_RATE_EXIT_SHARE", "-0.1"),
+        ("RISK_PERSIST_INTERVAL_S", "0"),
+        ("RISK_PERSIST_INTERVAL_S", "10.5"),
+        ("RISK_PERSIST_INTERVAL_S", "60"),
+        ("RISK_MONITOR_INTERVAL_S", "0"),
+        ("RISK_MONITOR_INTERVAL_S", "5.5"),
+        ("RISK_MONITOR_INTERVAL_S", "60"),
+    ],
+)
+def test_risk_setting_bounds(monkeypatch: pytest.MonkeyPatch, name: str, value: str) -> None:
+    dhan_env(monkeypatch, **{name: value})
+    assert name in error_text()
+
+
+def test_risk_intervals_at_their_caps_are_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The monitor cap (5 s) and persist cap (10 s) keep the gate's three-interval liveness
+    rule and the crash-loss window short; both caps themselves are valid values."""
+    dhan_env(monkeypatch, RISK_MONITOR_INTERVAL_S="5", RISK_PERSIST_INTERVAL_S="10")
+    settings = load_settings(EngineSettings)
+    assert (settings.risk_monitor_interval_s, settings.risk_persist_interval_s) == (5, 10)

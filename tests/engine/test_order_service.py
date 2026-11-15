@@ -268,3 +268,30 @@ async def test_cnc_sell_is_limited_to_held_minus_open_sells() -> None:
     )
     assert not sell_five.accepted  # only 4 left once the open 6-unit sell is counted
     assert len(adapter.placed) == 1
+
+
+# ---- add-risk-engine task 1.1: the new order fields reach the order --------------------------
+
+
+async def test_the_initial_stop_is_carried_onto_the_order() -> None:
+    service, _, repo = build()
+    entry = command("k-stop", limit="200.00").model_copy(update={"initial_stop": Decimal("190.00")})
+
+    result = await service.place(entry)
+
+    assert result.accepted
+    assert repo.orders[result.order_id or ""].initial_stop == Decimal("190.00")
+
+
+async def test_a_stop_market_command_is_refused_and_never_reaches_the_broker() -> None:
+    service, adapter, repo = build()
+    stop = PlaceOrder(
+        command_id="c-stop", idempotency_key="k-stop", account_id="main", source="cli",
+        sent_at=NOW, key=OPTION, side=OrderSide.SELL, quantity=65, product=ProductType.INTRADAY,
+        order_type=OrderType.STOP_MARKET, trigger_price=Decimal("160.00"),
+    )  # fmt: skip
+
+    result = await service.place(stop)
+
+    assert not result.accepted and "not supported yet" in (result.reason or "")
+    assert adapter.placed == [] and repo.orders == {}

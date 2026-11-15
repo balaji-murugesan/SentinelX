@@ -315,6 +315,7 @@ class OrderService:
             product=command.product,
             order_type=command.order_type,
             limit_price=command.limit_price,
+            initial_stop=command.initial_stop,
             idempotency_key=command.idempotency_key,
             source=command.source,
             paper=self._paper,

@@ -219,3 +219,12 @@ def test_transition_carries_changes_and_revalidates() -> None:
     assert opened.broker_order_id == "paper-1"
     with pytest.raises(ValueError):
         transition(order(state=S.OPEN), S.FILLED, at=NOW, filled_quantity=-1)
+
+
+# ---- add-risk-engine task 1.1: stop-market orders are refused until the broker can rest them --
+
+
+def test_stop_market_is_refused_until_the_paper_broker_can_rest_it() -> None:
+    stop = command(order_type=OrderType.STOP_MARKET, trigger_price=Decimal("160.00"))
+    reason = check(stop)
+    assert reason is not None and "stop-market" in reason and "not supported yet" in reason

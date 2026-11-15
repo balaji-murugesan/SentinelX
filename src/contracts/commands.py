@@ -44,10 +44,15 @@ class PlaceOrder(_CommandBase):
     product: ProductType
     order_type: OrderType
     limit_price: Decimal | None = Field(default=None, gt=0)
+    # Optional with defaults, so a command sent before add-risk-engine still parses.
+    # ``Field(default=None, gt=0)`` is a declarative guard, like a C# ``[Range]`` attribute: it is
+    # checked when the command is built, and None (absent) skips the check.
+    trigger_price: Decimal | None = Field(default=None, gt=0)  # STOP_MARKET only
+    initial_stop: Decimal | None = Field(default=None, gt=0)  # entries: where the trade is wrong
 
     @model_validator(mode="after")
     def _limit_price_matches_type(self) -> Self:
-        check_limit_price(self.order_type, self.limit_price)
+        check_limit_price(self.order_type, self.limit_price, self.trigger_price)
         return self
 
 
@@ -62,12 +67,49 @@ class ResumeRecovery(_CommandBase):
     command: Literal["resume_recovery"] = "resume_recovery"
 
 
+class KillSwitch(_CommandBase):
+    """Stop trading for the day: cancel pending entries and flatten every position. It carries
+    nothing else: ``source`` says who asked, and a kill is idempotent per account and day."""
+
+    command: Literal["kill_switch"] = "kill_switch"
+
+
+# A limit value is text, a whole number, a flag, or None ("not configured"). ``A | B`` is a
+# union type: the value must be one of them (closest C# analogue: ``OneOf<string, int, bool>``).
+# There is deliberately no float member: money and percentages travel as strings ("1000.00")
+# and become ``Decimal`` in the engine, so a rounding error can never enter a risk limit. A
+# JSON number with a fraction would be a float, and is refused here.
+LimitValue = str | int | bool | None
+
+
+class SetRiskLimits(_CommandBase):
+    """Replace the account's risk limits. The engine validates the keys, the values and the
+    tighten-only rule; this model only fixes the shape. Flat keys, e.g. ``per_trade_max_risk``
+    or ``mode.per_trade_risk``."""
+
+    command: Literal["set_risk_limits"] = "set_risk_limits"
+    limits: dict[str, LimitValue]
+
+
+class SizeOrder(_CommandBase):
+    """Ask how many units an entry may be for the per-trade risk limit. Changes no state."""
+
+    command: Literal["size_order"] = "size_order"
+    key: InstrumentKey
+    side: OrderSide
+    entry_price: Decimal = Field(gt=0)
+    initial_stop: Decimal = Field(gt=0)
+
+
+# Every command the engine can receive: a union type, like a C# base type with these subclasses.
+# Code that handles it with ``match`` is checked by mypy to cover every member.
+AnyCommand = PlaceOrder | CancelOrder | ResumeRecovery | KillSwitch | SetRiskLimits | SizeOrder
 # Annotated[..., Field(discriminator=...)] tells pydantic to choose the class by `command`.
-Command = Annotated[PlaceOrder | CancelOrder | ResumeRecovery, Field(discriminator="command")]
+Command = Annotated[AnyCommand, Field(discriminator="command")]
 _COMMAND = TypeAdapter(Command)
 
 
-def parse_command(raw: str | bytes) -> PlaceOrder | CancelOrder | ResumeRecovery:
+def parse_command(raw: str | bytes) -> AnyCommand:
     """Parse one stream entry. Raises pydantic.ValidationError for anything malformed."""
     return _COMMAND.validate_json(raw)
 
@@ -84,4 +126,7 @@ class CommandResult(BaseModel):
     accepted: bool
     order_id: str | None = None
     reason: str | None = None  # why it was rejected; None when accepted
+    # Set only on the answer to a SizeOrder command (optional, so older replies still parse).
+    sized_quantity: int | None = None  # units, a whole number of lots
+    risk_amount: Decimal | None = None  # rupees at risk for that quantity
     decided_at: AwareDatetime
