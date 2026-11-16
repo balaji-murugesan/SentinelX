@@ -54,6 +54,8 @@ from opentelemetry.trace import Span, Tracer
 from contracts.commands import CancelOrder, CommandResult, PlaceOrder
 from contracts.orders import Fill, Order, OrderSide, OrderState, Position, ProductType
 from engine.broker.adapter import (
+    Admitting,
+    BrokerAck,
     BrokerAdapter,
     BrokerError,
     BrokerRejected,
@@ -208,12 +210,16 @@ class OrderService:
     async def _submit(self, order: Order, span: Span) -> None:
         """Requested -> Submitted -> Open / Rejected / Unknown. Never resends (rule 4)."""
         order = await self._advance(order, OrderState.SUBMITTED)
-        started = time.perf_counter()
         try:
             with self._tracer.start_as_current_span("broker.place") as broker_span:
+                # Wait for a turn from the rate limiter first (if there is one): an exit may
+                # wait up to a minute for a token, and that is not a broker that did not answer.
+                # An entry with no token is refused here, as ``BrokerRejected``.
+                send = await self._admit_place(order)
+                started = time.perf_counter()
                 try:
                     async with asyncio.timeout(self._ack_timeout_s):
-                        ack = await self._adapter.place(order)
+                        ack = await send(order)
                 finally:
                     latency_ms = (time.perf_counter() - started) * 1000
                     broker_span.set_attribute("broker.latency_ms", latency_ms)
@@ -228,6 +234,15 @@ class OrderService:
             )
         else:
             await self._advance(order, OrderState.OPEN, broker_order_id=ack.broker_order_id)
+
+    async def _admit_place(self, order: Order) -> Callable[[Order], Awaitable[BrokerAck]]:
+        """Take the rate limiter's turn for ``order`` (if the adapter has one) and return the call
+        that sends it."""
+        adapter = self._adapter
+        if isinstance(adapter, Admitting):
+            await adapter.admit_place(order)
+            return adapter.send_place
+        return adapter.place
 
     async def _advance(
         self, order: Order, target: OrderState, reason: str | None = None, **changes: str
@@ -617,8 +632,14 @@ class OrderService:
         return expired
 
     async def _broker_cancel(self, order: Order) -> None:
+        adapter = self._adapter
+        if isinstance(adapter, Admitting):
+            await adapter.admit_cancel(order)  # may wait for a token: before the timeout starts
+            send = adapter.send_cancel
+        else:
+            send = adapter.cancel
         async with asyncio.timeout(self._ack_timeout_s):
-            await self._adapter.cancel(order)
+            await send(order)
 
     def _holdings(self, command: PlaceOrder) -> Holdings:
         """What a CNC (delivery) sell may draw on; other orders need no holdings."""

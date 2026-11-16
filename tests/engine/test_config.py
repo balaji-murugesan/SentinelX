@@ -256,7 +256,12 @@ def test_cap_above_the_ceiling_refuses_to_start(
     ("name", "value"),
     [
         ("ORDER_RATE_PER_S", "0"),
+        (
+            "ORDER_RATE_PER_S",
+            "1",
+        ),  # one token cannot be both reserved for exits and left for entries
         ("ORDER_RATE_PER_MIN", "0"),
+        ("ORDER_RATE_PER_MIN", "1"),
         ("ORDER_RATE_EXIT_SHARE", "0"),
         ("ORDER_RATE_EXIT_SHARE", "1"),
         ("ORDER_RATE_EXIT_SHARE", "-0.1"),

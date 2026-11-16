@@ -13,7 +13,7 @@ from contracts.mode import TradingMode
 from contracts.settings import ModeSettings
 from engine.broker.dhan import endpoints
 from engine.healthcheck import DEFAULT_HEARTBEAT_PATH
-from engine.risk.ratelimit import ORDERS_PER_MIN_CEILING, ORDERS_PER_S_CEILING
+from engine.risk.ceilings import ORDERS_PER_MIN_CEILING, ORDERS_PER_S_CEILING
 from observability.masking import mask_account
 
 
@@ -118,9 +118,10 @@ class EngineSettings(ModeSettings):
     # Only infrastructure settings live here. The risk LIMITS (per-trade risk, the equity floor,
     # cutoffs...) have no defaults and live in Postgres, set through `cli risk set-limits`.
     # Broker order calls allowed per second and per minute. `le=` is the hard ceiling in code
-    # (engine.risk.ratelimit): a larger value refuses to start, whatever the environment says.
-    order_rate_per_s: int = Field(default=3, ge=1, le=ORDERS_PER_S_CEILING)
-    order_rate_per_min: int = Field(default=120, ge=1, le=ORDERS_PER_MIN_CEILING)
+    # (engine.risk.ceilings): a larger value refuses to start, whatever the environment says.
+    # (At least 2 each: one token cannot be both reserved for exits and left for entries.)
+    order_rate_per_s: int = Field(default=3, ge=2, le=ORDERS_PER_S_CEILING)
+    order_rate_per_min: int = Field(default=120, ge=2, le=ORDERS_PER_MIN_CEILING)
     # Share of each window's tokens kept back for exits and cancels, so entries can never starve
     # them. Entries get the rest.
     order_rate_exit_share: float = Field(default=0.4, gt=0, lt=1)

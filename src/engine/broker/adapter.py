@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from contracts.orders import CostBreakdown, Order, OrderState
 
@@ -85,3 +85,22 @@ class BrokerAdapter(Protocol):
     def updates(self) -> AsyncIterator[BrokerUpdate]:
         """Fills, cancellations and rejections, in the order the broker reports them."""
         ...
+
+
+@runtime_checkable
+class Admitting(Protocol):
+    """Optional: an adapter that makes order calls wait for a turn before they may be sent (the
+    rate limiter, ``engine.risk.ratelimit``). ``place`` and ``cancel`` still do both steps, so any
+    caller may ignore this. The order service uses the steps separately so that the time spent
+    waiting for a turn does not count against the broker's acknowledgement timeout (an exit may
+    legitimately wait up to a minute for a token, and must not become ``Unknown`` for it).
+    ``admit_*`` takes the turn (an entry that has none is refused at once with ``BrokerRejected``);
+    ``send_*`` is the call to the broker and takes no turn."""
+
+    async def admit_place(self, order: Order) -> None: ...
+
+    async def admit_cancel(self, order: Order) -> None: ...
+
+    async def send_place(self, order: Order) -> BrokerAck: ...
+
+    async def send_cancel(self, order: Order) -> None: ...
