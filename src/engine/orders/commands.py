@@ -60,6 +60,7 @@ class CommandConsumer:
         account_id: str,
         resume: Callable[[ResumeRecovery], Awaitable[CommandResult]] | None = None,
         set_limits: Callable[[SetRiskLimits], Awaitable[CommandResult]] | None = None,
+        size: Callable[[SizeOrder], Awaitable[CommandResult]] | None = None,
     ) -> None:
         self._redis = redis
         self._service = service
@@ -69,6 +70,7 @@ class CommandConsumer:
         # is not available.
         self._resume = resume
         self._set_limits = set_limits
+        self._size = size
 
     async def run(
         self, stop: asyncio.Event, *, block_ms: int = 500, retry_seconds: float = 1.0
@@ -173,6 +175,8 @@ class CommandConsumer:
                 return await self._resume(command)
             case SetRiskLimits() if self._set_limits is not None:
                 return await self._set_limits(command)
+            case SizeOrder() if self._size is not None:
+                return await self._size(command)
             case KillSwitch() | SetRiskLimits() | SizeOrder():
                 # These parse already but have no handler until the risk engine is wired
                 # (add-risk-engine groups 6, 10 and 11), which replaces this arm one command at a

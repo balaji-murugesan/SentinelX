@@ -100,6 +100,8 @@ One row per `(account_id, trade_date)` in `risk_day_state`, with `trade_date = I
 | `loss_streak` | plain set under the service lock (it legitimately resets on a win) |
 | `close_marks` | set once at the close: last price per open position, used as the next day's reference |
 
+*Streak and cooldown semantics* (the spec leaves these open, so this is the stricter reading, for the owner to confirm): a closed trade is a position that returned to flat, judged on its **whole round trip net of charges**, whichever day each leg was on (a flip is not a closed trade, because the position never returns to flat). Only a **win** resets the streak; a trade with exactly zero net neither extends nor resets it. There is no automatic reset when a cooldown ends: the streak stays at the limit, so the next single loss starts another cooldown. After a restart the open trades' running totals are rebuilt by replaying the **whole fill history** from flat with the same `apply` that builds the positions, so a restart in the middle of a trade cannot turn a loss into a win (or the reverse) and skip the cooldown.
+
 The in-memory copy is authoritative while the engine runs. It is persisted at most every `RISK_PERSIST_INTERVAL_S` and always before acting on HALT or worse. On restart: `peak` and `floor` resume as `max(stored, recomputed)`; counters and halt level come from the row.
 
 ### 7. `MTM_day` from fills, net of charges, previous-close basis

@@ -108,6 +108,11 @@ class RiskState(Protocol):
         unprotected position), or None."""
         ...
 
+    async def entry_allowed(self) -> str | None:
+        """Count one allowed entry and persist the count before the entry is sent. None on
+        success; otherwise why it could not be saved, and the entry is refused."""
+        ...
+
 
 class RiskEngine:
     def __init__(
@@ -119,7 +124,7 @@ class RiskEngine:
         state: RiskState,
         audit: RiskAudit,
         instruments: Callable[[InstrumentKey], Instrument | None],
-        checks: Sequence[PreTradeCheck] = (),
+        checks: Sequence[PreTradeCheck],  # required: a gate with no rules would allow everything
         now: Callable[[], datetime] = utc_now,
     ) -> None:
         self._account_id = account_id
@@ -154,6 +159,11 @@ class RiskEngine:
                     reason = self._judge_exit(order, now, results, extra)
                 else:
                     reason = self._judge_entry(order, now, results, extra)
+                    if reason is None and (saved := await self._state.entry_allowed()) is not None:
+                        # Every rule allowed it, but the day's entry count could not be written
+                        # first: refuse (fail closed), because an uncounted entry could breach
+                        # the daily maximum after a restart.
+                        reason = f"{STATE_UNAVAILABLE}: {saved}"
         except Exception as error:
             # Nothing above should raise (the checks are guarded), but if it does: an entry
             # fails closed and an exit goes through, exactly as the spec's rule for unavailable

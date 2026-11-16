@@ -134,6 +134,9 @@ def context(
     age_s: float = 1,
     now: datetime = NOW,
     extra_instruments: Iterable[Instrument] = (),
+    feed_silent_for: timedelta | None = None,
+    feed_subscribed: bool = False,
+    unpriced_for: Mapping[InstrumentKey, timedelta] | None = None,
 ) -> RiskContext:
     """A context with sane defaults: limits set, no positions, a fresh price of 100 for each
     instrument in ``prices`` (``age_s`` seconds old)."""
@@ -149,4 +152,7 @@ def context(
         orders={o.order_id: o for o in orders},
         instruments=known.get,
         quote=quotes.get,
+        feed_silent_for=feed_silent_for,
+        feed_subscribed=feed_subscribed,
+        unpriced_for=unpriced_for or {},
     )

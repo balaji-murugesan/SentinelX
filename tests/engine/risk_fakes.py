@@ -66,6 +66,8 @@ class StubState:
         self.unavailable_reason = unavailable
         self.halt = entry_halt
         self.quotes = dict(quotes or {})
+        self.entries_counted = 0  # how many times the gate asked to count an allowed entry
+        self.count_fails: str | None = None  # a reason: make the count fail like a database error
 
     def unavailable(self, now: datetime) -> str | None:
         return self.unavailable_reason
@@ -81,6 +83,12 @@ class StubState:
 
     def entry_halt(self) -> Decision | None:
         return self.halt
+
+    async def entry_allowed(self) -> str | None:
+        if self.count_fails is not None:
+            return self.count_fails
+        self.entries_counted += 1
+        return None
 
 
 class StubTrading:

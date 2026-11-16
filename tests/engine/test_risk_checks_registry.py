@@ -1,0 +1,28 @@
+"""The registered pre-trade rules (add-risk-engine group 6): each is named in the limits' rule
+table, exactly one applies to exits, and the order is the tie-break."""
+
+from engine.risk.checks.registry import default_checks
+from engine.risk.limits import RULES
+
+
+def test_every_registered_rule_is_a_rule_the_limits_know_by_name() -> None:
+    names = [check.name for check in default_checks()]
+
+    assert len(names) == len(set(names))  # one check per name
+    assert set(names) <= set(RULES)  # so each has a mode and a shadow rule
+
+
+def test_every_rule_in_the_limits_table_is_registered() -> None:
+    assert {check.name for check in default_checks()} == set(RULES)
+
+
+def test_only_price_sanity_judges_exits() -> None:
+    assert [c.name for c in default_checks() if c.applies_to_exits] == ["price_sanity"]
+
+
+def test_the_most_basic_problems_are_named_first() -> None:
+    names = [check.name for check in default_checks()]
+
+    assert names.index("initial_stop") < names.index("per_trade_risk")
+    assert names.index("stale_data") < names.index("price_sanity")
+    assert names[-1] == "equity_floor"

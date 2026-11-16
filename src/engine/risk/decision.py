@@ -129,6 +129,12 @@ class RiskContext:
     reference is missing): a rule must treat that as "unknown", never as zero. ``instruments`` and
     ``quote`` are lookups (a C# ``Func<,>``): the instrument master's facts (lot size, tick size)
     and the latest price with its age.
+
+    The last three fields feed the stale-data checks and have defaults, so a context built
+    without them (a pre-trade rule's test) is simply one with a healthy feed: ``feed_silent_for``
+    is the time since *any* tick arrived (None: not known), ``feed_subscribed`` says something is
+    subscribed, and ``unpriced_for`` is, for each held instrument that has never been priced, how
+    long the engine has been waiting for its first tick.
     """
 
     account_id: str
@@ -140,6 +146,9 @@ class RiskContext:
     orders: Mapping[str, Order]
     instruments: Callable[[InstrumentKey], Instrument | None]
     quote: Callable[[InstrumentKey], Quote | None]
+    feed_silent_for: timedelta | None = None
+    feed_subscribed: bool = False
+    unpriced_for: Mapping[InstrumentKey, timedelta] = field(default_factory=dict)
 
 
 class PreTradeCheck(Protocol):

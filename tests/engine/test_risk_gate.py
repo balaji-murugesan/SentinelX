@@ -437,6 +437,18 @@ async def test_a_gate_that_fails_internally_refuses_an_entry_and_lets_an_exit_th
     assert h.verdict().inputs["gate_error"] == "RuntimeError"  # and the audit says why
 
 
+def test_a_gate_cannot_be_built_without_its_rules() -> None:
+    """A gate with no rules would allow every entry, so ``checks`` has no default."""
+    import pytest
+
+    h = Harness()
+    with pytest.raises(TypeError, match="checks"):
+        RiskEngine(  # type: ignore[call-arg]
+            account_id="main", mode=TradingMode.PAPER, limits=h.limits, state=h.state,
+            audit=h.audit, instruments=instrument_of, now=lambda: NOW,
+        )  # fmt: skip
+
+
 async def test_an_unbound_gate_says_it_is_not_connected() -> None:
     h = await harness(bind=False)
 
@@ -494,3 +506,35 @@ async def test_a_standing_halt_is_audited_with_its_own_severity() -> None:
     )
     assert h.verdict().decision == "HALT_NEW_ENTRIES"
     assert h.verdict().inputs["decided_by"] == "standing_halt"
+
+
+# ---- counting the allowed entry (task 6.4) ---------------------------------------------------
+
+
+async def test_an_allowed_entry_is_counted_once_and_a_refused_one_or_an_exit_is_not() -> None:
+    state = StubState(day_state())
+    h = await harness(
+        state=state, checks=[Rule("max_trades", ALLOW)], positions=[position(quantity=65)]
+    )
+
+    assert await h.gate.check(order(BUY, 65)) is None
+    assert state.entries_counted == 1  # an allowed entry
+    assert await h.gate.check(order(SELL, 65)) is None
+    assert state.entries_counted == 1  # an exit is not an entry
+
+    refused = await harness(
+        state=StubState(day_state()), checks=[Rule("max_trades", reject("RISK_MAX_TRADES"))]
+    )
+    assert await refused.gate.check(order(BUY, 65)) is not None
+    assert refused.state.entries_counted == 0  # type: ignore[attr-defined]  # a refused entry
+
+
+async def test_an_entry_whose_count_cannot_be_saved_is_refused_after_the_rules_allowed_it() -> None:
+    state = StubState(day_state())
+    state.count_fails = "the entry count could not be saved: db down"
+    h = await harness(state=state, checks=[Rule("max_trades", ALLOW)])
+
+    reason = await h.gate.check(order(BUY, 65))
+
+    assert (reason or "").startswith("RISK_STATE_UNAVAILABLE") and "count" in (reason or "")
+    assert h.verdict().reason_code == "RISK_STATE_UNAVAILABLE"
