@@ -10,6 +10,8 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 
+import pytest
+
 from contracts.orders import Fill, OrderSide, Position
 from engine.persistence.repository import PersistenceError
 from engine.positions.book import PositionId, apply, flat, position_id
@@ -644,3 +646,66 @@ async def test_a_fill_that_opens_from_flat_realises_nothing_whatever_the_cumulat
     await feed.round_trip("100", "99")  # -65 gross
 
     assert daybook.day().loss_streak == 1
+
+
+# ---- what the monitor raises: the ratchet, the halt and the close marks ----------------------
+
+
+async def test_the_ratchet_only_raises_the_peak_and_the_floor() -> None:
+    daybook, *_ = await loaded()
+
+    daybook.ratchet(D("500"), D("-2000"))
+    daybook.ratchet(D("300"), D("-2500"))  # both lower: ignored
+    daybook.ratchet(D("700"), None)  # a higher peak, no floor: the floor stays
+
+    assert daybook.day().peak == D("700") and daybook.day().floor == D("-2000")
+    daybook.ratchet(D("700"), D("-1000"))
+    assert daybook.day().floor == D("-1000")
+
+
+@pytest.mark.parametrize("bad", [D("NaN"), D("Infinity"), D("-Infinity")])
+async def test_the_ratchet_ignores_a_value_that_is_not_a_number(bad: Decimal) -> None:
+    daybook, *_ = await loaded()
+    daybook.ratchet(D("500"), D("-2000"))
+
+    daybook.ratchet(bad, bad)
+
+    assert daybook.day().peak == D("500") and daybook.day().floor == D("-2000")
+
+
+async def test_the_ratchet_marks_the_book_dirty_only_when_something_rose() -> None:
+    daybook, *_ = await loaded()
+
+    daybook.ratchet(D("0"), None)  # nothing: the peak starts at 0
+    assert not daybook.dirty
+    daybook.ratchet(D("10"), None)
+    assert daybook.dirty
+    await daybook.flush()
+    daybook.ratchet(D("10"), None)  # the same again
+    assert not daybook.dirty
+
+
+async def test_a_halt_only_rises_and_keeps_the_reason_that_set_it() -> None:
+    from contracts.snapshot import HaltLevel
+
+    daybook, repo, _ = await loaded()
+
+    daybook.raise_halt(HaltLevel.KILL, "equity floor breached")
+    daybook.raise_halt(HaltLevel.MTM_BLIND, "prices unknown")  # lower: ignored
+    await daybook.flush()
+
+    assert daybook.day().halt_level is HaltLevel.KILL
+    assert daybook.day().halt_reason == "equity floor breached"
+    stored = await repo.load_day("main", TODAY)
+    assert stored is not None and stored.halt_level is HaltLevel.KILL
+
+
+async def test_the_first_close_marks_for_a_day_stand() -> None:
+    daybook, repo, _ = await loaded()
+
+    daybook.set_close_marks({"NSE_FNO:53720|INTRADAY": "104"})
+    daybook.set_close_marks({"NSE_FNO:53720|INTRADAY": "999"})  # a restart after the close
+    await daybook.flush()
+
+    stored = await repo.load_day("main", TODAY)
+    assert stored is not None and stored.close_marks == {"NSE_FNO:53720|INTRADAY": "104"}

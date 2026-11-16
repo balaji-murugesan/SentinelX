@@ -77,7 +77,27 @@ class MtmTracker:
         self._band = outlier_pct / 100
         self._stale_after = stale_after
         self._series: dict[InstrumentKey, _Series] = {}
+        self._baselines: dict[InstrumentKey, Decimal] = {}
         self._peak = Decimal(0)
+
+    def reconfigure(self, *, outlier_pct: Decimal, stale_after: timedelta) -> None:
+        """Apply new thresholds (the owner tightened ``outlier_pct`` or ``stale_s``) without
+        losing the prices seen so far. Same checks as the constructor."""
+        if not outlier_pct.is_finite() or outlier_pct <= 0:
+            raise ValueError("outlier_pct must be above zero")
+        if stale_after <= timedelta(0):
+            raise ValueError("stale_after must be above zero")
+        self._band = outlier_pct / 100
+        self._stale_after = stale_after
+
+    def seed_baseline(self, key: InstrumentKey, price: Decimal) -> None:
+        """Give ``key`` a price to judge its FIRST tick against (a held position's previous close
+        or average price). Without one, the first tick has nothing to compare with and is
+        accepted, so a corrupt but positive and finite first tick (ten times the real price)
+        could raise the peak for good. With one, a first tick far from it must be confirmed by
+        the next tick like any other jump. A baseline is not a tick: it never counts as fresh."""
+        if price.is_finite() and price > 0:
+            self._baselines[key] = price
 
     # ---- prices ---------------------------------------------------------------------------
 
@@ -87,8 +107,14 @@ class MtmTracker:
             return TickKind.REJECTED  # garbage: leave every price and time untouched
         series = self._series.get(tick.key)
         if series is None:
-            self._series[tick.key] = _Series(price, at, price, at)  # nothing to compare with yet
-            return TickKind.ACCEPTED
+            baseline = self._baselines.get(tick.key)
+            if baseline is None or self._within_band(price, baseline):
+                self._series[tick.key] = _Series(price, at, price, at)  # nothing to doubt
+                return TickKind.ACCEPTED
+            # Far from where the position stood: believed for the loss side (the latest price),
+            # but the peak keeps using the baseline until the next tick confirms or drops it.
+            self._series[tick.key] = _Series(price, at, baseline, at, pending=price)
+            return TickKind.OUTLIER
         series.latest, series.latest_at = price, at
 
         if series.pending is not None:

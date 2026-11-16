@@ -39,6 +39,7 @@ from typing import Final
 import structlog
 
 from contracts.orders import Fill, OrderSide, Position
+from contracts.snapshot import HaltLevel
 from engine.market_data.clock import ist_date, utc_now
 from engine.persistence.repository import PersistenceError
 from engine.positions.book import PositionId, apply, flat, position_id
@@ -174,6 +175,36 @@ class DayBook:
         if self._day is None or self._day.trade_date == ist_date(self._now()):
             return False
         return await self.load()
+
+    # ---- what the monitor raises (task 7.1) ------------------------------------------------
+
+    def ratchet(self, peak: Decimal, floor: Decimal | None) -> None:
+        """Raise the day's peak and floor. They only ever rise: a lower or non-finite value is
+        ignored, so the monitor may pass what it has just computed. The change is written by the
+        next ``flush`` (the monitor flushes before it acts on a kill)."""
+        state = self.day()
+        new_peak = peak if peak.is_finite() and peak > state.peak else state.peak
+        new_floor = state.floor
+        if floor is not None and floor.is_finite() and (new_floor is None or floor > new_floor):
+            new_floor = floor
+        if new_peak != state.peak or new_floor != state.floor:
+            self._day = replace(state, peak=new_peak, floor=new_floor)
+            self._version += 1
+
+    def raise_halt(self, level: HaltLevel, reason: str) -> None:
+        """Lock the day at ``level`` (it only ever rises, and clears with the next trading day)."""
+        state = self.day()
+        if level > state.halt_level:
+            self._day = replace(state, halt_level=level, halt_reason=reason)
+            self._version += 1
+
+    def set_close_marks(self, marks: dict[str, str]) -> None:
+        """Record each open position's last price at the close: tomorrow's reference. The first
+        marks written for a day stand (a restart after the close must not replace them)."""
+        state = self.day()
+        if state.close_marks is None:
+            self._day = replace(state, close_marks=dict(marks))
+            self._version += 1
 
     # ---- the entry counter -----------------------------------------------------------------
 

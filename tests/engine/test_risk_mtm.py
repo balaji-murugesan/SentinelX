@@ -375,3 +375,74 @@ def test_an_absurdly_large_peak_is_ignored_so_the_floor_check_never_goes_blind()
 
     t.raise_peak(D("1e12"))  # the supported maximum itself is accepted
     assert t.peak == D("1e12")
+
+
+# ---- a baseline for the first tick, and new thresholds (task 7.1) -----------------------------
+
+
+def test_a_corrupt_first_tick_far_from_the_baseline_needs_confirmation() -> None:
+    """Without a baseline the first tick is accepted whatever it says, so ten times the real price
+    could raise the peak for good. With the position's previous close as a baseline it is an
+    outlier like any other jump."""
+    t = tracker()
+    t.seed_baseline(OPTION, D("100"))
+
+    assert t.on_tick(tick("1000")) is TickKind.OUTLIER
+    assert t.latest_price(OPTION) == D("1000")  # believed for the loss side
+    assert t.accepted_price(OPTION) == D("100")  # the peak keeps using the baseline
+    reading = evaluate(t)
+    assert reading is not None and reading.peak == D("0")  # the spike did not raise the peak
+    assert t.on_tick(tick("100.5", 1)) is TickKind.ACCEPTED  # the spike reverted: dropped
+    assert t.accepted_price(OPTION) == D("100.5")
+
+
+def test_a_first_tick_that_is_confirmed_is_a_genuine_gap() -> None:
+    t = tracker()
+    t.seed_baseline(OPTION, D("100"))
+    t.on_tick(tick("130"))
+
+    assert t.on_tick(tick("131", 1)) is TickKind.CONFIRMED
+    assert t.accepted_price(OPTION) == D("131")
+
+
+def test_a_first_tick_near_the_baseline_is_accepted_at_once() -> None:
+    t = tracker()
+    t.seed_baseline(OPTION, D("100"))
+
+    assert t.on_tick(tick("105")) is TickKind.ACCEPTED
+    assert t.accepted_price(OPTION) == D("105")
+
+
+def test_a_baseline_is_not_a_tick() -> None:
+    t = tracker()
+    t.seed_baseline(OPTION, D("100"))
+
+    assert t.latest_price(OPTION) is None and t.age(OPTION, NOW) is None  # still unpriced
+
+
+@pytest.mark.parametrize("bad", [D("0"), D("-5"), D("NaN"), D("Infinity")])
+def test_a_bad_baseline_is_ignored(bad: Decimal) -> None:
+    t = tracker()
+    t.seed_baseline(OPTION, bad)
+
+    assert t.on_tick(tick("1000")) is TickKind.ACCEPTED  # nothing to compare with
+
+
+def test_new_thresholds_apply_without_losing_the_prices() -> None:
+    t = tracker()
+    t.on_tick(tick("100"))
+
+    t.reconfigure(outlier_pct=D("5"), stale_after=timedelta(seconds=2))
+
+    assert t.latest_price(OPTION) == D("100")  # the series survived
+    assert t.on_tick(tick("110", 1)) is TickKind.OUTLIER  # 10% is now beyond the 5% band
+
+
+@pytest.mark.parametrize("pct", [D("0"), D("-1"), D("NaN")])
+def test_reconfigure_refuses_what_the_constructor_refuses(pct: Decimal) -> None:
+    t = tracker()
+
+    with pytest.raises(ValueError, match="outlier_pct"):
+        t.reconfigure(outlier_pct=pct, stale_after=STALE)
+    with pytest.raises(ValueError, match="stale_after"):
+        t.reconfigure(outlier_pct=D("20"), stale_after=timedelta(0))

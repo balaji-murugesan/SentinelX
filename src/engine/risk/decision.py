@@ -134,7 +134,8 @@ class RiskContext:
     without them (a pre-trade rule's test) is simply one with a healthy feed: ``feed_silent_for``
     is the time since *any* tick arrived (None: not known), ``feed_subscribed`` says something is
     subscribed, and ``unpriced_for`` is, for each held instrument that has never been priced, how
-    long the engine has been waiting for its first tick.
+    long the engine has been waiting for its first tick. ``unprotected`` is the set of open
+    positions with no catastrophic stop resting (``engine.risk.stops``).
     """
 
     account_id: str
@@ -149,6 +150,7 @@ class RiskContext:
     feed_silent_for: timedelta | None = None
     feed_subscribed: bool = False
     unpriced_for: Mapping[InstrumentKey, timedelta] = field(default_factory=dict)
+    unprotected: frozenset[PositionId] = frozenset()
 
 
 class PreTradeCheck(Protocol):
