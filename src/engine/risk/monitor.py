@@ -121,6 +121,7 @@ class RiskMonitor:
         persist_interval_s: float,
         on_kill: KillHook | None = None,
         ensure_flat: EnsureFlatHook | None = None,
+        lock_pending: Callable[[], bool] = lambda: False,
         unprotected: Callable[[], frozenset[PositionId]] = frozenset,
         now: Callable[[], datetime] = utc_now,
     ) -> None:
@@ -128,6 +129,9 @@ class RiskMonitor:
         must be idempotent and return promptly. ``ensure_flat`` is called on every pass while the
         day is locked and asks for the book to be flattened; it is idempotent too (it starts a
         flatten only if none is running), which is how a flatten cut short by a crash resumes.
+        ``lock_pending`` says a kill was asked for while today's state could not be read and is
+        still waiting to be recorded on the day: the monitor then asks ``ensure_flat`` too, even
+        though the loaded day is not locked yet, which is how that kill reaches the day.
         ``unprotected`` returns the open positions that have no catastrophic stop."""
         self._account_id = account_id
         self._limits = limits
@@ -142,6 +146,7 @@ class RiskMonitor:
         self._persist_every = timedelta(seconds=persist_interval_s)
         self._on_kill = on_kill
         self._ensure_flat = ensure_flat
+        self._lock_pending = lock_pending
         self._unprotected = unprotected
         self._now = now
         self._trading: TradingView | None = None
@@ -434,7 +439,8 @@ class RiskMonitor:
         asked on every pass, not once, so a flatten that failed or was cut short by a crash is
         started again."""
         day = self._daybook.day()
-        if day.halt_level < HaltLevel.MTM_BLIND or self._ensure_flat is None:
+        pending = self._lock_pending()
+        if (day.halt_level < HaltLevel.MTM_BLIND and not pending) or self._ensure_flat is None:
             return
         try:
             await self._ensure_flat(day.halt_reason or "day locked")

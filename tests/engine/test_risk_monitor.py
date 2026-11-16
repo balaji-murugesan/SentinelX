@@ -1069,3 +1069,14 @@ async def test_run_takes_ticks_and_passes_until_stopped() -> None:
 
     quote = fast.quote(OPTION)
     assert quote is not None and quote.price == D("101")
+
+
+async def test_a_pending_lock_makes_the_monitor_ask_for_the_flatten_on_an_unlocked_day() -> None:
+    """A kill asked for while the day could not be read is waiting to be recorded: the hook is
+    asked although the loaded day is not locked yet, which is how the kill reaches the day."""
+    env = await Env(positions=[carried()]).ready()
+    env.monitor._lock_pending = lambda: True  # type: ignore[attr-defined]
+
+    await stepped(env)
+
+    assert env.flat_calls == ["day locked"] and env.daybook.day().halt_level is HaltLevel.NONE

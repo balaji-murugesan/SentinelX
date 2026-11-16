@@ -7,6 +7,7 @@ fail-closed ladder for entries (unbound, no limits, unusable limits, state, day 
 halt) and the guarantee that none of it refuses an exit.
 """
 
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
@@ -81,6 +82,7 @@ class Harness:
         bind: bool = True,
         positions: list[Any] | None = None,
         state: StubState | None = None,
+        on_kill: Callable[[Decision], None] | None = None,
     ) -> None:
         self.repo = MemoryRiskRepository()
         self.limits = LimitsService(
@@ -94,7 +96,7 @@ class Harness:
         self.checks = checks if checks is not None else []
         self.gate = RiskEngine(
             account_id="main", mode=mode, limits=self.limits, state=self.state, audit=self.audit,
-            instruments=instrument_of, checks=self.checks, now=lambda: NOW,
+            instruments=instrument_of, checks=self.checks, on_kill=on_kill, now=lambda: NOW,
         )  # fmt: skip
         if bind:
             self.gate.bind(self.trading)
@@ -243,6 +245,69 @@ async def test_the_most_severe_enforced_rule_decides_the_reason() -> None:
 
     assert (reason or "").startswith("RISK_FLOOR_BREACH")
     assert h.verdict().decision == "KILL" and h.verdict().inputs["decided_by"] == "equity_floor"
+
+
+async def test_a_kill_from_a_pre_trade_rule_is_requested_as_well_as_refused() -> None:
+    """The engine acts on the most severe decision wherever it was seen (task 10.3)."""
+    asked: list[Decision] = []
+    h = await harness(
+        checks=[Rule("per_trade_risk", reject("RISK_PER_TRADE")), Rule("floor", kill("RISK_X"))],
+        on_kill=asked.append,
+    )
+
+    reason = await h.gate.check(order(BUY, 65))
+
+    assert (reason or "").startswith("RISK_X")
+    assert [d.code for d in asked] == ["RISK_X"]  # once, with the decision that won
+
+
+@pytest.mark.parametrize(
+    "decision", [reject("RISK_A"), halt_new_entries("RISK_B"), ALLOW], ids=["reject", "halt", "ok"]
+)
+async def test_a_decision_below_kill_requests_no_kill(decision: Decision) -> None:
+    asked: list[Decision] = []
+    h = await harness(checks=[Rule("r", decision)], on_kill=asked.append)
+
+    await h.gate.check(order(BUY, 65))
+
+    assert asked == []
+
+
+async def test_a_shadow_rule_that_would_kill_requests_no_kill() -> None:
+    asked: list[Decision] = []
+    h = await harness(
+        checks=[Rule("per_trade_risk", kill("RISK_X"))],
+        limits_values={**BASE, MODE_PREFIX + "per_trade_risk": "shadow"},
+        on_kill=asked.append,
+    )
+
+    reason = await h.gate.check(order(BUY, 65))
+
+    assert reason is None and asked == []  # logged and audited, not acted on
+
+
+async def test_an_exit_rule_that_returns_kill_requests_it_too() -> None:
+    asked: list[Decision] = []
+    h = await harness(
+        checks=[Rule("exit_rule", kill("RISK_X"), applies_to_exits=True)],
+        positions=[position(quantity=65)],
+        on_kill=asked.append,
+    )
+
+    await h.gate.check(order(SELL, 65))
+
+    assert [d.code for d in asked] == ["RISK_X"]
+
+
+async def test_a_kill_hook_that_raises_changes_nothing_about_the_verdict() -> None:
+    def broken(decision: Decision) -> None:
+        raise RuntimeError("could not schedule")
+
+    h = await harness(checks=[Rule("floor", kill("RISK_X"))], on_kill=broken)
+
+    reason = await h.gate.check(order(BUY, 65))
+
+    assert (reason or "").startswith("RISK_X")  # still refused, and the gate did not fail
 
 
 async def test_a_check_that_crashes_rejects_an_entry_naming_the_check() -> None:

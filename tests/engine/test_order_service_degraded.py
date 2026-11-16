@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from contracts.commands import CommandResult
+from contracts.commands import CancelOrder, CommandResult
 from contracts.orders import CostBreakdown, Fill, OrderSide, OrderState, Position
 from engine.broker.adapter import Filled
 from engine.orders.service import OrderService
@@ -90,6 +90,79 @@ async def test_kill_with_postgres_down_the_exit_is_sent_and_its_write_queued() -
     assert service.persistence_ok
     assert states(repo) == ["Requested", "Submitted", "Open"]  # stored in the order they happened
     assert repo.results[("main", "exit")] == result and repo.orders[result.order_id] == held
+
+
+def cancel_of(order_id: str, key: str = "cancel-1") -> CancelOrder:
+    return CancelOrder(
+        command_id=f"c-{key}", idempotency_key=key, account_id="main", source="risk-kill",
+        sent_at=NOW, order_id=order_id,
+    )  # fmt: skip
+
+
+async def test_a_cancel_still_reaches_the_broker_when_the_database_is_down() -> None:
+    """Task 10.1: the kill must be able to cancel an entry during an outage. A cancel only removes
+    risk, so like an exit it does not wait for the idempotency lookup; its result is queued."""
+    repo = FailingRepository()
+    service, adapter, _ = build(repository=repo)
+    resting = await service.place(command("rest", side=BUY, quantity=65, limit="90.00"))
+    assert resting.accepted and resting.order_id
+    asked: list[str] = []
+
+    async def cancel(order: Any) -> None:
+        asked.append(order.order_id)
+
+    adapter.cancel = cancel  # type: ignore[method-assign]
+    repo.down = True  # the database fails just now: persistence_ok is not yet known to be false
+
+    first = await service.cancel(cancel_of(resting.order_id))
+
+    assert first.accepted and asked == [resting.order_id]
+    assert ("main", "cancel-1") not in repo.results  # queued, not stored
+
+    repo.down = False
+    assert await service.drain_pending() is True
+    assert repo.results[("main", "cancel-1")] == first  # stored once the database is back
+
+
+async def test_a_cancel_does_not_spend_a_database_call_while_the_database_is_known_to_be_down() -> (
+    None
+):
+    repo = FailingRepository()
+    service, adapter, _ = build(repository=repo)
+    resting = await service.place(command("rest", side=BUY, quantity=65, limit="90.00"))
+    assert resting.order_id
+    service.persistence_ok = False  # an earlier write failed
+    lookups: list[str] = []
+    real = repo.find_result
+
+    async def counting(account_id: str, key: str) -> Any:
+        lookups.append(key)
+        return await real(account_id, key)
+
+    repo.find_result = counting  # type: ignore[method-assign]
+
+    result = await service.cancel(cancel_of(resting.order_id))
+
+    assert result.accepted and lookups == []
+
+
+async def test_a_repeated_cancel_key_still_returns_the_first_answer_when_the_database_is_up() -> (
+    None
+):
+    service, adapter, repo = build()
+    resting = await service.place(command("rest", side=BUY, quantity=65, limit="90.00"))
+    assert resting.order_id
+    asked: list[str] = []
+
+    async def cancel(order: Any) -> None:
+        asked.append(order.order_id)
+
+    adapter.cancel = cancel  # type: ignore[method-assign]
+    first = await service.cancel(cancel_of(resting.order_id))
+
+    second = await service.cancel(cancel_of(resting.order_id))
+
+    assert second == first and asked == [resting.order_id]  # the broker was asked once
 
 
 async def test_an_entry_in_the_same_state_is_rejected_with_the_persistence_reason() -> None:
@@ -530,3 +603,90 @@ async def test_a_validation_rejection_is_still_the_answer_to_a_repeat_while_flag
     again = await service.place(command("bad", side=BUY, quantity=70))
 
     assert again == first and adapter.placed == []
+
+
+async def test_a_repeated_cancel_key_during_an_outage_gets_the_first_answer_from_memory() -> None:
+    """Rule 5 without the database: the key lookup is skipped, so the service remembers what it
+    answered. A repeat must not ask the broker again."""
+    repo = FailingRepository()
+    service, adapter, _ = build(repository=repo)
+    resting = await service.place(command("rest", side=BUY, quantity=65, limit="90.00"))
+    assert resting.order_id
+    asked: list[str] = []
+
+    async def cancel(order: Any) -> None:
+        asked.append(order.order_id)
+
+    adapter.cancel = cancel  # type: ignore[method-assign]
+    repo.down = True
+
+    first = await service.cancel(cancel_of(resting.order_id))
+    second = await service.cancel(cancel_of(resting.order_id))
+
+    assert first.accepted and second == first and asked == [resting.order_id]
+
+
+async def test_a_failed_key_lookup_marks_persistence_down_so_the_next_cancel_pays_no_timeout() -> (
+    None
+):
+    repo = FailingRepository()
+    service, adapter, _ = build(repository=repo)
+    resting = await service.place(command("rest", side=BUY, quantity=65, limit="90.00"))
+    other = await service.place(command("rest2", side=BUY, quantity=65, limit="91.00"))
+    assert resting.order_id and other.order_id
+    lookups: list[str] = []
+    real = repo.find_result
+
+    async def counting(account_id: str, key: str) -> Any:
+        lookups.append(key)
+        return await real(account_id, key)
+
+    repo.find_result = counting  # type: ignore[method-assign]
+    repo.down = True
+
+    await service.cancel(cancel_of(resting.order_id, "c-1"))
+    assert not service.persistence_ok  # the failed lookup said so
+    await service.cancel(cancel_of(other.order_id, "c-2"))
+
+    assert lookups == ["c-1"]  # only the first cancel paid for a lookup
+
+
+async def test_the_cancel_answers_kept_for_an_outage_are_dropped_when_the_database_catches_up() -> (
+    None
+):
+    repo = FailingRepository()
+    service, _, _ = build(repository=repo)
+    resting = await service.place(command("rest", side=BUY, quantity=65, limit="90.00"))
+    assert resting.order_id
+    repo.down = True
+    await service.cancel(cancel_of(resting.order_id))
+    assert service._cancel_answers  # type: ignore[attr-defined]
+
+    repo.down = False
+    assert await service.drain_pending() is True
+
+    assert service._cancel_answers == {}  # type: ignore[attr-defined]
+    assert repo.results[("main", "cancel-1")].accepted  # the answer reached the database
+
+
+async def test_a_failed_key_lookup_alone_marks_persistence_down() -> None:
+    """Even if writes still work, a lookup that failed says the database is not answering: the
+    next cancel must not pay for another one."""
+    repo = FailingRepository()
+    service, _, _ = build(repository=repo)
+    first = await service.place(command("rest", side=BUY, quantity=65, limit="90.00"))
+    second = await service.place(command("rest2", side=BUY, quantity=65, limit="91.00"))
+    assert first.order_id and second.order_id
+    lookups: list[str] = []
+
+    async def failing_lookup(account_id: str, key: str) -> Any:
+        lookups.append(key)
+        raise PersistenceError("reads are timing out")
+
+    repo.find_result = failing_lookup  # type: ignore[method-assign]  # writes still work
+
+    await service.cancel(cancel_of(first.order_id, "c-1"))
+    assert not service.persistence_ok
+    await service.cancel(cancel_of(second.order_id, "c-2"))
+
+    assert lookups == ["c-1"]

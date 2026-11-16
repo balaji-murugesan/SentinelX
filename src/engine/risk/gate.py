@@ -125,8 +125,14 @@ class RiskEngine:
         audit: RiskAudit,
         instruments: Callable[[InstrumentKey], Instrument | None],
         checks: Sequence[PreTradeCheck],  # required: a gate with no rules would allow everything
+        on_kill: Callable[[Decision], None] | None = None,
         now: Callable[[], datetime] = utc_now,
     ) -> None:
+        """``on_kill`` is called when an enforced pre-trade rule returns KILL, so that the engine
+        acts on the most severe decision wherever it was seen (the floor check is normally a
+        continuous one, but a pre-trade rule may return KILL too). The gate runs inside the order
+        service's lock, which the kill's own cancels need, so the hook must only *schedule* the
+        kill and return (``KillSwitch.request``); it must never await it."""
         self._account_id = account_id
         self._mode = mode
         self._limits = limits
@@ -134,6 +140,7 @@ class RiskEngine:
         self._audit = audit
         self._instruments = instruments
         self._checks = tuple(checks)
+        self._on_kill = on_kill
         self._now = now
         self._trading: TradingView | None = None
 
@@ -193,7 +200,16 @@ class RiskEngine:
         ctx = self._context(now)
         results.extend(run_pre_trade([c for c in self._checks if c.applies_to_exits], ctx, order))
         winner = most_severe(r for r in results if r.decision.code != CHECK_ERROR)
+        self._request_kill_if_severe(winner)
         return None if winner is None else self._refusal(winner, extra)
+
+    def _request_kill_if_severe(self, winner: RuleResult | None) -> None:
+        if winner is None or winner.effective < Severity.KILL or self._on_kill is None:
+            return  # nothing severe, or a shadow rule (its effective severity is lower)
+        try:
+            self._on_kill(winner.decision)
+        except Exception:  # the order is refused either way; the kill is retried by the monitor
+            log.critical("kill requested by a pre-trade rule could not be scheduled", exc_info=True)
 
     def _why_unjudged(self, now: datetime) -> str | None:
         if self._limits.current is None:
@@ -220,6 +236,7 @@ class RiskEngine:
             return halt.reason() or f"{STATE_UNAVAILABLE}: new entries are halted"
         results.extend(run_pre_trade(self._checks, self._context(now), order))
         winner = most_severe(results)
+        self._request_kill_if_severe(winner)
         return None if winner is None else self._refusal(winner, extra)
 
     @staticmethod

@@ -127,6 +127,8 @@ class OrderService:
         # Fail-closed flags (spec "fail closed"). 8.1 sets reconciled after recovery.
         self.persistence_ok = True
         self.reconciled = True
+        # Answers to cancels given while the database could not be asked (rule 5 in memory).
+        self._cancel_answers: dict[tuple[str, str], CommandResult] = {}
         # What recovery found (or the stored halt holds); empty unless HALTED. Shown in the
         # snapshot and banner so the owner can see why new orders are refused (design §9).
         self.halt_differences: list[str] = []
@@ -286,6 +288,7 @@ class OrderService:
             except PersistenceError:
                 return False
             self.persistence_ok = True
+            self._cancel_answers.clear()  # the database has every answer now
             log.info("persistence_restored")
         return True
 
@@ -584,14 +587,36 @@ class OrderService:
                 return await self._cancel(command)
 
     async def _cancel(self, command: CancelOrder) -> CommandResult:
-        try:
-            stored = await self._repo.find_result(command.account_id, command.idempotency_key)
-        except PersistenceError as error:
-            return self._refuse(
-                command.command_id, command.idempotency_key, f"{CANNOT_SAVE}: {error}"
-            )
+        # A cancel only removes risk (an entry that could rest, a stop that could trigger), so,
+        # like an exit, it keeps working when the database is away: the kill must be able to
+        # cancel an entry during an outage. The key lookup is skipped then (it would cost a
+        # database timeout per cancel), and rule 5 is kept in memory instead: a repeat of a key
+        # answered during the outage gets that first answer back. The result is queued with the
+        # other writes (``_store``), and the memory is dropped once the database has caught up.
+        key = (command.account_id, command.idempotency_key)
+        stored = None
+        skipped = True
+        if self.persistence_ok and not self._pending:
+            skipped = False
+            try:
+                stored = await self._repo.find_result(*key)
+            except PersistenceError:
+                # The database has only just failed. Say so now, so that the next cancel does not
+                # pay another timeout: with a hung database the kill's cancels would otherwise
+                # delay its first exit by one timeout each.
+                self.persistence_ok = False
+                skipped = True
+                log.warning("cancel_idempotency_unchecked", key=command.idempotency_key)
         if stored is not None:
             return stored
+        if skipped and (known := self._cancel_answers.get(key)) is not None:
+            return known
+        result = await self._cancel_order(command)
+        if skipped:
+            self._cancel_answers[key] = result
+        return result
+
+    async def _cancel_order(self, command: CancelOrder) -> CommandResult:
         order = self.orders.get(command.order_id)
         if order is None:
             return await self._reject(command, f"unknown order id {command.order_id}")
