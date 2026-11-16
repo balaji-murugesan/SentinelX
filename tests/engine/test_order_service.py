@@ -284,7 +284,7 @@ async def test_the_initial_stop_is_carried_onto_the_order() -> None:
     assert repo.orders[result.order_id or ""].initial_stop == Decimal("190.00")
 
 
-async def test_a_stop_market_command_is_refused_and_never_reaches_the_broker() -> None:
+async def test_a_stop_market_command_is_accepted_and_the_order_carries_its_trigger() -> None:
     service, adapter, repo = build()
     stop = PlaceOrder(
         command_id="c-stop", idempotency_key="k-stop", account_id="main", source="cli",
@@ -294,5 +294,21 @@ async def test_a_stop_market_command_is_refused_and_never_reaches_the_broker() -
 
     result = await service.place(stop)
 
-    assert not result.accepted and "not supported yet" in (result.reason or "")
+    assert result.accepted
+    stored = repo.orders[result.order_id or ""]
+    assert stored.order_type is OrderType.STOP_MARKET and stored.trigger_price == Decimal("160.00")
+    assert [o.trigger_price for o in adapter.placed] == [Decimal("160.00")]  # the broker got it
+
+
+async def test_a_stop_market_with_a_trigger_off_the_tick_grid_never_reaches_the_broker() -> None:
+    service, adapter, repo = build()
+    stop = PlaceOrder(
+        command_id="c-stop", idempotency_key="k-stop", account_id="main", source="cli",
+        sent_at=NOW, key=OPTION, side=OrderSide.SELL, quantity=65, product=ProductType.INTRADAY,
+        order_type=OrderType.STOP_MARKET, trigger_price=Decimal("160.03"),
+    )  # fmt: skip
+
+    result = await service.place(stop)
+
+    assert not result.accepted and "tick grid" in (result.reason or "")
     assert adapter.placed == [] and repo.orders == {}

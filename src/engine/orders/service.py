@@ -68,7 +68,7 @@ from engine.market_data.clock import ist_date, market_close_utc, utc_now
 from engine.market_data.instruments import InstrumentMaster
 from engine.market_data.provider import SubscriptionLimitError
 from engine.orders.gate import RiskGate
-from engine.orders.intent import Intent, classify
+from engine.orders.intent import PROTECTIVE_STOP_SOURCE, Intent, classify
 from engine.orders.machine import InvalidTransition, transition
 from engine.orders.validation import NO_HOLDINGS, Holdings, validate
 from engine.persistence.repository import LoadedState, PersistenceError, TradingRepository
@@ -408,6 +408,7 @@ class OrderService:
             product=command.product,
             order_type=command.order_type,
             limit_price=command.limit_price,
+            trigger_price=command.trigger_price,
             initial_stop=command.initial_stop,
             idempotency_key=command.idempotency_key,
             source=command.source,
@@ -649,12 +650,17 @@ class OrderService:
         # A negative CNC quantity is not a holding, so it never counts as negative "held".
         held = max(0, position.quantity) if position else 0
         # Unknown orders count too: they may be live at the broker, so their units are spoken for.
+        # The catastrophic stop does not: it protects the same units an exit would sell, and
+        # counting it would refuse the replacement stop after a scale-in and every CNC exit while
+        # it rests (and exit comes before cancel, rule 7). Whether Dhan blocks a CNC exit while a
+        # stop reserves the shares is an open item for the live smoke test (design Risks).
         selling = sum(
             o.quantity - o.filled_quantity
             for o in self.orders.values()
             if o.key == command.key
             and o.product is ProductType.CNC
             and o.side is OrderSide.SELL
+            and o.source != PROTECTIVE_STOP_SOURCE
             and not o.state.is_final
         )
         return Holdings(held=held, selling=selling)

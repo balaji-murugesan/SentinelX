@@ -221,10 +221,18 @@ def test_transition_carries_changes_and_revalidates() -> None:
         transition(order(state=S.OPEN), S.FILLED, at=NOW, filled_quantity=-1)
 
 
-# ---- add-risk-engine task 1.1: stop-market orders are refused until the broker can rest them --
+# ---- add-risk-engine task 9.1: stop-market orders ------------------------------------------
 
 
-def test_stop_market_is_refused_until_the_paper_broker_can_rest_it() -> None:
+def test_a_stop_market_with_its_trigger_on_the_tick_grid_passes_validation() -> None:
     stop = command(order_type=OrderType.STOP_MARKET, trigger_price=Decimal("160.00"))
+
+    assert check(stop) is None
+
+
+def test_a_stop_market_trigger_off_the_tick_grid_is_refused() -> None:
+    stop = command(order_type=OrderType.STOP_MARKET, trigger_price=Decimal("160.03"))
+
     reason = check(stop)
-    assert reason is not None and "stop-market" in reason and "not supported yet" in reason
+
+    assert reason is not None and "trigger price" in reason and "tick grid" in reason

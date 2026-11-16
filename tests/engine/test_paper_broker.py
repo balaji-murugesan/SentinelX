@@ -291,3 +291,155 @@ def test_cost_category() -> None:
     assert category(Seg.NSE_FNO, "FUTSTK", ProductType.INTRADAY) is CostCategory.FUTURE
     assert category(Seg.NSE_EQ, "EQUITY", ProductType.CNC) is CostCategory.EQUITY_DELIVERY
     assert category(Seg.NSE_EQ, "EQUITY", ProductType.INTRADAY) is CostCategory.EQUITY_INTRADAY
+
+
+# ---- add-risk-engine task 9.1: stop-market orders ---------------------------------------------
+
+
+def stop(
+    side: OrderSide = OrderSide.SELL,
+    trigger: str = "160.00",
+    order_id: str = "s1",
+    **changes: object,
+) -> Order:
+    return order(
+        side, order_id=order_id, order_type=OrderType.STOP_MARKET,
+        trigger_price=Decimal(trigger), **changes,
+    )  # fmt: skip
+
+
+async def test_a_sell_stop_rests_until_the_price_trades_through_its_trigger() -> None:
+    clock = Clock()
+    broker = make(clock)
+    price(broker, clock, "200.00")
+
+    await broker.place(stop())
+    price(broker, clock, "170.00")  # lower, but not yet at the trigger
+
+    assert pending(broker) == []
+    assert [b.state for b in await broker.order_book()] == [OrderState.OPEN]
+
+
+async def test_gap_through_the_stop_fills_near_the_new_price_not_the_trigger() -> None:
+    """Spec "Gap through the stop": trigger 160.00, the next tick is 150.00."""
+    clock = Clock()
+    broker = make(clock)
+    price(broker, clock, "200.00")
+    ack = await broker.place(stop())
+
+    price(broker, clock, "150.00")
+
+    [fill] = pending(broker)
+    assert isinstance(fill, Filled) and fill.broker_order_id == ack.broker_order_id
+    assert fill.price == Decimal("149.95")  # 150.00 less one tick of slippage, not 160.00
+    assert fill.quantity == 65 and fill.costs.total > 0
+
+
+async def test_a_sell_stop_triggers_when_the_price_is_exactly_the_trigger() -> None:
+    clock = Clock()
+    broker = make(clock)
+    price(broker, clock, "200.00")
+    await broker.place(stop())
+
+    price(broker, clock, "160.00")
+
+    [fill] = pending(broker)
+    assert isinstance(fill, Filled) and fill.price == Decimal("159.95")  # at or below
+
+
+async def test_a_buy_stop_protecting_a_short_triggers_on_a_rise() -> None:
+    clock = Clock()
+    broker = make(clock)
+    price(broker, clock, "500.00")
+    await broker.place(stop(OrderSide.BUY, "550.00"))
+
+    price(broker, clock, "549.95")
+    assert pending(broker) == []
+    price(broker, clock, "560.00")
+
+    [fill] = pending(broker)
+    assert isinstance(fill, Filled) and fill.price == Decimal("560.05")  # paid more, as a buy
+
+
+async def test_a_stop_already_through_its_trigger_on_arrival_triggers_at_once() -> None:
+    clock = Clock()
+    broker = make(clock)
+    price(broker, clock, "150.00")
+
+    await broker.place(stop())
+
+    [fill] = pending(broker)
+    assert isinstance(fill, Filled) and fill.price == Decimal("149.95")
+
+
+async def test_a_stop_with_no_fresh_price_rests() -> None:
+    clock = Clock()
+    broker = make(clock)
+    price(broker, clock, "150.00", age_s=30)  # stale: older than the 5 s limit
+
+    await broker.place(stop())
+
+    assert pending(broker) == []
+    assert [b.state for b in await broker.order_book()] == [OrderState.OPEN]
+
+
+async def test_a_resting_stop_can_be_cancelled_and_then_never_fires() -> None:
+    clock = Clock()
+    broker = make(clock)
+    price(broker, clock, "200.00")
+    ack = await broker.place(stop())
+
+    await broker.cancel(stop(broker_order_id=ack.broker_order_id, state=OrderState.OPEN))
+    price(broker, clock, "100.00")
+
+    updates = pending(broker)
+    assert [type(u) for u in updates] == [Cancelled]  # the cancel confirmation, and no fill
+
+
+async def test_restart_with_a_resting_stop_resumes_it() -> None:
+    clock = Clock()
+    broker = make(clock)
+    resting = stop(broker_order_id="paper-abc", state=OrderState.OPEN)
+
+    broker.restore([resting])
+    price(broker, clock, "150.00")
+
+    [fill] = pending(broker)
+    assert isinstance(fill, Filled) and fill.broker_order_id == "paper-abc"
+    assert fill.price == Decimal("149.95")
+
+
+async def test_a_buy_stop_triggers_when_the_price_is_exactly_the_trigger() -> None:
+    """ "At or above" for a buy stop, as "at or below" is for a sell stop."""
+    clock = Clock()
+    broker = make(clock)
+    price(broker, clock, "500.00")
+    await broker.place(stop(OrderSide.BUY, "550.00"))
+
+    price(broker, clock, "550.00")
+
+    [fill] = pending(broker)
+    assert isinstance(fill, Filled) and fill.price == Decimal("550.05")
+
+
+async def test_another_instruments_tick_never_triggers_a_stop() -> None:
+    clock = Clock()
+    other = InstrumentKey.parse("NSE_EQ:1333")
+    shares = Instrument(
+        key=other, trading_symbol="HDFCBANK", display_name="HDFC Bank",
+        underlying_symbol="HDFCBANK", instrument_type="EQUITY", lot_size=1, tick_size=TICK,
+        freeze_qty=None,
+    )  # fmt: skip
+
+    def both(key: InstrumentKey) -> Instrument | None:
+        return shares if key == other else instrument(key)
+
+    broker = PaperBroker(
+        TickBus(), both, slippage_ticks=1, max_price_age=timedelta(seconds=5), now=clock
+    )
+    price(broker, clock, "200.00")  # the option the stop protects
+    await broker.place(stop())  # a sell stop at 160.00 on the option
+    broker.on_tick(Tick(other, Decimal("100.00"), exchange_time=clock.now, received_at=clock.now))
+
+    assert pending(broker) == []  # 100 is below 160, but it is another instrument's price
+    assert [b.state for b in await broker.order_book()] == [OrderState.OPEN]

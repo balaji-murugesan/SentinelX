@@ -64,11 +64,12 @@ def validate(
     if reason := _freeze_reason(command, instrument):
         return reason
     if command.order_type is OrderType.STOP_MARKET:
-        # The contract accepts stop-market orders, but the paper broker cannot rest them until
-        # add-risk-engine task 9.1. Refuse here, before the gate, rather than let a stop reach a
-        # broker that would treat it as a limit order. Task 9.1 removes this refusal; task 9.2
-        # adds a trigger-price tick-grid check in its place.
-        return "stop-market orders are not supported yet"
+        assert command.trigger_price is not None  # guaranteed by the PlaceOrder model
+        if command.trigger_price % instrument.tick_size:
+            return (
+                f"trigger price {command.trigger_price} is not on the tick grid "
+                f"(tick size {instrument.tick_size})"
+            )
     if command.order_type is OrderType.LIMIT:
         assert command.limit_price is not None  # guaranteed by the PlaceOrder model
         if command.limit_price % instrument.tick_size:

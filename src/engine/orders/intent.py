@@ -22,10 +22,21 @@ of Stage 4 sizes exits against the ones already resting.
 
 from collections.abc import Mapping
 from enum import StrEnum
+from typing import Final
 
 from contracts.commands import PlaceOrder
 from contracts.orders import Order, OrderSide, Position
 from engine.positions.book import PositionId
+
+# The ``source`` of the catastrophic stop the stop manager places (``engine.risk.stops``). It lives
+# here, in the layer both the order service and the risk engine already share, so the service can
+# tell a protective stop from an order that sells (``OrderService._holdings``) without importing
+# the risk engine.
+PROTECTIVE_STOP_SOURCE: Final = "risk-stop"
+# Every ``source`` the risk engine stamps on its own orders. A command from a client (the CLI, the
+# API, a webhook) may not claim one: ``OrderService._holdings`` and the stop manager and the
+# flattener decide what an order is by its source, so a spoofed one would be trusted.
+RESERVED_SOURCES: Final = frozenset({PROTECTIVE_STOP_SOURCE, "risk-kill", "risk-squareoff"})
 
 
 class Intent(StrEnum):
