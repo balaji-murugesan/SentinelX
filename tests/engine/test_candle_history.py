@@ -148,11 +148,41 @@ async def test_request_shape_and_window() -> None:
         "instrument": "OPTIDX",
         "interval": "1",
         "oi": False,
-        "fromDate": "2026-10-28 09:15:00",
+        "fromDate": "2026-10-28 09:14:00",  # one minute early: Dhan's fromDate is exclusive
         "toDate": "2026-10-28 10:54:00",  # capped at the last completed minute
     }
     assert candles[0].start >= ist(28, 9, 15)  # older fixture rows filtered by start
     assert candles[-1].start == ist(28, 10, 53)
+
+
+async def test_first_requested_minute_survives_an_exclusive_from_date() -> None:
+    """Owner's probe 2026-11-19: Dhan leaves out the bar stamped at fromDate. Without the
+    one-minute margin the first minute of a candle went missing, so the aggregate had two
+    constituents instead of three and the comparison failed (task 7.2, 09:24)."""
+    source = fixture("history_option.json")
+    columns = {name: list(v) for name, v in source.items() if isinstance(v, list)}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        text = json.loads(request.content)["fromDate"]
+        from_date = datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
+        keep = [i for i, s in enumerate(columns["timestamp"]) if float(s) > from_date.timestamp()]
+        return httpx.Response(
+            200, json={name: [col[i] for i in keep] for name, col in columns.items()}
+        )
+
+    candles = await make_history(handler).minutes(OPTION, ist(28, 10, 40), RECORDED)
+    assert candles[0].start == ist(28, 10, 40)  # the bar stamped at `start` is present
+    assert [c.start for c in candles] == [ist(28, 10, m) for m in range(40, 54)]
+
+
+async def test_margin_bar_is_dropped_when_dhan_ignores_the_margin() -> None:
+    """If Dhan ever makes fromDate inclusive (its time conventions have changed overnight
+    before), the extra bar at start - 1 minute comes back and must not reach callers."""
+    candles = await make_history(serve(fixture("history_option.json"))).minutes(
+        OPTION, ist(28, 10, 40), RECORDED
+    )
+    assert candles[0].start == ist(28, 10, 40)  # the 10:39 bar is in the response, but dropped
+    assert [c.start for c in candles] == [ist(28, 10, m) for m in range(40, 54)]
 
 
 async def test_unknown_instrument() -> None:
