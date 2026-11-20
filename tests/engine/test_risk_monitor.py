@@ -1044,7 +1044,7 @@ async def test_run_takes_ticks_and_passes_until_stopped() -> None:
     fast = RiskMonitor(
         account_id="main", limits=env.limits, daybook=env.daybook, repository=env.repo,
         audit=env.audit, instruments=instrument_of, checks=[FeedDown()],
-        subscribed=lambda: True, interval_s=0.02, persist_interval_s=10.0,
+        subscribed=lambda: True, interval_s=0.02, persist_interval_s=10.0, now=env.clock,
     )  # fmt: skip
     fast.bind(env.trading)
     bus = TickBus()
@@ -1061,7 +1061,7 @@ async def test_run_takes_ticks_and_passes_until_stopped() -> None:
     task = asyncio.create_task(fast.run(stop, subscription))
 
     await asyncio.wait_for(passes.wait(), timeout=2)
-    bus.publish(Tick(OPTION, D("101"), exchange_time=NOW, received_at=datetime.now(UTC)))
+    bus.publish(Tick(OPTION, D("101"), exchange_time=NOW, received_at=env.clock.at))
     passes.clear()
     await asyncio.wait_for(passes.wait(), timeout=2)  # a pass after the tick: it was consumed
     stop.set()

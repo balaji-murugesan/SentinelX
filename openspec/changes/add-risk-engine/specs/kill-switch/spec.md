@@ -25,7 +25,7 @@ On a kill the engine SHALL first set the account's state to HALTED for the day a
 - **THEN** the account is still HALTED and the open position is flattened after reconciliation
 
 ### Requirement: Pending entries are cancelled and every position is flattened
-A kill SHALL cancel every open entry order and exit every open position, whatever its product: `INTRADAY`, `CNC` and `MARGIN` positions, including those carried from earlier days. An entry that fills while it is being cancelled SHALL be exited too.
+A kill SHALL cancel every open entry order and, while the market is open (09:15 to 15:30 IST), exit every open position, whatever its product: `INTRADAY`, `CNC` and `MARGIN` positions, including those carried from earlier days. An entry that fills while it is being cancelled SHALL be exited too. While the market is closed it SHALL send no exit, because the broker would refuse it, but it SHALL still lock the day and say so in its answer.
 
 #### Scenario: Carried delivery position is flattened
 - **WHEN** a kill runs with an open `INTRADAY` position and a carried `CNC` holding
@@ -34,6 +34,14 @@ A kill SHALL cancel every open entry order and exit every open position, whateve
 #### Scenario: Entry fills during cancel
 - **WHEN** an entry fills before its cancel is confirmed
 - **THEN** the new position is exited
+
+#### Scenario: Kill with the market closed
+- **WHEN** a kill runs at 16:00 IST with a position open
+- **THEN** the day is locked, no exit order is sent, a critical alert is logged, and the answer to the kill command says the open positions cannot be exited now
+
+#### Scenario: Kill before the open
+- **WHEN** a kill runs at 09:10 IST with a position open and the market then opens the same day
+- **THEN** the day stays locked and the position is exited on the first monitor pass inside market hours
 
 ### Requirement: Exits are bounded limit orders, replaced only after a confirmed cancel
 A kill's exits SHALL be limit orders priced past the latest price by the configured buffer, and the engine SHALL NOT send market orders. If an exit has not filled within the configured chase interval, the engine SHALL cancel it, wait for the cancel to be confirmed, and place a new one at the current price, up to the configured number of steps.

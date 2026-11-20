@@ -201,6 +201,39 @@ async def test_sizing_changes_no_state() -> None:
     assert (len(risk.events), dict(results.results), limits.current) == before
 
 
+async def test_a_repeated_key_is_answered_afresh_from_the_limits_then_in_force() -> None:
+    """Order-commands "Size command repeated": a size command changes nothing, so its answer is not
+    remembered by idempotency key (unlike every other command). The same key after the per-trade
+    maximum was tightened is judged against the tightened limit, and nothing is stored."""
+    limits, risk, results, _ = limits_service()
+    await limits.set_limits(
+        SetRiskLimits(
+            command_id="s", idempotency_key="s", account_id="main", source="t", sent_at=NOW,
+            limits=BASE,
+        )
+    )  # fmt: skip
+    service = SizingService(account_id="main", limits=limits, instruments=instrument_of)
+
+    first = await service.size(command())  # key "k1": one lot of 65 risks 650.00, limit 1,000
+
+    assert first.accepted and first.sized_quantity == 65
+    tightened = await limits.set_limits(
+        SetRiskLimits(
+            command_id="t", idempotency_key="t", account_id="main", source="t", sent_at=NOW,
+            limits={**BASE, "per_trade_max_risk": "500"},
+        )
+    )  # fmt: skip
+    assert tightened.accepted, tightened.reason
+    before = (len(risk.events), dict(results.results))
+
+    second = await service.size(command())  # the same key "k1", now one lot (650.00) exceeds 500
+
+    assert not second.accepted and (second.reason or "").startswith(SIZE_BELOW_ONE_LOT)
+    assert "500" in (second.reason or "") and second.sized_quantity is None
+    assert (len(risk.events), dict(results.results)) == before  # no audit row, no stored result
+    assert ("main", "k1") not in results.results
+
+
 async def test_a_size_that_cannot_be_measured_is_refused_not_raised() -> None:
     """A stop a hair from the entry against a huge budget makes a quotient of more than 28 digits,
     which Decimal cannot hold. The answer is a refusal: a command that raised would be left

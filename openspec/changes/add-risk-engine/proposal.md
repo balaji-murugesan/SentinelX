@@ -38,12 +38,10 @@ Out of scope:
 - `order-rate-limiter`: client-side token buckets with exit priority and a hard ceiling.
 
 ### Modified Capabilities
-None can be written yet. The `orders`, `order-commands` and `trading-state` specs exist only inside the unarchived `add-order-position-core` change (its task 9.2, the market-hours smoke test, is still open), so `openspec/specs/` has nothing to modify. Once that change is archived, this change adds `MODIFIED` deltas for:
-- `orders`: "Mandatory pre-trade gate" (the paper-only stub sentence is replaced by the real gate), the order-type list (adds `STOP_MARKET`), and the exit-while-degraded rule;
-- `order-commands`: the new commands and fields;
-- `trading-state`: persistence-outage and recovery-halt wording for exits.
-
-This is task 1.1 and must be done before this change is archived.
+Three existing specs gain `MODIFIED` deltas, 15 requirements in all, each copied whole from `openspec/specs/` and changed where this change changes behaviour (task 12.1):
+- `orders` (4): "Order content" (the order-type list adds `STOP_MARKET`; trigger price and initial stop), "Validation against instrument facts" (the trigger price is on the tick grid), "Delivery sell only against holdings" (the catastrophic stop is not counted as shares being sold) and "Mandatory pre-trade gate" (the paper-only stub sentence is replaced by the real gate, and a degraded state alone does not refuse an exit);
+- `order-commands` (4): "Commands through the Redis command stream" (the kill, limit-edit and sizing commands, a trigger price only on a stop-market, reserved sources), "Idempotency key on every command" and "Commands survive a busy or restarting engine" (a size command stores no result), and "Developer CLI uses the command stream";
+- `trading-state` (7): "Durable trading records", "Fail closed when persistence is unavailable", "Restart recovery", "Persisted recovery halt" and "Recovery completes before trading" (an exit is not refused for a degraded state alone, and may be sent before it is stored), "Halt is visible" (the day-lock banner) and "State snapshot in Redis" (the risk block).
 
 ## Impact
 
