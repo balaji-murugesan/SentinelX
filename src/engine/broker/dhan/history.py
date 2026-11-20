@@ -8,9 +8,13 @@ Findings from the owner's recorded responses (task 4.1, 2026-10-28 10:54 IST, ID
 NSE_FNO:53720 over 3 days; fixtures tests/fixtures/dhan/history_*.json):
 
 - ``timestamp`` is a true UTC epoch (seconds, sent as a float): read as UTC the first row is
-  09:15:00 IST. This differs from the live feed's LTT, which is an IST epoch.
+  09:15:00 IST. The live feed's LTT was an IST epoch through 2026-11-19 and a true UTC epoch
+  from 2026-11-20 (see ``packets.LTT_IS_IST_EPOCH``), so the two may differ by 5h30m.
 - The still-forming minute is included (last row 10:54:00 at 10:54:02), so rows at or after
   the last completed minute boundary are discarded.
+- ``fromDate`` is exclusive: asked from 09:24:00, the first bar is 09:25:00; asked from 09:23:00
+  it is 09:24:00 (owner's probe, 2026-11-19, NSE_FNO:42722). ``DhanHistory.minutes`` therefore
+  asks one minute early, or the first requested minute silently goes missing.
 - No zero-volume rows. Index rows do carry a volume (millions), unlike live index ticks, so it
   is set to 0 here to keep history and live index candles identical (spec "Index candle").
 - The option returned 870 rows to the index's 850 (= 375 + 375 + 100 session minutes): about
@@ -24,7 +28,7 @@ NSE_FNO:53720 over 3 days; fixtures tests/fixtures/dhan/history_*.json):
 import asyncio
 import time
 from collections.abc import Callable, Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import httpx
@@ -40,6 +44,7 @@ log = structlog.get_logger("engine.broker.dhan.history")
 
 INTRADAY_PATH = "/charts/intraday"
 TIMEOUT = httpx.Timeout(15.0)
+ONE_MINUTE = timedelta(minutes=1)
 # Dhan error codes for an invalid token (DH-901), no access to the API or data plan (DH-902)
 # and account problems (DH-903). DH-904 is rate limiting: retryable, so not listed here.
 AUTH_ERROR_CODES = frozenset({"DH-901", "DH-902", "DH-903"})
@@ -158,8 +163,8 @@ def parse_intraday(
 
 
 def history_time_to_utc(epoch: float) -> datetime:
-    """Intraday-chart timestamp -> aware UTC datetime. A true UTC epoch (task 4.1), unlike
-    the live feed's LTT; kept in one function like ``ltt_to_utc``."""
+    """Intraday-chart timestamp -> aware UTC datetime. A true UTC epoch (task 4.1); kept in one
+    function like ``ltt_to_utc``, because the live feed's LTT convention has differed."""
     return datetime.fromtimestamp(epoch, UTC)
 
 
@@ -235,7 +240,9 @@ class DhanHistory:
                 self._api_base,
                 self._token,
                 self._client_id,
-                intraday_body(key, instrument_type, start, before),
+                # One minute early: Dhan's fromDate is exclusive (module docstring). The filter
+                # below drops the extra bar, so callers still get rows from ``start`` on.
+                intraday_body(key, instrument_type, start - ONE_MINUTE, before),
             )
         except HistoryError as exc:
             if exc.auth:
