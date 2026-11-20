@@ -210,6 +210,29 @@ async def test_the_floor_replay_uses_the_engine_figures() -> None:
     assert not result.accepted and "lower today's floor" in (result.reason or "")
 
 
+async def test_a_market_hours_edit_waits_for_the_engine_figures_instead_of_guessing_them() -> None:
+    """Figures of None mean today's state is not loaded: the floor cannot be replayed, so the edit
+    is refused as unavailable (never judged against zeros) and is not remembered, so the same key
+    may be sent again. The first set and an edit outside market hours need no figures."""
+    figures: list[tuple[Decimal, Decimal | None] | None] = [None]
+    clock = Clock(AFTER_CLOSE)
+    limits = LimitsService(
+        account_id="main", repository=MemoryRiskRepository(), results=MemoryRepository(),
+        figures=lambda: figures[0], now=clock,
+    )  # fmt: skip
+    assert (await limits.set_limits(command(BASE, key="first"))).accepted
+    assert (await limits.set_limits(command(edit(per_trade_max_risk="1500"), key="loose"))).accepted
+    clock.at = MID_DAY
+
+    early = await limits.set_limits(command(edit(per_trade_max_risk="500"), key="tighter"))
+    figures[0] = (D(0), None)
+    later = await limits.set_limits(command(edit(per_trade_max_risk="500"), key="tighter"))
+
+    assert not early.accepted and (early.reason or "").startswith("RISK_STATE_UNAVAILABLE")
+    assert later.accepted
+    assert limits.current is not None and limits.current.per_trade_max_risk == D(500)
+
+
 # ---- audit ----------------------------------------------------------------------------------
 
 

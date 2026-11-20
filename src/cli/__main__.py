@@ -12,10 +12,18 @@ Commands so far:
   instruments search T   Search the instrument master (today's cached file, else a download).
   feed watch KEY...      Print ticks and feed status for KEYs (e.g. IDX_I:13) until Ctrl+C,
                          from FEED_SOURCE (dhan or simulated).
-  order place KEY SIDE QTY --product P [--limit PRICE]
+  order place KEY SIDE QTY --product P [--limit PRICE] [--stop PRICE]
                          Send a place-order command to the engine and print its reply
-                         (run inside the engine container; see cli/orders.py).
+                         (run inside the engine container; see cli/orders.py). An entry needs
+                         --stop, the price where the trade is wrong.
   order cancel ORDER_ID  Ask the engine to cancel an open order.
+  kill --yes             Stop trading for the day: cancel pending entries and exit every
+                         position. No intraday undo; --yes is the confirmation.
+  risk set-limits --file PATH
+                         Send the risk limits in a JSON file (see docs/risk-limits.example.json).
+  risk size KEY SIDE --entry P --stop P
+                         Ask the engine how many units fit the per-trade risk limit.
+  risk status            Show today's risk figures from the engine's snapshot.
   orders / positions     Show open orders / positions from the engine's Redis snapshot
                          (a HALTED block lists why new orders are refused, if they are).
   recovery resume        After reviewing a HALTED state and fixing its cause, ask the engine to
@@ -103,8 +111,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--product", type=str.upper, choices=[p.value for p in ProductType], required=True
     )
     place.add_argument("--limit", type=Decimal, metavar="PRICE", help="limit price")
+    place.add_argument(
+        "--stop", type=Decimal, metavar="PRICE", help="initial stop: where the trade is wrong"
+    )
     cancel = order.add_parser("cancel", help="cancel an open order")
     cancel.add_argument("order_id", metavar="ORDER_ID")
+    kill = groups.add_parser(
+        "kill", help="stop trading for the day: cancel entries and exit every position"
+    )
+    kill.add_argument(
+        "--yes", action="store_true", help="confirm: there is no intraday undo (required)"
+    )
+    risk = groups.add_parser("risk", help="risk limits and figures").add_subparsers(
+        dest="command", required=True
+    )
+    set_limits = risk.add_parser("set-limits", help="send the risk limits in a JSON file")
+    set_limits.add_argument("--file", type=Path, required=True, metavar="PATH")
+    size = risk.add_parser("size", help="how many units fit the per-trade risk limit")
+    size.add_argument("key", type=InstrumentKey.parse, metavar="KEY")
+    size.add_argument("side", type=str.upper, choices=[s.value for s in OrderSide])
+    size.add_argument("--entry", type=Decimal, required=True, metavar="PRICE")
+    size.add_argument("--stop", type=Decimal, required=True, metavar="PRICE")
+    risk.add_parser("status", help="today's risk figures from the engine snapshot")
     recovery = groups.add_parser(
         "recovery", help="clear a HALTED state after review"
     ).add_subparsers(dest="command", required=True)
@@ -113,6 +141,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     groups.add_parser("positions", help="positions and P&L from the engine snapshot")
     args = parser.parse_args(argv)
 
+    if args.group == "kill" and not args.yes:
+        # Checked before anything is loaded or sent: a kill cannot be undone today.
+        print(
+            "Not sent: `kill` cancels pending entries, exits every position and refuses entries "
+            "until the next trading day, with no way to undo it. Run it again with --yes.",
+            file=sys.stderr,
+        )
+        return 1
     try:
         if args.group == "dhan":
             credentials = load_settings(DhanCredentials)
@@ -126,7 +162,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         # asyncio.run is the sync -> async entry point (like `await` at the top of Main): it
         # creates the event loop, runs the coroutine to completion and closes the loop.
-        if args.group in ("order", "orders", "positions", "recovery"):
+        if args.group in ("order", "orders", "positions", "recovery", "kill", "risk"):
             return asyncio.run(_order_command(settings, args))
         if args.group == "dhan" and args.command == "history":
             return asyncio.run(dhan_history(settings, credentials, args.key, args.days, args.save))
@@ -156,6 +192,12 @@ async def _order_command(settings: EngineSettings, args: argparse.Namespace) -> 
         return await order_cli.run_with_redis(
             url, None, lambda r: order_cli.resume_recovery(r, account_id=account, out=_print_now)
         )
+    if args.group == "kill":
+        return await order_cli.run_with_redis(
+            url, None, lambda r: order_cli.kill(r, account_id=account, out=_print_now)
+        )
+    if args.group == "risk":
+        return await _risk_command(url, account, args)
     if args.command == "cancel":
         return await order_cli.run_with_redis(
             url,
@@ -170,8 +212,30 @@ async def _order_command(settings: EngineSettings, args: argparse.Namespace) -> 
         lambda r: order_cli.place_order(
             r, account_id=account, key=args.key, side=OrderSide(args.side), quantity=args.quantity,
             product=ProductType(args.product), limit_price=args.limit, out=_print_now,
+            initial_stop=args.stop,
         ),
     )  # fmt: skip
+
+
+async def _risk_command(url: str, account: str, args: argparse.Namespace) -> int:
+    if args.command == "set-limits":
+        return await order_cli.run_with_redis(
+            url,
+            None,
+            lambda r: order_cli.set_limits(r, account_id=account, path=args.file, out=_print_now),
+        )
+    if args.command == "size":
+        return await order_cli.run_with_redis(
+            url,
+            None,
+            lambda r: order_cli.size_order(
+                r, account_id=account, key=args.key, side=OrderSide(args.side),
+                entry_price=args.entry, initial_stop=args.stop, out=_print_now,
+            ),
+        )  # fmt: skip
+    return await order_cli.run_with_redis(
+        url, None, lambda r: order_cli.show_risk(r, account_id=account, out=_print_now)
+    )
 
 
 async def dhan_profile(

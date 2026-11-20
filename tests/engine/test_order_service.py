@@ -26,12 +26,12 @@ from engine.market_data.bus import TickBus
 from engine.market_data.instruments import InstrumentMaster
 from engine.market_data.provider import Subscriptions, Tick
 from engine.market_data.simulated import SimulatedFeed
-from engine.orders.gate import LIVE_NOT_READY, PaperOnlyGate, RiskGate
+from engine.orders.gate import RiskGate
 from engine.orders.service import OrderService
 from engine.persistence.repository import PersistenceError
 from engine.positions.book import position_id
 from engine.positions.feed import PositionFeed
-from tests.engine.trading_fakes import MemoryRepository
+from tests.engine.trading_fakes import MemoryRepository, PermissiveGate
 
 NOW = datetime(2026, 10, 29, 4, 30, tzinfo=UTC)
 OPTION = InstrumentKey.parse("NSE_FNO:53720")
@@ -127,7 +127,7 @@ def build(
     if exporter:
         provider.add_span_processor(SimpleSpanProcessor(exporter))
     service = OrderService(
-        account_id="main", paper=mode is TradingMode.PAPER, gate=gate or PaperOnlyGate(mode),
+        account_id="main", paper=mode is TradingMode.PAPER, gate=gate or PermissiveGate(),
         adapter=adapter, repository=repository, instruments=master(), position_feed=position_feed(),
         tracer=provider.get_tracer("test"), ack_timeout_s=timeout_s, now=now,
         retry_min_s=retry_min_s,
@@ -182,14 +182,33 @@ async def test_validation_failure_creates_no_order_and_is_remembered() -> None:
 
 
 async def test_live_mode_gate_rejection_is_final_and_never_reaches_the_broker() -> None:
-    service, adapter, repo = build(mode=TradingMode.LIVE)
+    """The REAL gate in live mode (add-risk-engine task 11.1): live orders are refused until a
+    live broker exists, the refusal is a final Rejected order, and nothing reaches the broker."""
+    from engine.risk.audit import RiskAudit
+    from engine.risk.checks.registry import default_checks
+    from engine.risk.gate import RiskEngine
+    from engine.risk.limits_service import LimitsService
+    from tests.engine.risk_builders import day_state, instrument_of
+    from tests.engine.risk_fakes import MemoryRiskRepository, StubState
+
+    risk_repo = MemoryRiskRepository()
+    gate = RiskEngine(
+        account_id="main", mode=TradingMode.LIVE, state=StubState(day_state()),
+        limits=LimitsService(
+            account_id="main", repository=risk_repo, results=MemoryRepository(),
+            figures=lambda: (Decimal(0), None),
+        ),
+        audit=RiskAudit(risk_repo), instruments=instrument_of, checks=default_checks(),
+    )  # fmt: skip
+    service, adapter, repo = build(mode=TradingMode.LIVE, gate=gate)
 
     result = await service.place(command())
 
-    assert not result.accepted and result.reason == LIVE_NOT_READY
+    assert not result.accepted and (result.reason or "").startswith("RISK_LIVE_NOT_ENABLED")
     assert adapter.placed == []  # zero broker calls
     stored = repo.orders[result.order_id or ""]
-    assert stored.state is OrderState.REJECTED and stored.reason == LIVE_NOT_READY
+    assert stored.state is OrderState.REJECTED
+    assert (stored.reason or "").startswith("RISK_LIVE_NOT_ENABLED")
 
 
 def test_service_cannot_be_built_without_a_gate() -> None:

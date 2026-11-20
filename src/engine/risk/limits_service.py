@@ -77,12 +77,14 @@ class LimitsService:
         account_id: str,
         repository: RiskRepository,
         results: TradingRepository,
-        figures: Callable[[], tuple[Decimal, Decimal | None]],
+        figures: Callable[[], tuple[Decimal, Decimal | None] | None],
         now: Callable[[], datetime] = utc_now,
     ) -> None:
         """``figures`` returns today's ``(peak, floor)`` from the engine's own state (floor None
-        until there is one). It has no default on purpose: the floor re-simulation of an edit must
-        use the real figures, and a forgotten argument would silently use zero."""
+        until there is one), or None while that state is not available (the day is not loaded).
+        It has no default on purpose: the floor re-simulation of an edit must use the real
+        figures, and a forgotten argument would silently use zero. A market-hours edit is refused
+        while the figures are None, never judged against made-up ones."""
         self._account_id = account_id
         self._repo = repository
         self._results = results
@@ -196,7 +198,19 @@ class LimitsService:
                         old_values, started,
                     )  # fmt: skip
 
-        peak, floor = self._figures()
+        peak, floor = Decimal(0), None  # unused: ``validate_edit`` replays the floor only below
+        if old is not None and is_market_hours(at):
+            figures = self._figures()
+            if figures is None:
+                # The tighten-only floor re-simulation needs today's real peak and floor, and the
+                # day is not loaded yet (the engine is still starting). Not a verdict, so it is not
+                # remembered: the same key may be sent again.
+                return await self._refused(
+                    command, STATE_UNAVAILABLE,
+                    ["today's risk state is not loaded yet, so the floor cannot be re-simulated"],
+                    old_values, started,
+                )  # fmt: skip
+            peak, floor = figures
         try:
             new = validate_edit(old, command.limits, now=at, peak=peak, floor=floor)
         except EditRejected as rejected:

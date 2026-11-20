@@ -3,6 +3,9 @@ Postgres. Scenarios: a paper order through the command stream, a snapshot-writer
 orders and the heartbeat running, a HALTED start that is shown and cleared only by resume,
 state surviving a restart on Postgres, and an engine that stays up with Postgres unreachable.
 
+Since add-risk-engine every order passes the real risk gate, so these tests set limits first and
+send entries with an initial stop (``tests.integration.risk_setup``).
+
 Needs TEST_REDIS_URL (database 15); the Postgres tests also need TEST_DATABASE_URL. Skipped
 loudly without them locally, never in CI.
 """
@@ -29,9 +32,16 @@ from engine.market_data.service import MarketDataService
 from engine.orders.snapshot import SnapshotWriter
 from engine.persistence.postgres import PostgresRepository
 from engine.persistence.repository import RecoveryHalt, TradingRepository
+from tests.engine.risk_fakes import MemoryRiskRepository
 from tests.engine.test_order_service import NOW, command, master
 from tests.engine.test_trading_repository import prepare_database
 from tests.engine.trading_fakes import MemoryRepository
+from tests.integration.risk_setup import (
+    place_when_ready,
+    send_kill,
+    send_limits,
+    with_stop,
+)
 from tests.integration.test_command_stream import reply_for
 
 TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL")
@@ -69,6 +79,9 @@ def settings_for(
     monkeypatch.setenv("ENGINE_HEARTBEAT_PATH", str(heartbeat))
     monkeypatch.setenv("FEED_SOURCE", "simulated")
     monkeypatch.setenv("SNAPSHOT_INTERVAL_S", "0.05")
+    # A price for the test option, so the gate has a quote to judge an entry by.
+    monkeypatch.setenv("FEED_INSTRUMENTS", "NSE_FNO:53720")
+    monkeypatch.setenv("SIM_INTERVAL_S", "0.05")
     return load_settings(EngineSettings)
 
 
@@ -135,11 +148,23 @@ async def test_paper_order_goes_through_the_command_stream(
 ) -> None:
     repo = MemoryRepository()
     engine = Engine(
-        settings_for(monkeypatch, tmp_path / "hb", "postgresql+asyncpg://u:p@h/x"), redis, repo
+        settings_for(monkeypatch, tmp_path / "hb", "postgresql+asyncpg://u:p@h/x"),
+        redis,
+        repo,
+        risk_repository=MemoryRiskRepository(),
     )
     try:
-        reply = await send(redis, command("k1", limit="100"))
+        assert (await send_limits(redis)).accepted
+        # A resting buy well below the simulated price (it starts at 100), so it stays open.
+        _, reply = await place_when_ready(redis, lambda k: with_stop(command(k, limit="95"), "85"))
         await eventually(lambda: snapshot_shows(redis, lambda s: len(s.open_orders) == 1))
+        # The snapshot carries the engine's risk figures: one entry counted, nothing halted.
+        await eventually(
+            lambda: snapshot_shows(
+                redis, lambda s: s.risk is not None and s.risk.entries_today == 1
+            )
+        )
+        snapshot = await cli.read_snapshot(redis, "main")
         assert is_healthy(tmp_path / "hb")
     finally:
         await engine.shutdown()
@@ -147,6 +172,8 @@ async def test_paper_order_goes_through_the_command_stream(
     assert reply.accepted and reply.order_id
     assert repo.orders[reply.order_id].state is OrderState.OPEN
     assert repo.orders[reply.order_id].paper
+    assert snapshot is not None and snapshot.risk is not None
+    assert snapshot.risk.halt_level == 0 and snapshot.risk.floor == -10000000
 
 
 async def test_snapshot_writer_crash_leaves_orders_and_heartbeat_running(
@@ -164,11 +191,13 @@ async def test_snapshot_writer_crash_leaves_orders_and_heartbeat_running(
         settings_for(monkeypatch, tmp_path / "hb", "postgresql+asyncpg://u:p@h/x"),
         redis,
         repo,
+        risk_repository=MemoryRiskRepository(),
         snapshot_restart_s=0.05,
     )
     try:
         await eventually(lambda: _at_least(crashes, 2))  # crashed, restarted, crashed again
-        reply = await send(redis, command("k1", limit="100"))
+        assert (await send_limits(redis)).accepted
+        _, reply = await place_when_ready(redis, lambda k: with_stop(command(k, limit="95"), "85"))
         assert is_healthy(tmp_path / "hb")
         assert not engine.task.done()
     finally:
@@ -187,7 +216,10 @@ async def test_halted_start_is_shown_and_only_resume_clears_it(
     repo = MemoryRepository()
     repo.halts["main"] = RecoveryHalt(("seeded difference for the test",), NOW)
     engine = Engine(
-        settings_for(monkeypatch, tmp_path / "hb", "postgresql+asyncpg://u:p@h/x"), redis, repo
+        settings_for(monkeypatch, tmp_path / "hb", "postgresql+asyncpg://u:p@h/x"),
+        redis,
+        repo,
+        risk_repository=MemoryRiskRepository(),
     )
     with capture_logs() as logs:
         try:
@@ -196,7 +228,10 @@ async def test_halted_start_is_shown_and_only_resume_clears_it(
             snapshot = await cli.read_snapshot(redis, "main")
             lines: list[str] = []
             code = await cli.resume_recovery(redis, account_id="main", out=lines.append)
-            accepted = await send(redis, command("k2", limit="100"))
+            assert (await send_limits(redis)).accepted
+            _, accepted = await place_when_ready(
+                redis, lambda k: with_stop(command(k, limit="95"), "85")
+            )
         finally:
             await engine.shutdown()
 
@@ -219,7 +254,10 @@ async def test_run_on_real_postgres_keeps_state_across_a_restart(
 
     first = Engine(settings, redis, None)  # no injected repository: Postgres from DATABASE_URL
     try:
-        placed = await send(redis, command("k1", limit="100"))
+        assert (await send_limits(redis)).accepted  # stored in Postgres: the restart finds them
+        key, placed = await place_when_ready(
+            redis, lambda k: with_stop(command(k, limit="95"), "85")
+        )
     finally:
         await first.shutdown()
     assert placed.accepted and placed.order_id
@@ -235,7 +273,8 @@ async def test_run_on_real_postgres_keeps_state_across_a_restart(
     second = Engine(settings, redis, None)
     try:
         again = await send(
-            redis, command("k1", limit="100").model_copy(update={"command_id": "c-again"})
+            redis,
+            with_stop(command(key, limit="95"), "85").model_copy(update={"command_id": "c-again"}),
         )
         await eventually(
             lambda: snapshot_shows(
@@ -259,8 +298,12 @@ async def test_engine_stays_up_and_refuses_orders_while_postgres_is_unreachable(
     engine = Engine(settings, redis, None)
     try:
         reply = await send(redis, command("k1", limit="100"), wait_s=20)
+        # The kill must not wait for the database (safety rule 8: it needs only Redis and the
+        # engine): it is accepted and answered even though nothing can be stored.
+        killed = await send_kill(redis, wait_s=30)
         assert is_healthy(tmp_path / "hb") and not engine.task.done()
     finally:
         await engine.shutdown()
 
     assert not reply.accepted and "cannot be saved" in (reply.reason or "")
+    assert killed.accepted

@@ -150,6 +150,25 @@ it compares the live candles with a fresh history fetch:
 uv run --env-file .env python -m cli candles watch IDX_I:13 --tf 5
 ```
 
+## Setting risk limits
+
+Every order passes the risk engine, and a fresh install has **no limits**, so it refuses every entry (an exit is never refused by an entry limit; price sanity and the gate still apply) until you set some. There are no defaults on purpose: the numbers are yours to decide from your own backtests.
+
+```bash
+# The engine image has no docs/ folder and Redis is not published to the host, so copy your
+# limits file into the container, then send it from there:
+cp docs/risk-limits.example.json my-limits.json             # then edit my-limits.json
+docker compose cp my-limits.json engine:/tmp/limits.json
+docker compose exec engine python -m cli risk set-limits --file /tmp/limits.json
+docker compose exec engine python -m cli risk status        # today's P&L, floor, halt, entries
+docker compose exec engine python -m cli risk size NSE_FNO:53720 BUY --entry 100 --stop 90
+```
+
+- [`docs/risk-limits.example.json`](docs/risk-limits.example.json) is a complete file with **example values, not a recommendation**. Copy it and edit your copy. Money and percentages are strings (`"3000"`), counts and seconds are numbers, and keys starting with `_` are comments.
+- **While the market is open (09:15-15:30 IST) an edit may only tighten** (a lower loss limit, an earlier cut-off, fewer trades); loosening is refused with `TIGHTEN_ONLY`, and the answer names the keys. Outside market hours any valid edit is accepted. An edit is applied whole or not at all.
+- An entry needs `--stop PRICE` (where the trade is wrong): the engine sizes the risk from it and places a wide catastrophic stop at the broker once the entry fills.
+- **`kill --yes`** cancels pending entries and exits every position, and refuses entries until the next trading day. There is no intraday undo, and `recovery resume` does not clear it.
+
 ## Each morning: fresh Dhan token
 
 Dhan access tokens last about 24 hours and the engine never creates or renews them.
@@ -187,7 +206,7 @@ scripts/          smoke_test.py      docker-compose.yml, alembic.ini at the root
 ## Development workflow
 
 1. Pick the next stage in `PRD.md` §11.
-2. `/opsx:propose <change-id>` → review → `openspec validate <change-id> --strict` → approve.
+2. `/openspec-propose <change-id>` → review → `openspec validate <change-id> --strict` → approve.
 3. Implement; keep `tasks.md` checkboxes current.
 4. All checks green → merge → `openspec archive <change-id> --yes`.
 5. If a design decision changes, add a superseding entry to `docs/DECISIONS.md`.
@@ -195,6 +214,7 @@ scripts/          smoke_test.py      docker-compose.yml, alembic.ini at the root
 ## Emergency
 
 - **Dashboard:** hold the kill switch for 1 second.
+- **CLI:** `docker compose exec engine python -m cli kill --yes` (needs only Redis and the engine, not the API or the dashboard). The engine also kills by itself when the day's loss reaches the equity floor.
 - **Dashboard down:** send `/kill` to the Telegram bot (Stage 7+).
 - **Engine down:** use Dhan's own kill switch at web.dhan.co; static catastrophic SLs remain at the exchange. From Stage 7, Dhan's P&L-based exit is armed every morning as a wider backstop.
 - **Positions won't flatten:** the engine escalates to Dhan's Exit All on its own (Stage 7+). Manually, use Exit All in the Dhan app; it also cancels the catastrophic SLs.

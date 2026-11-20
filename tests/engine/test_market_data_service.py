@@ -24,6 +24,7 @@ from engine.main import run
 from engine.market_data.bus import Subscription
 from engine.market_data.provider import FeedState, Tick
 from engine.market_data.service import MarketDataService
+from tests.engine.risk_fakes import MemoryRiskRepository
 from tests.engine.test_run import DownRedis
 from tests.engine.trading_fakes import MemoryRepository
 
@@ -79,6 +80,7 @@ def start(
             stop=stop,
             market_data=service,
             repository=MemoryRepository(),
+            risk_repository=MemoryRiskRepository(),
         )
     )
     return engine, stop

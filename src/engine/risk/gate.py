@@ -1,6 +1,7 @@
 """The real ``RiskGate``: every order passes through ``RiskEngine.check`` before it can reach the
 broker (add-risk-engine task 5.3; risk-gate spec; design §2, §3). It replaces the Stage 2 stub
-(``PaperOnlyGate``) behind the same ``RiskGate`` Protocol, so no call site changed.
+(a paper-only gate, since deleted) behind the same ``RiskGate`` Protocol, so no call
+site changed.
 
 What it decides, in order:
 

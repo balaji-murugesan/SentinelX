@@ -11,6 +11,15 @@ from contracts.orders import Fill, Order, Position
 from engine.persistence.repository import LoadedState, PersistenceError, RecoveryHalt
 
 
+class PermissiveGate:
+    """A ``RiskGate`` that lets every order through, for tests that are not about risk (the S2
+    order, recovery and snapshot tests). It exists only here: the engine has no way to build an
+    order service with a gate that checks nothing. The real gate has its own tests."""
+
+    async def check(self, order: Order) -> str | None:
+        return None
+
+
 class MemoryRepository:
     def __init__(self) -> None:
         self.orders: dict[str, Order] = {}
