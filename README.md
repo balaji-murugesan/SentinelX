@@ -18,7 +18,7 @@ What each stage builds and its acceptance criteria: [`PRD.md` §11](PRD.md#11-de
 |---|---|---|---|
 | S0 | Foundation | `add-foundation` | ✅ Done (archived 2026-10-25) |
 | S1 | Market data | `add-market-data`, `add-candles` | ✅ Done (`add-market-data` archived 2026-10-28, `add-candles` archived 2026-11-20) |
-| S2 | Orders & positions | `add-order-position-core`, `add-dhan-readonly` | 🟡 `add-order-position-core` 24/27 tasks (engine wiring done); `add-dhan-readonly` after |
+| S2 | Orders & positions | `add-order-position-core`, `add-dhan-readonly` | 🟡 `add-order-position-core` ✅ (archived 2026-11-20); `add-dhan-readonly` after |
 | S3 | Risk engine | `add-risk-engine`, `add-risk-guards` | ⬜ |
 | S4 | Trailing SL & exits | `add-trailing-exits` | ⬜ |
 | S5 | API bridge | `add-api-bridge` | ⬜ |
