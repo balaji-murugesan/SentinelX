@@ -37,7 +37,7 @@ TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 IN_CI = os.environ.get("CI") == "true"
 TABLES = (
     "order_events", "fills", "positions", "command_results", "recovery_state",
-    "risk_event", "risk_day_state", "risk_limits", "orders",
+    "risk_event", "risk_day_state", "risk_limits", "risk_ban_list", "orders",
 )  # fmt: skip
 
 NOW = datetime(2026, 10, 29, 4, 0, tzinfo=UTC)

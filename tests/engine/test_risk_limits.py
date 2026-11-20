@@ -153,6 +153,15 @@ def test_a_float_is_refused_because_money_never_travels_as_one() -> None:
         parse_limits(raw)
 
 
+@pytest.mark.parametrize("key", ["daily_max_loss", "max_trades_per_day", "entry_cutoff"])
+def test_a_list_value_is_refused_for_an_amount_a_count_and_a_time(key: str) -> None:
+    """An INR, a COUNT and a TIME_OF_DAY key: a one-item list is not its value."""
+    raw: dict[str, LimitValue] = {**BASE, key: ["3000"]}  # type: ignore[dict-item]
+
+    with pytest.raises(InvalidLimits, match=key):
+        parse_limits(raw)
+
+
 @pytest.mark.parametrize("amount", ["1E-999999999", "0.0000001", "1E+13"])
 def test_an_amount_with_an_absurd_exponent_is_refused_without_being_expanded(amount: str) -> None:
     with pytest.raises(InvalidLimits, match="per_trade_max_risk"):

@@ -87,20 +87,60 @@ def test_a_snapshot_from_before_the_risk_engine_with_orders_and_positions_still_
 
 
 def test_halt_level_numbers_are_a_stored_contract() -> None:
-    """The values are persisted with GREATEST (task 2.3), so they must not change. 20 stays free
-    for add-risk-guards' profit-target halt, ranked between MTM_BLIND and KILL."""
+    """The values are persisted with GREATEST (task 2.3), so they must not change. add-risk-guards
+    put the profit-target halt at 20, ranked between MTM_BLIND and KILL."""
     numbers = {level.name: int(level) for level in HaltLevel}
-    assert numbers == {"NONE": 0, "MTM_BLIND": 10, "KILL": 30}
-    assert 10 < 20 < 30
-    for level, number in ((HaltLevel.NONE, 0), (HaltLevel.MTM_BLIND, 10), (HaltLevel.KILL, 30)):
-        assert RiskStatus(halt_level=level).model_dump(mode="json")["halt_level"] == number
+    assert numbers == {"NONE": 0, "MTM_BLIND": 10, "TARGET_HALT": 20, "KILL": 30}
+    for level, number in numbers.items():
+        status = RiskStatus(halt_level=HaltLevel[level])
+        assert status.model_dump(mode="json")["halt_level"] == number
 
 
 def test_halt_level_ranks_by_severity_and_refuses_unknown_numbers() -> None:
     assert max(HaltLevel.NONE, HaltLevel.KILL, HaltLevel.MTM_BLIND) is HaltLevel.KILL
-    for unknown in (7, 20, 2):  # 20 is reserved, not yet a level
+    assert HaltLevel.MTM_BLIND < HaltLevel.TARGET_HALT < HaltLevel.KILL
+    assert max(HaltLevel.TARGET_HALT, HaltLevel.MTM_BLIND) is HaltLevel.TARGET_HALT
+    for unknown in (7, 25, 2):
         with pytest.raises(ValidationError):
             RiskStatus(halt_level=unknown)  # type: ignore[arg-type]
+
+
+# ---- add-risk-guards task 2.1: the new risk-block fields --------------------------------------
+
+
+def test_the_new_risk_fields_round_trip() -> None:
+    risk = RiskStatus(
+        halt_level=HaltLevel.TARGET_HALT,
+        halt_reason="RISK_TARGET_HALT",
+        entry_lots_today=7,
+        ban_list_loaded=True,
+        broker_rejections_5m=2,
+    )
+    again = Snapshot.model_validate_json(snapshot(risk=risk).model_dump_json())
+    assert again.risk == risk
+    assert again.risk is not None and again.risk.halt_level is HaltLevel.TARGET_HALT
+    assert RiskStatus().model_dump(mode="json")["halt_level"] == 0
+
+
+def test_the_new_risk_fields_default_safely() -> None:
+    """``ban_list_loaded`` defaults to False: an unknown list reads as missing, never loaded."""
+    risk = RiskStatus()
+    assert risk.entry_lots_today == 0 and risk.broker_rejections_5m == 0
+    assert risk.ban_list_loaded is False
+
+
+def test_a_risk_block_from_before_add_risk_guards_still_parses() -> None:
+    old = (
+        '{"schema_version":1,"account_id":"main","taken_at":"2026-11-16T05:30:00Z",'
+        '"open_orders":[],"positions":[],"halted":false,"halt_differences":[],'
+        '"risk":{"mtm_day":"-510.00","floor":"-3000","peak":"1200.50","halt_level":10,'
+        '"halt_reason":"mtm blind","entries_today":4,"loss_streak":2,"cooldown_until":null,'
+        '"unprotected":[]}}'
+    )
+    parsed = Snapshot.model_validate_json(old)
+    assert parsed.risk is not None and parsed.risk.halt_level is HaltLevel.MTM_BLIND
+    assert parsed.risk.entry_lots_today == 0 and parsed.risk.ban_list_loaded is False
+    assert parsed.risk.broker_rejections_5m == 0
 
 
 def test_unknown_risk_fields_are_refused() -> None:

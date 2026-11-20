@@ -14,7 +14,7 @@ from contracts.market import InstrumentKey
 from contracts.orders import Order, Position
 from engine.positions.book import PositionId
 from engine.risk.decision import Decision, Quote
-from engine.risk.repository import RiskEvent, StoredLimits
+from engine.risk.repository import RiskEvent, StoredBanList, StoredLimits
 from engine.risk.state import DayState, merge_day_state
 
 
@@ -23,6 +23,7 @@ class MemoryRiskRepository:
         self.limits: dict[str, StoredLimits] = {}
         self.days: dict[tuple[str, date], DayState] = {}
         self.events: list[RiskEvent] = []
+        self.ban_lists: dict[tuple[str, date], StoredBanList] = {}
 
     async def load_limits(self, account_id: str) -> StoredLimits | None:
         return self.limits.get(account_id)
@@ -46,6 +47,23 @@ class MemoryRiskRepository:
 
     async def append_event(self, event: RiskEvent) -> None:
         self.events.append(event)
+
+    async def load_ban_list(self, account_id: str, from_date: date) -> list[StoredBanList]:
+        return sorted(
+            (
+                stored
+                for (account, trade_date), stored in self.ban_lists.items()
+                if account == account_id and trade_date >= from_date
+            ),
+            key=lambda stored: stored.trade_date,
+        )
+
+    async def save_ban_list(
+        self, account_id: str, trade_date: date, symbols: frozenset[str], at: datetime
+    ) -> StoredBanList:
+        stored = StoredBanList(trade_date, frozenset(symbols), at)
+        self.ban_lists[(account_id, trade_date)] = stored
+        return stored
 
 
 class StubState:

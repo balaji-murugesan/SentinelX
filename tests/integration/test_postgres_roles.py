@@ -316,10 +316,10 @@ def run_migrate(monkeypatch: pytest.MonkeyPatch, db: Db) -> None:
     migrate.main()
 
 
-HEAD = "0004"  # newest migration; bump with each new one
+HEAD = "0005"  # newest migration; bump with each new one
 TRADING_TABLES = {
     "orders", "order_events", "fills", "positions", "command_results", "recovery_state",
-    "risk_limits", "risk_day_state", "risk_event",
+    "risk_limits", "risk_day_state", "risk_event", "risk_ban_list",
 }  # fmt: skip
 
 
@@ -332,7 +332,7 @@ def test_migrations_create_trading_tables_the_engine_role_can_use(
     version = as_migrate(db, "SELECT version_num FROM migrations.alembic_version")
     assert [r["version_num"] for r in version] == [HEAD]
     tables = as_migrate(db, "SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
-    assert {r["tablename"] for r in tables} == TRADING_TABLES  # Stages 2 and 3 (0002, 0003, 0004)
+    assert {r["tablename"] for r in tables} == TRADING_TABLES  # Stages 2 and 3 (0002 to 0005)
     # The real engine role (init.sql default privileges) reads and writes them.
     as_engine(db, "INSERT INTO command_results VALUES ('main', 'k', 'c', false, NULL, 'x', now())")
     assert as_engine(db, "SELECT count(*) AS n FROM command_results")[0]["n"] == 1
@@ -435,6 +435,61 @@ def test_downgrade_to_0003_removes_the_risk_schema_and_upgrade_restores_it(
             as_engine(db, "DELETE FROM risk_event")
     finally:
         as_migrate(db, "DELETE FROM risk_event")
+
+
+# ---- add-risk-guards (migration 0005) -----------------------------------------------
+
+
+def test_the_engine_role_can_use_the_ban_list_and_the_new_day_columns(
+    db: Db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_migrate(monkeypatch, db)
+    try:
+        as_engine(
+            db, "INSERT INTO risk_ban_list VALUES ('main', current_date, '[\"XYZ\"]'::jsonb, now())"
+        )
+        as_engine(db, 'UPDATE risk_ban_list SET symbols = \'["ABC", "XYZ"]\'::jsonb')
+        assert as_engine(db, "SELECT count(*) AS n FROM risk_ban_list")[0]["n"] == 1
+        # A row written without the new columns (as before 0005) gets their defaults.
+        as_engine(
+            db,
+            "INSERT INTO risk_day_state (account_id, trade_date, peak, halt_level, entries_today, "
+            "loss_streak, updated_at) VALUES ('main', current_date, 0, 0, 0, 0, now())",
+        )
+        row = as_engine(
+            db, "SELECT entry_lots_today, last_entry_at, expiry_exposure FROM risk_day_state"
+        )[0]
+        assert (row[0], row[1], row[2]) == (0, None, False)
+        as_engine(db, "UPDATE risk_day_state SET entry_lots_today = 4, expiry_exposure = true")
+    finally:
+        for table in ("risk_ban_list", "risk_day_state"):
+            as_engine(db, f"DELETE FROM {table}")
+
+
+def test_downgrade_to_0004_removes_the_guard_schema_and_upgrade_restores_it(
+    db: Db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_migrate(monkeypatch, db)
+    command.downgrade(migrate.alembic_config(db.migrate_url()), "0004")
+
+    tables = {
+        r["tablename"]
+        for r in as_migrate(db, "SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+    }
+    assert "risk_ban_list" not in tables and "risk_day_state" in tables
+    columns = {
+        r["column_name"]
+        for r in as_migrate(
+            db,
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'risk_day_state'",
+        )
+    }
+    assert not columns & {"entry_lots_today", "last_entry_at", "expiry_exposure"}
+    assert as_migrate(db, "SELECT version_num FROM migrations.alembic_version")[0][0] == "0004"
+
+    run_migrate(monkeypatch, db)  # back to head
+    assert as_migrate(db, "SELECT version_num FROM migrations.alembic_version")[0][0] == HEAD
 
 
 def test_failing_migration_exits_nonzero_without_leaking_credentials(

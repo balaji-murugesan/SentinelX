@@ -16,7 +16,7 @@
 - **Scope moved out**, agreed with the owner on 2026-11-21:
   - **Bid-ask spread check:** deferred, because the feed carries no bid or ask (Quote mode). The PRD row is marked as waiting on market depth.
   - **Modification cap:** moved to S4 `add-trailing-exits`, because nothing modifies an order before S4's exit manager (D-027). The S3 flattener cancels and replaces instead.
-- **Contract additions** (all optional or new, `schema_version` stays 1): `HaltLevel.TARGET_HALT = 20` (reserved for this by `add-risk-engine`), a `SetBanList` command, and new fields in the snapshot's risk block (gross lots today, the ban list's date, recent broker rejections). The CLI gains `risk set-ban-list`.
+- **Contract additions** (all optional or new, `schema_version` stays 1): `HaltLevel.TARGET_HALT = 20` (reserved for this by `add-risk-engine`), a `SetBanList` command, and new fields in the snapshot's risk block (gross lots today, whether today's ban list is loaded, recent broker rejections). The CLI gains `risk set-ban-list`.
 
 Out of scope:
 - **S4:** the modification cap, the exit manager and trailing.

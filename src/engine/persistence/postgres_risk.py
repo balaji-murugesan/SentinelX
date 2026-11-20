@@ -29,7 +29,7 @@ from contracts.snapshot import HaltLevel
 from engine.persistence import tables as t
 from engine.persistence.postgres import DEFAULT_TIMEOUT_S
 from engine.persistence.repository import PersistenceError
-from engine.risk.repository import RiskEvent, StoredLimits
+from engine.risk.repository import RiskEvent, StoredBanList, StoredLimits
 from engine.risk.state import DayState
 
 
@@ -139,6 +139,11 @@ class PostgresRiskRepository:
                 "cooldown_until": sa.func.greatest(day.cooldown_until, new.cooldown_until),
                 "close_marks": sa.func.coalesce(day.close_marks, new.close_marks),
                 "updated_at": new.updated_at,
+                # add-risk-guards: maximum, maximum, OR. Postgres orders false < true, so
+                # GREATEST on the boolean is OR: once expiry exposure is on, it stays on.
+                "entry_lots_today": sa.func.greatest(day.entry_lots_today, new.entry_lots_today),
+                "last_entry_at": sa.func.greatest(day.last_entry_at, new.last_entry_at),
+                "expiry_exposure": sa.func.greatest(day.expiry_exposure, new.expiry_exposure),
             },
         ).returning(*t.risk_day_state.c)
         async with self._transaction() as conn:
@@ -151,6 +156,39 @@ class PostgresRiskRepository:
         async with self._transaction() as conn:
             await conn.execute(sa.insert(t.risk_event).values(_event_row(event)))
 
+    # ---- ban list -------------------------------------------------------------------------
+
+    async def load_ban_list(self, account_id: str, from_date: date) -> list[StoredBanList]:
+        ban = t.risk_ban_list.c
+        async with self._transaction() as conn:
+            rows = (
+                (
+                    await conn.execute(
+                        sa.select(t.risk_ban_list)
+                        .where(ban.account_id == account_id, ban.trade_date >= from_date)
+                        .order_by(ban.trade_date)
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        return [_decoded(_ban_list, row) for row in rows]
+
+    async def save_ban_list(
+        self, account_id: str, trade_date: date, symbols: frozenset[str], at: datetime
+    ) -> StoredBanList:
+        # Stored as a sorted list: JSON has no set, and a fixed order makes rows comparable.
+        insert = pg_insert(t.risk_ban_list).values(
+            account_id=account_id, trade_date=trade_date, symbols=sorted(symbols), loaded_at=at
+        )
+        statement = insert.on_conflict_do_update(
+            index_elements=["account_id", "trade_date"],
+            set_={"symbols": insert.excluded.symbols, "loaded_at": insert.excluded.loaded_at},
+        ).returning(*t.risk_ban_list.c)
+        async with self._transaction() as conn:
+            row = (await conn.execute(statement)).mappings().one()
+        return _decoded(_ban_list, row)
+
 
 # ---- row <-> model conversions ------------------------------------------------------------
 
@@ -160,7 +198,7 @@ class PostgresRiskRepository:
 def _decoded[T](decode: Callable[[RowMapping], T], row: RowMapping) -> T:
     """Turn a stored row into a model, or fail closed.
 
-    A row that does not decode (a halt level this version does not know, such as the reserved 20
+    A row that does not decode (a halt level this version does not know, such as TARGET_HALT 20
     after a rollback, or a damaged document) must never be read as "no halt": it raises the same
     ``PersistenceError`` as any other database failure, so callers have one thing to catch.
     """
@@ -187,6 +225,9 @@ def _day_row(s: DayState) -> dict[str, Any]:
         "cooldown_until": s.cooldown_until,
         "close_marks": s.close_marks,
         "updated_at": s.updated_at,
+        "entry_lots_today": s.entry_lots_today,
+        "last_entry_at": s.last_entry_at,
+        "expiry_exposure": s.expiry_exposure,
     }
 
 
@@ -203,7 +244,18 @@ def _day_state(r: RowMapping) -> DayState:
         loss_streak=r["loss_streak"],
         cooldown_until=r["cooldown_until"],
         close_marks=None if r["close_marks"] is None else dict(r["close_marks"]),
+        entry_lots_today=r["entry_lots_today"],
+        last_entry_at=r["last_entry_at"],
+        expiry_exposure=r["expiry_exposure"],
     )
+
+
+def _ban_list(r: RowMapping) -> StoredBanList:
+    symbols = r["symbols"]
+    # A damaged document (not a list of text) must fail closed, never read as "no bans".
+    if not isinstance(symbols, list) or not all(isinstance(s, str) for s in symbols):
+        raise ValueError("ban list symbols must be a list of text")
+    return StoredBanList(r["trade_date"], frozenset(symbols), r["loaded_at"])
 
 
 def _event_row(e: RiskEvent) -> dict[str, Any]:

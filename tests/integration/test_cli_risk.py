@@ -112,7 +112,9 @@ async def test_a_bad_limits_file_is_never_sent(tmp_path: Path) -> None:
 
 async def test_a_value_the_command_cannot_carry_is_never_sent(tmp_path: Path) -> None:
     path = tmp_path / "limits.json"
-    path.write_text('{"daily_max_loss": ["3000"]}', encoding="utf-8")
+    # A nested object: no LimitValue member carries one. (A list of text became a valid value
+    # in add-risk-guards, for symbol sets; the engine still refuses it for a money limit.)
+    path.write_text('{"daily_max_loss": {"amount": "3000"}}', encoding="utf-8")
     lines: list[str] = []
 
     code = await cli.set_limits(

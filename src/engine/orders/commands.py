@@ -38,6 +38,7 @@ from contracts.commands import (
     KillSwitch,
     PlaceOrder,
     ResumeRecovery,
+    SetBanList,
     SetRiskLimits,
     SizeOrder,
     parse_command,
@@ -193,9 +194,10 @@ class CommandConsumer:
                 return await self._size(command)
             case KillSwitch() if self._kill is not None:
                 return await self._kill(command)
-            case KillSwitch() | SetRiskLimits() | SizeOrder():
+            case KillSwitch() | SetRiskLimits() | SizeOrder() | SetBanList():
                 # These parse already but have no handler when the risk engine is not wired
-                # (an engine built without it), so they are answered, not dropped: a command
+                # (an engine built without it; SetBanList until add-risk-guards task 7.2 routes
+                # it), so they are answered, not dropped: a command
                 # nobody handles must not crash this loop, and the reply fails closed. They are
                 # listed, not caught by a default arm (``case _``, like ``_ =>`` in a C# switch
                 # expression), so that mypy flags a missing arm when a command is added to

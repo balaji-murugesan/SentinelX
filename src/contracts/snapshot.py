@@ -38,12 +38,14 @@ class HaltLevel(IntEnum):
     as a number, and ``max()`` picks the more severe. A halt only ever goes up within a day.
 
     The numbers are a stored contract: the risk engine persists them with ``GREATEST`` (add-risk-
-    engine task 2.3), so they must never be renumbered. They are spaced out on purpose: 20 is
-    reserved for the daily-profit-target halt that ``add-risk-guards`` adds (PRD §7.2 ranking
-    HALT_NEW_ENTRIES < TARGET_HALT < KILL)."""
+    engine task 2.3), so they must never be renumbered. They are spaced out on purpose, so a new
+    level can slot in by severity (PRD §7.2 ranking HALT_NEW_ENTRIES < TARGET_HALT < KILL)."""
 
     NONE = 0
     MTM_BLIND = 10  # prices were unknown too long: flattened, no new entries today
+    # The daily profit target was reached and held (add-risk-guards): flattened, no new entries
+    # today. Below KILL, so a kill on a target-halted day still escalates to KILL.
+    TARGET_HALT = 20
     KILL = 30  # kill switch or equity-floor breach: flattened, no new entries today
 
 
@@ -74,6 +76,12 @@ class RiskStatus(BaseModel):
     # Open positions with no catastrophic stop resting. The ``[]`` default is safe: pydantic
     # copies a mutable default for each instance, like a C# field initialiser ``= new()``.
     unprotected: list[PositionRef] = []
+    # Added by add-risk-guards. Defaults keep an older snapshot readable (schema_version stays 1).
+    # Lots (contracts of one lot size each) the gate allowed for entries today, filled or not.
+    entry_lots_today: int = 0
+    # Whether today's F&O ban list is loaded: without it, every F&O entry is refused.
+    ban_list_loaded: bool = False
+    broker_rejections_5m: int = 0  # orders the broker rejected in the last five minutes
 
 
 class Snapshot(BaseModel):

@@ -10,15 +10,15 @@
 
 ## 2. Contracts and persistence
 
-- [ ] 2.1 Make additive contract changes (`schema_version` stays 1):
+- [x] 2.1 Make additive contract changes (`schema_version` stays 1):
   - `HaltLevel.TARGET_HALT = 20` in `contracts/snapshot.py`;
   - `RiskStatus` fields `entry_lots_today`, `ban_list_loaded` and `broker_rejections_5m` with defaults;
   - `LimitValue` gains `list[str]`;
   - a `SetBanList` command (`trade_date`, `symbols`, idempotency key) in the command union.
 
   Verify with `tests/contracts` round-trip tests, including that an older snapshot without the new fields still parses.
-- [ ] 2.2 Add `entry_lots_today`, `last_entry_at` and `expiry_exposure` to `DayState`, and extend `merge_day_state`: maximum, maximum, OR. Verify with the merge unit tests: a lower or older value never wins, and `expiry_exposure` never turns off within a day.
-- [ ] 2.3 Write Alembic migration `0005`:
+- [x] 2.2 Add `entry_lots_today`, `last_entry_at` and `expiry_exposure` to `DayState`, and extend `merge_day_state`: maximum, maximum, OR. Verify with the merge unit tests: a lower or older value never wins, and `expiry_exposure` never turns off within a day.
+- [x] 2.3 Write Alembic migration `0005`:
   - the three `risk_day_state` columns;
   - the `risk_ban_list` table keyed by `(account_id, trade_date)`.
 

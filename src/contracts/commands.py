@@ -6,6 +6,7 @@ pattern as the Stage 0 diagnostic ping. ``Command`` is a *discriminated union*: 
 right class when parsing (like a C# polymorphic JSON converter keyed on a type tag).
 """
 
+from datetime import date
 from decimal import Decimal
 from typing import Annotated, Literal, Self
 
@@ -74,12 +75,14 @@ class KillSwitch(_CommandBase):
     command: Literal["kill_switch"] = "kill_switch"
 
 
-# A limit value is text, a whole number, a flag, or None ("not configured"). ``A | B`` is a
-# union type: the value must be one of them (closest C# analogue: ``OneOf<string, int, bool>``).
-# There is deliberately no float member: money and percentages travel as strings ("1000.00")
-# and become ``Decimal`` in the engine, so a rounding error can never enter a risk limit. A
-# JSON number with a fraction would be a float, and is refused here.
-LimitValue = str | int | bool | None
+# A limit value is text, a whole number, a flag, a list of symbols, or None ("not configured").
+# ``A | B`` is a union type: the value must be one of them (closest C# analogue:
+# ``OneOf<string, int, bool, List<string>>``). The list carries a set of underlyings such as
+# ``allowed_underlyings`` (added by add-risk-guards). There is deliberately no float member:
+# money and percentages travel as strings ("1000.00") and become ``Decimal`` in the engine, so a
+# rounding error can never enter a risk limit. A JSON number with a fraction would be a float,
+# and is refused here.
+LimitValue = str | int | bool | list[str] | None
 
 
 class SetRiskLimits(_CommandBase):
@@ -101,9 +104,28 @@ class SizeOrder(_CommandBase):
     initial_stop: Decimal = Field(gt=0)
 
 
+class SetBanList(_CommandBase):
+    """Load the exchange's F&O ban list for one IST trading day (instrument-policy spec).
+
+    Underlyings in the ban list may not be entered in futures or options that day; with no list
+    loaded for today every F&O entry is refused. ``symbols`` are underlying names such as "XYZ";
+    an empty list means "no bans that day". The engine checks the date and the tighten-only rule
+    for today during market hours; this model only fixes the shape. ``Annotated[str,
+    Field(min_length=1)]`` attaches the guard to each list item, like a C# validation attribute
+    applied per element. ``strict=True`` on ``trade_date`` turns off pydantic's lax coercion,
+    which would otherwise read a midnight datetime or a midnight Unix timestamp as a date: in
+    JSON only a "YYYY-MM-DD" string is accepted, in Python only a ``date`` object."""
+
+    command: Literal["set_ban_list"] = "set_ban_list"
+    trade_date: date = Field(strict=True)
+    symbols: list[Annotated[str, Field(min_length=1)]]
+
+
 # Every command the engine can receive: a union type, like a C# base type with these subclasses.
 # Code that handles it with ``match`` is checked by mypy to cover every member.
-AnyCommand = PlaceOrder | CancelOrder | ResumeRecovery | KillSwitch | SetRiskLimits | SizeOrder
+AnyCommand = (
+    PlaceOrder | CancelOrder | ResumeRecovery | KillSwitch | SetRiskLimits | SizeOrder | SetBanList
+)
 # Annotated[..., Field(discriminator=...)] tells pydantic to choose the class by `command`.
 Command = Annotated[AnyCommand, Field(discriminator="command")]
 _COMMAND = TypeAdapter(Command)
