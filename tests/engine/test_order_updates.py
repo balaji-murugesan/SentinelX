@@ -12,18 +12,16 @@ from typing import NamedTuple
 from opentelemetry.sdk.trace import TracerProvider
 
 from contracts.commands import CancelOrder
-from contracts.mode import TradingMode
 from contracts.orders import CostBreakdown, OrderSide, OrderState
 from engine.broker.adapter import BrokerOrder, Cancelled, Filled
 from engine.broker.paper import PaperBroker
 from engine.market_data.bus import TickBus
 from engine.market_data.provider import Subscriptions, Tick
 from engine.market_data.simulated import SimulatedFeed
-from engine.orders.gate import PaperOnlyGate
 from engine.orders.service import OrderService
 from engine.positions.feed import PositionFeed
 from tests.engine.test_order_service import NOW, OPTION, FakeAdapter, build, command, master
-from tests.engine.trading_fakes import MemoryRepository
+from tests.engine.trading_fakes import MemoryRepository, PermissiveGate
 
 CLOSE = datetime(2026, 10, 29, 10, 0, tzinfo=UTC)  # 15:30 IST
 
@@ -52,7 +50,7 @@ def paper_rig() -> Rig:
     )
     repo = MemoryRepository()
     service = OrderService(
-        account_id="main", paper=True, gate=PaperOnlyGate(TradingMode.PAPER), adapter=broker,
+        account_id="main", paper=True, gate=PermissiveGate(), adapter=broker,
         repository=repo, instruments=master(), ack_timeout_s=5, now=clock,
         position_feed=PositionFeed(SimulatedFeed(TickBus(), subscriptions, script=[])),
         tracer=TracerProvider().get_tracer("test"),

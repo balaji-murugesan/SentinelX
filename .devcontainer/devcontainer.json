@@ -1,0 +1,11 @@
+{
+  "name": "sentinelx-agent",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {}
+  },
+  "postCreateCommand": "npm install -g @anthropic-ai/claude-code && pip install -r requirements.txt",
+  "mounts": [
+    "source=claude-config,target=/home/vscode/.claude,type=volume"
+  ]
+}

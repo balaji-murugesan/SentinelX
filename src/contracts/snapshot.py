@@ -6,11 +6,13 @@ single row that is repeatedly UPDATEd), not a history.
 """
 
 from decimal import Decimal
+from enum import IntEnum
 from typing import Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict
 
-from contracts.orders import Order, Position
+from contracts.market import InstrumentKey
+from contracts.orders import Order, Position, ProductType
 
 
 def snapshot_key(account_id: str) -> str:
@@ -30,6 +32,50 @@ class PositionView(BaseModel):
     net_pnl: Decimal | None = None  # realized + mtm - costs
 
 
+class HaltLevel(IntEnum):
+    """How firmly the risk engine has stopped the account for the day. An IntEnum is an enum
+    whose members are also integers (a C# ``enum`` with explicit values): it is stored and sent
+    as a number, and ``max()`` picks the more severe. A halt only ever goes up within a day.
+
+    The numbers are a stored contract: the risk engine persists them with ``GREATEST`` (add-risk-
+    engine task 2.3), so they must never be renumbered. They are spaced out on purpose: 20 is
+    reserved for the daily-profit-target halt that ``add-risk-guards`` adds (PRD §7.2 ranking
+    HALT_NEW_ENTRIES < TARGET_HALT < KILL)."""
+
+    NONE = 0
+    MTM_BLIND = 10  # prices were unknown too long: flattened, no new entries today
+    KILL = 30  # kill switch or equity-floor breach: flattened, no new entries today
+
+
+class PositionRef(BaseModel):
+    """Names one position: the same instrument can be held under two products."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    key: InstrumentKey
+    product: ProductType
+
+
+class RiskStatus(BaseModel):
+    """The risk engine's figures for the account today, all computed by the engine (the UI
+    never computes P&L or risk). ``mtm_day`` and ``floor`` are None while unknown (MTM has no
+    price yet, or no limits are set): never a guessed zero."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    mtm_day: Decimal | None = None  # the day's P&L net of charges (PRD §7)
+    floor: Decimal | None = None  # the equity floor: only ever rises (PRD §7.1)
+    peak: Decimal = Decimal("0")  # the day's highest mtm_day, from fresh prices only
+    halt_level: HaltLevel = HaltLevel.NONE
+    halt_reason: str | None = None
+    entries_today: int = 0
+    loss_streak: int = 0
+    cooldown_until: AwareDatetime | None = None
+    # Open positions with no catastrophic stop resting. The ``[]`` default is safe: pydantic
+    # copies a mutable default for each instance, like a C# field initialiser ``= new()``.
+    unprotected: list[PositionRef] = []
+
+
 class Snapshot(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -42,3 +88,5 @@ class Snapshot(BaseModel):
     # the reasons, as logged. Defaults keep older snapshots readable (schema_version stays 1).
     halted: bool = False
     halt_differences: list[str] = []
+    # Added by add-risk-engine. None until the risk engine has produced its first figures.
+    risk: RiskStatus | None = None

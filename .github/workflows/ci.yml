@@ -19,7 +19,7 @@ concurrency:
 
 env:
   UV_VERSION: "0.11.33"
-  OPENSPEC_VERSION: "1.15.0"
+  OPENSPEC_VERSION: "2.0.0"
 
 jobs:
   checks:

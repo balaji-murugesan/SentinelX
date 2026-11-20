@@ -33,12 +33,15 @@ Architecture decisions from the design discussions (Sep–Oct 2026), kept as ref
 | D-023 | Market data separated from execution (`MarketDataProvider` vs `BrokerAdapter`) | Accepted |
 | D-024 | Shared runtime telemetry lives in `observability`; `contracts` stays pure models | Accepted |
 | D-025 | Trailing SL is a pluggable method chosen per trade, with a configured default | Proposed |
-| D-026 | Risk rules are pluggable `RiskCheck`s with monotonic, engine-owned state; daily loss becomes an equity-floor ratchet | Proposed |
+| D-026 | Risk rules are pluggable `RiskCheck`s with monotonic, engine-owned state; daily loss becomes an equity-floor ratchet | Accepted |
 | D-027 | Exits are bounded limit-price chases, never MARKET orders | Proposed |
 | D-028 | External (manual) orders detected continuously; orphan catastrophic SLs cancelled first | Proposed |
 | D-029 | Spouse's Zerodha account integrated in Stage 8 (execution only); market data stays on Dhan | Proposed |
-| D-030 | Automatic stops lock the account for the day at the broker; risk halts have no intraday resume | Proposed |
+| D-030 | Automatic stops lock the account for the day at the broker; risk halts have no intraday resume | Accepted (engine lock); broker lock Proposed until Stage 7 |
 | D-031 | Webhooks: own scripts over Tailscale; TradingView through one public, IP-allowlisted route | Proposed |
+| D-032 | Day P&L is net of estimated charges and a carried position is measured from the previous close | Accepted |
+| D-033 | Catastrophic stops of carried positions are re-placed each morning | Accepted |
+| D-034 | The catastrophic stop is assumed to be an SL-M; live trading is gated on verifying it | Accepted as an assumption |
 
 ---
 
@@ -189,7 +192,7 @@ Architecture decisions from the design discussions (Sep–Oct 2026), kept as ref
 **Revisit when:** backtests show some methods add nothing for NSE F&O intraday; drop them rather than carry untested options. The scores in `trailing-sl.md` are hypotheses until then.
 
 ## D-026 — Pluggable risk checks with monotonic state; equity-floor ratchet
-**Status:** Proposed (2026-11-11); to be confirmed in the Stage 3 change `add-risk-engine`.
+**Status:** Accepted (2026-11-16): implemented in the Stage 3 change `add-risk-engine` (the owner's paper smoke test, task 12.4, is still to be done). First proposed 2026-11-11.
 **Context:** The PRD's §7 listed rules but gave no shape for adding more, and "daily max loss" was a single static number. The RMS research ([`research/rms-tool.md`](research/rms-tool.md) R2) shows that five vendor settings, Max Loss, Trail Max Loss, Lock Minimum Profit, Trail Profits and Lock & Trail, are all versions of one number that only rises. It also shows that vendor tools lose that state on restart.
 **Decision:**
 - **One interface.** Every risk rule implements one `RiskCheck` protocol with a pre-trade phase, a continuous phase, or both. Each returns a decision ranked by severity (ALLOW < REJECT < HALT_NEW_ENTRIES < TARGET_HALT < KILL), and the gate acts on the most severe. A check that raises fails closed.
@@ -238,7 +241,7 @@ Architecture decisions from the design discussions (Sep–Oct 2026), kept as ref
 **Trade-off:** a second adapter, instrument mapping and a second daily login, in exchange for no broker concentration (a Dhan outage no longer affects both accounts) and no new account for the spouse.
 
 ## D-030 — Automatic stops lock the account for the day
-**Status:** Proposed (2026-11-12); to be confirmed in Stage 3 (engine lock) and Stage 7 (broker lock).
+**Status:** The engine lock is Accepted (2026-11-16, Stage 3 `add-risk-engine`): a floor breach, a kill and a blind book lock the day, with no intraday resume; the lock lives in the day state, so the recovery resume command cannot clear it. (Stage 3 adds one lock beyond this entry: a book whose prices are unknown for `mtm_blind_s` is flattened and locks entries for the day, with no broker lock.) The broker lock (Dhan `POST /killswitch` once flat) stays Proposed until Stage 7. First proposed 2026-11-12.
 **Context:** The owner wants the day's rules to act as an emotional circuit breaker: once a rule stops trading, nothing, including the owner, can trade that account until the next day. The engine's HALTED state only blocks orders that go *through SentinelX*; the owner could still trade from the broker's own app.
 **Decision:**
 - **Automatic stops** (equity-floor breach, daily profit target) halt the account until the post-close reset. **No intraday resume command exists for a risk halt.** The recovery-halt resume (reconciliation) is a separate command and never clears a risk halt.
@@ -260,3 +263,32 @@ Architecture decisions from the design discussions (Sep–Oct 2026), kept as ref
 - **Dashboard and API stay Tailscale-only** (D-016 unchanged for them).
 **Alternatives:** Tailscale only (TradingView impossible); a third-party tunnel or relay (another dependency that sees the payloads); a fully public endpoint (random traffic and scanning).
 **Revisit when:** TradingView changes its source IPs (the allowlist must be kept current), or a signal source can join the tailnet.
+
+## D-032 — Day P&L is net of estimated charges and a carried position is measured from the previous close
+**Status:** Accepted (2026-11-16, Stage 3 `add-risk-engine`); resolves PRD §12 Q13 and Q18.
+**Context:** The equity floor (D-026) compares `MTM_day` with a ratchet that only rises, so what `MTM_day` counts decides when the kill fires. Two questions were open: gross or net of charges (Q18), and for a position carried over from an earlier day, whether its loss counts from entry or from yesterday's close (Q13).
+**Decision:**
+- **Net.** `MTM_day` is today's realized P&L plus the unrealized P&L of open positions at the latest price (even a tick that has not yet been confirmed: the loss side is not debounced, PRD §7.1), minus the charges of every fill today and the estimated charge of exiting each open position at that price. Only the peak (and the 15:30 close mark below) use confirmed, fresh prices, so that a one-tick spike cannot raise the floor. The cost model is `engine.broker.costs`.
+- **Previous-close basis.** A carried position is measured from the previous weekday's close, so only today's move counts and yesterday's loss is not charged twice. The monitor records each open position's last *confirmed* price at 15:30 (never a spike on the last tick) in the day state; the next trading day reads it. With no mark on record (the engine did not run at that close, or an exchange holiday) the position is measured from its average price and the gap is audited once (`RISK_REFERENCE_MISSING`). An older day's marks are never used in its place. There is no holiday calendar yet, so only weekends are skipped.
+- **Carried positions count.** They count toward max open positions (total and per underlying) and the kill flattens them, whatever their product.
+- **Unknown is unknown.** With no price, or with the previous close unreadable, `MTM_day` is unknown, never zero: entries are refused and the day's peak and floor never use it.
+**Alternatives:** gross MTM (the floor then ignores what the day costs; simpler, and independent of the cost model); measuring a carried position from entry (a position that gapped against the owner yesterday would trigger today's floor on yesterday's loss).
+**Trade-off:** the floor now depends on the cost model, and `costs.py` marks the futures and equity-delivery rates as unverified. Check them against Dhan's charge calculator before live.
+
+## D-033 — Catastrophic stops of carried positions are re-placed each morning
+**Status:** Accepted (2026-11-16, Stage 3 `add-risk-engine`); resolves PRD §12 Q12.
+**Context:** A day SL-M order expires at the close, so a carried `CNC` position has no exchange-side protection overnight or at the next open unless something places it again.
+**Decision:**
+- **The stop manager places it again.** Every open position, carried `CNC` and `MARGIN` included, has its catastrophic stop placed by the stop manager's sweep (every 5 s) after startup reconciliation and at each market open. It places nothing outside 09:15-15:30 IST, and the close's expiry is not treated as a loss of protection.
+- **Until it is placed, entries wait.** An open position without a resting stop of the right side, size and trigger halts new entries (`RISK_UNPROTECTED`) until it has one; exits are never blocked. The stop manager retries with backoff and raises a critical alert.
+- **No broker-side persistent order.** A Forever Order is not used: it is a second order lifecycle that cannot be resized by a place-then-cancel and whose behaviour with partial exits is unverified.
+**Alternatives:** a Forever Order (above); placing stops before the open (unverified at Dhan; the Stage 7 morning sequence owns the real timing).
+**Open:** whether Dhan lets a `CNC` exit through while a stop reserves the same shares, and the reverse: whether a stop is refused while the owner's own resting sell reserves them (the engine refuses it, loudly, and halts entries until that order is cancelled). The engine does not count its own stop against what may be sold (so the replacement stop and the kill's exit are accepted in paper); the Stage 7 smoke test must record what the broker does, and if it blocks the exit, the order of cancel and exit for delivery holdings is revisited with a new entry.
+
+## D-034 — The catastrophic stop is assumed to be an SL-M; live trading is gated on verifying it
+**Status:** Accepted as an assumption (2026-11-16, Stage 3 `add-risk-engine`); PRD §12 Q17 stays "assumed, gated".
+**Context:** Whether Dhan accepts an API SL-M under Market Price Protection, converts it, or rejects it is unverified. If it converts or rejects it, the catastrophic stop must be an SL-limit, which a fast market can gap through.
+**Decision:**
+- **One constant.** The stop's order type is `engine.risk.stops.STOP_ORDER_TYPE`, set to `STOP_MARKET`, and only `stops.py` chooses the type. It is not the only place that knows `STOP_MARKET` exists: `engine/broker/paper.py` (resting and triggering it), `engine/orders/validation.py`, `engine/risk/checks/common.py` and `contracts/orders.py` mention it too, so a switch to a stop-limit is more than the constant: it needs a new `STOP_LIMIT` member of `OrderType` (none exists today) and its handling in those places (the price rules in `contracts/orders.py`, the order validation, the risk checks' entry-price helper in `engine/risk/checks/common.py` and the paper broker's resting and triggering). `PaperBroker` rests it, triggers it on a trade at or through the trigger and fills it like a market order with slippage (a gap fills at the new price, not at the trigger).
+- **The gate.** Live trading (Stage 7) must not start until a smoke test has recorded what Dhan does with an API SL-M under MPP. If it converts or rejects it, a further entry refines D-007 with an SL-limit and the constant changes.
+**Alternatives:** an SL-limit now (the gap-through risk accepted without evidence); no exchange-side stop (D-007 exists because the engine can fail).

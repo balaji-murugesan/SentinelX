@@ -1,0 +1,39 @@
+{
+  "_note": "EXAMPLE VALUES, NOT A RECOMMENDATION. Chosen only so the file validates. Decide your own numbers from your own backtests before sending them.",
+  "_how": "Send with: python -m cli risk set-limits --file <this file>. In Docker, copy it into the engine container first (docker compose cp), since the image has no docs folder. Keys that start with an underscore are comments and are not sent. Money and percentages are strings; counts and seconds are numbers.",
+  "_tighten_only": "While the market is open an edit may only make a limit stricter (a lower loss limit, a shorter cut-off, fewer trades); loosening is refused with TIGHTEN_ONLY. Outside market hours any valid edit is accepted.",
+
+  "per_trade_max_risk": "1000",
+  "daily_max_loss": "3000",
+  "catastrophic_sl_pct": "40",
+  "price_band_pct": "10",
+  "outlier_pct": "20",
+  "exit_buffer_pct": "2",
+
+  "max_trades_per_day": 5,
+  "loss_streak_limit": 3,
+  "max_open_total": 4,
+  "max_open_per_underlying": 2,
+  "max_chase_steps": 5,
+  "cooldown_seconds": 900,
+
+  "stale_s": 5,
+  "feed_down_s": 15,
+  "mtm_blind_s": 60,
+  "chase_interval_s": 2,
+  "exit_escalate_s": 30,
+
+  "entry_cutoff": "15:00",
+  "square_off_time": "15:15",
+
+  "trail_loss_x": "1000",
+  "trail_loss_y": "500",
+  "lock_mode": "LOCK",
+  "lock_trigger": "1000",
+  "lock_at": "200",
+  "trail_step": "500",
+  "trail_by": "250",
+  "giveback_arm": "2000",
+  "giveback_abs": "1000",
+  "giveback_pct": "30"
+}

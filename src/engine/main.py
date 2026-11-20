@@ -2,13 +2,15 @@
 
 Validates configuration, announces its mode and account, keeps a liveness heartbeat, answers
 diagnostic pings, streams market data, and runs the order path: recovery, then the command
-consumer, paper broker, order updates and the Redis snapshot. Paper broker only (no
-``DhanBroker`` yet).
+consumer, paper broker, order updates and the Redis snapshot, and the risk engine (limits, the
+gate every order passes, the monitor, catastrophic stops, kill switch and square-off; see
+``engine.risk.runtime``). Paper broker only (no ``DhanBroker`` yet).
 """
 
 import asyncio
 import contextlib
 import signal
+import time
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
 
@@ -25,13 +27,16 @@ from engine.diagnostics import answer_pings
 from engine.healthcheck import heartbeat_loop
 from engine.market_data.service import MarketDataService
 from engine.orders.commands import CommandConsumer
-from engine.orders.gate import PaperOnlyGate
 from engine.orders.recovery import recover_with_retry, resume_recovery
 from engine.orders.service import OrderService
 from engine.orders.snapshot import SnapshotWriter
 from engine.persistence.postgres import PostgresRepository
+from engine.persistence.postgres_risk import PostgresRiskRepository
 from engine.persistence.repository import TradingRepository
 from engine.positions.feed import PositionFeed
+from engine.risk.ratelimit import RateLimitedAdapter
+from engine.risk.repository import RiskRepository
+from engine.risk.runtime import RiskRuntime
 from observability.banner import log_halted_banner, log_startup_banner
 from observability.logging_setup import configure_logging
 from observability.tracing import configure_tracing, shutdown_tracing
@@ -109,6 +114,7 @@ async def run(
     stop: asyncio.Event | None = None,
     market_data: MarketDataService | None = None,
     repository: TradingRepository | None = None,
+    risk_repository: RiskRepository | None = None,
     snapshot_restart_s: float = 5.0,
 ) -> None:
     """Run the engine's background tasks until ``stop`` is set (or one of them fails).
@@ -117,9 +123,10 @@ async def run(
     cancelled and the error propagates, so the process exits non-zero and Docker restarts it.
     Market data contains its own failures (design §11), so it never triggers that.
 
-    ``repository`` exists only so tests can inject ``MemoryRepository``: in production it is
-    always Postgres, built from ``DATABASE_URL`` (design §13). If Postgres is down the engine
-    stays up with new orders refused and keeps retrying recovery.
+    ``repository`` and ``risk_repository`` exist only so tests can inject in-memory fakes: in
+    production both are Postgres, built from ``DATABASE_URL`` (design §13), each with its own
+    connection pool so a risk write never queues behind an order write. If Postgres is down the
+    engine stays up with new orders refused and keeps retrying recovery.
     """
     stop = stop or asyncio.Event()
     market_data = market_data or MarketDataService(settings)
@@ -130,17 +137,43 @@ async def run(
     )
     repository = repository or postgres
     assert repository is not None
+    risk_postgres = (
+        PostgresRiskRepository(settings.database_url.get_secret_value())
+        if risk_repository is None
+        else None
+    )
+    risk_repository = risk_repository or risk_postgres
+    assert risk_repository is not None
     account = settings.account_id
-    broker = PaperBroker(
+    paper = PaperBroker(
         market_data.bus,
         market_data.master.get,
         slippage_ticks=settings.paper_slippage_ticks,
         max_price_age=timedelta(seconds=settings.paper_price_max_age_s),
     )
+    # Every broker call goes through the rate limiter (exits and cancels keep a reserved share).
+    # ``service`` is built below: the lambda reads it only when an order is placed.
+    broker = RateLimitedAdapter(
+        paper,
+        per_s=settings.order_rate_per_s,
+        per_min=settings.order_rate_per_min,
+        exit_share=settings.order_rate_exit_share,
+        positions=lambda: service.positions,
+        clock=time.monotonic,
+    )
+    # The risk engine is built first because the order service needs its gate; ``attach`` connects
+    # the rest once the service exists (see ``engine.risk.runtime``).
+    risk = RiskRuntime(
+        settings=settings,
+        repository=repository,
+        risk_repository=risk_repository,
+        instruments=market_data.master.get,
+        subscribed=lambda: bool(market_data.subscriptions.keys),
+    )
     service = OrderService(
         account_id=account,
         paper=settings.mode is TradingMode.PAPER,
-        gate=PaperOnlyGate(settings.mode),
+        gate=risk.gate,
         adapter=broker,
         repository=repository,
         instruments=market_data.master,
@@ -148,17 +181,29 @@ async def run(
         tracer=trace.get_tracer("engine.orders"),
         ack_timeout_s=settings.order_ack_timeout_s,
     )
+    risk.attach(service)
+    assert risk.kill is not None and risk.sizing is not None
+    risk_ticks = market_data.bus.subscribe("risk")
 
     async def resume(command: ResumeRecovery) -> CommandResult:
         return await resume_recovery(service, repository, broker, command, account_id=account)
 
-    consumer = CommandConsumer(redis, service, account_id=account, resume=resume)
+    consumer = CommandConsumer(
+        redis,
+        service,
+        account_id=account,
+        resume=resume,
+        set_limits=risk.limits.set_limits,
+        size=risk.sizing.size,
+        kill=risk.kill.handle,
+    )
     snapshots = SnapshotWriter(
         redis,
         service,
         market_data.bus.subscribe("snapshot"),
         account_id=account,
         interval_s=settings.snapshot_interval_s,
+        risk=risk.status,
     )
     recovery_started = asyncio.Event()
 
@@ -170,7 +215,7 @@ async def run(
                 broker,
                 account_id=account,
                 stop=stop,
-                restore_broker=broker.restore,
+                restore_broker=paper.restore,
                 first_attempt=recovery_started,
             )
         finally:
@@ -193,7 +238,24 @@ async def run(
                 _after(recovery_started, lambda: _until_stopped(stop, service.run_updates()))
             )
             group.create_task(service.run_pending_writes(stop))
-            group.create_task(broker.run(stop))
+            group.create_task(paper.run(stop))
+            # The risk engine starts once recovery has had its first attempt (it needs the stored
+            # book). Until it has, no monitor runs and the gate refuses every entry, never an exit.
+            # It is supervised too: an unexpected error in it (a corrupt stored row, say) must not
+            # take the engine down, which would stop orders and the heartbeat.
+            group.create_task(
+                _after(
+                    recovery_started,
+                    lambda: _keep_alive("risk start", stop, lambda: risk.start(stop)),
+                )
+            )
+            for name, make in (
+                ("risk monitor", lambda: risk.run_monitor(stop, risk_ticks)),
+                ("catastrophic stops", lambda: risk.run_stops(stop)),
+                ("risk audit", lambda: risk.audit.run(stop)),
+                ("square-off", lambda: risk.run_square_off(stop)),
+            ):
+                group.create_task(_keep_alive(name, stop, make))
             group.create_task(
                 _keep_alive(
                     "snapshot writer",
@@ -207,6 +269,8 @@ async def run(
             await redis.aclose()
         if postgres is not None:
             await postgres.close()
+        if risk_postgres is not None:
+            await risk_postgres.close()
         log.info("engine stopped")
 
 

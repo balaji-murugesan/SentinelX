@@ -40,6 +40,10 @@ orders = sa.Table(
     sa.Column("reason", sa.Text),
     sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    # Added by migration 0004 (add-risk-engine): a stop-market's trigger, and the stop an entry
+    # was sized against. Both are exchange prices on the tick grid, and NULL on older rows.
+    sa.Column("trigger_price", PRICE),
+    sa.Column("initial_stop", PRICE),
     sa.Index("ix_orders_account_state", "account_id", "state"),
 )
 
@@ -119,4 +123,60 @@ command_results = sa.Table(
     sa.Column("order_id", sa.Text),
     sa.Column("reason", sa.Text),
     sa.Column("decided_at", sa.DateTime(timezone=True), nullable=False),
+)
+
+
+# ---- risk engine (add-risk-engine, migration 0004) -----------------------------------------
+
+# The account's risk limits: one JSON document of flat key -> text/number/flag/None, plus a
+# version that rises on every save. There is no default row: until the owner sets limits, every
+# entry is rejected (risk-limits spec "Limits are stored in Postgres with no built-in defaults").
+risk_limits = sa.Table(
+    "risk_limits",
+    metadata,
+    sa.Column("account_id", sa.Text, primary_key=True),
+    sa.Column("limits", sa.JSON, nullable=False),
+    sa.Column("version", sa.Integer, nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+)
+
+# One row per account and IST trading day. A new date has no row, so counters, halt and peak
+# start fresh: that is the "post-close reset" (design §6). The columns that may only move one way
+# are written with GREATEST (see ``PostgresRiskRepository.save_day``), so a stale or out-of-order
+# write can never lower them. ``floor`` is NULL until limits exist; GREATEST ignores NULLs.
+# ``halt_level`` has no CHECK constraint on purpose: 20 is reserved for a level a later change adds.
+risk_day_state = sa.Table(
+    "risk_day_state",
+    metadata,
+    sa.Column("account_id", sa.Text, primary_key=True),
+    sa.Column("trade_date", sa.Date, primary_key=True),
+    sa.Column("peak", EXACT, nullable=False),
+    sa.Column("floor", EXACT),
+    sa.Column("halt_level", sa.Integer, nullable=False),
+    sa.Column("halt_reason", sa.Text),
+    sa.Column("entries_today", sa.Integer, nullable=False),
+    sa.Column("loss_streak", sa.Integer, nullable=False),
+    sa.Column("cooldown_until", sa.DateTime(timezone=True)),
+    # SQL NULL (not JSON null) when unset, so COALESCE can keep the first value written.
+    sa.Column("close_marks", sa.JSON(none_as_null=True)),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+)
+
+# Append-only audit of every risk decision (risk-gate spec "Every risk decision is audited").
+# The migration revokes UPDATE and DELETE from the engine role, so the engine can add rows but
+# never change or remove one.
+risk_event = sa.Table(
+    "risk_event",
+    metadata,
+    sa.Column("event_id", sa.BigInteger, sa.Identity(), primary_key=True),
+    sa.Column("at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("account_id", sa.Text, nullable=False),
+    sa.Column("rule", sa.Text, nullable=False),
+    sa.Column("phase", sa.Text, nullable=False),
+    sa.Column("decision", sa.Text, nullable=False),
+    sa.Column("reason_code", sa.Text),
+    sa.Column("inputs", sa.JSON, nullable=False),
+    sa.Column("enforced", sa.Boolean, nullable=False),
+    sa.Column("latency_us", sa.Integer, nullable=False),
+    sa.Index("ix_risk_event_account_at", "account_id", "at"),
 )

@@ -13,6 +13,7 @@ from contracts.mode import TradingMode
 from contracts.settings import ModeSettings
 from engine.broker.dhan import endpoints
 from engine.healthcheck import DEFAULT_HEARTBEAT_PATH
+from engine.risk.ceilings import ORDERS_PER_MIN_CEILING, ORDERS_PER_S_CEILING
 from observability.masking import mask_account
 
 
@@ -112,6 +113,24 @@ class EngineSettings(ModeSettings):
     order_ack_timeout_s: float = Field(default=5, gt=0, le=60)
     # Minimum seconds between Redis snapshot writes.
     snapshot_interval_s: float = Field(default=1, gt=0, le=60)
+
+    # ---- risk engine (add-risk-engine) -----------------------------------------------------
+    # Only infrastructure settings live here. The risk LIMITS (per-trade risk, the equity floor,
+    # cutoffs...) have no defaults and live in Postgres, set through `cli risk set-limits`.
+    # Broker order calls allowed per second and per minute. `le=` is the hard ceiling in code
+    # (engine.risk.ceilings): a larger value refuses to start, whatever the environment says.
+    # (At least 2 each: one token cannot be both reserved for exits and left for entries.)
+    order_rate_per_s: int = Field(default=3, ge=2, le=ORDERS_PER_S_CEILING)
+    order_rate_per_min: int = Field(default=120, ge=2, le=ORDERS_PER_MIN_CEILING)
+    # Share of each window's tokens kept back for exits and cancels, so entries can never starve
+    # them. Entries get the rest.
+    order_rate_exit_share: float = Field(default=0.4, gt=0, lt=1)
+    # Longest the risk engine waits before writing the day's peak and floor to Postgres (they
+    # are also written before acting on a halt or kill), and how often its monitor wakes. The
+    # gate refuses entries when the monitor has been silent for three intervals, and a crash can
+    # lose one persist interval of peak movement, so both are capped low (design §10).
+    risk_persist_interval_s: float = Field(default=1, gt=0, le=10)
+    risk_monitor_interval_s: float = Field(default=1, gt=0, le=5)
 
     @field_validator("database_url")
     @classmethod

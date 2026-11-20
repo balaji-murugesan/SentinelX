@@ -20,7 +20,7 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from contracts.market import InstrumentKey
-from contracts.snapshot import PositionView, Snapshot, snapshot_key
+from contracts.snapshot import PositionView, RiskStatus, Snapshot, snapshot_key
 from engine.market_data.bus import Subscription
 from engine.market_data.clock import utc_now
 from engine.market_data.provider import FeedStatus, Tick
@@ -40,13 +40,17 @@ class SnapshotWriter:
         account_id: str,
         interval_s: float,
         now: Callable[[], datetime] = utc_now,
+        risk: Callable[[], RiskStatus | None] | None = None,
     ) -> None:
+        """``risk`` returns the risk engine's figures for the snapshot's risk block (None: no
+        figures yet). It is injected so this module does not depend on ``engine.risk``."""
         self._redis = redis
         self._service = service
         self._ticks = ticks
         self._account_id = account_id
         self._interval_s = interval_s
         self._now = now
+        self._risk = risk
         self._prices: dict[InstrumentKey, Decimal] = {}
 
     def build(self) -> Snapshot:
@@ -81,6 +85,7 @@ class SnapshotWriter:
             positions=views,
             halted=bool(self._service.halt_differences),
             halt_differences=list(self._service.halt_differences),
+            risk=None if self._risk is None else self._risk(),
         )
 
     async def write_once(self) -> None:

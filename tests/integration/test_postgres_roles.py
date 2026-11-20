@@ -316,9 +316,10 @@ def run_migrate(monkeypatch: pytest.MonkeyPatch, db: Db) -> None:
     migrate.main()
 
 
-HEAD = "0003"  # newest migration; bump with each new one
+HEAD = "0004"  # newest migration; bump with each new one
 TRADING_TABLES = {
     "orders", "order_events", "fills", "positions", "command_results", "recovery_state",
+    "risk_limits", "risk_day_state", "risk_event",
 }  # fmt: skip
 
 
@@ -331,7 +332,7 @@ def test_migrations_create_trading_tables_the_engine_role_can_use(
     version = as_migrate(db, "SELECT version_num FROM migrations.alembic_version")
     assert [r["version_num"] for r in version] == [HEAD]
     tables = as_migrate(db, "SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
-    assert {r["tablename"] for r in tables} == TRADING_TABLES  # Stage 2 (0002, 0003)
+    assert {r["tablename"] for r in tables} == TRADING_TABLES  # Stages 2 and 3 (0002, 0003, 0004)
     # The real engine role (init.sql default privileges) reads and writes them.
     as_engine(db, "INSERT INTO command_results VALUES ('main', 'k', 'c', false, NULL, 'x', now())")
     assert as_engine(db, "SELECT count(*) AS n FROM command_results")[0]["n"] == 1
@@ -347,6 +348,93 @@ def test_downgrade_to_base_works(db: Db, monkeypatch: pytest.MonkeyPatch) -> Non
     assert as_migrate(db, "SELECT version_num FROM migrations.alembic_version") == []
     run_migrate(monkeypatch, db)  # and back up again
     assert as_migrate(db, "SELECT version_num FROM migrations.alembic_version")[0][0] == HEAD
+
+
+RISK_EVENT_INSERT = (
+    "INSERT INTO risk_event (at, account_id, rule, phase, decision, reason_code, inputs, "
+    "enforced, latency_us) VALUES (now(), 'main', 'gate', 'verdict', 'ALLOW', NULL, "
+    "'{}'::json, true, 5) RETURNING event_id"
+)
+
+
+def test_the_engine_role_can_add_but_never_change_or_remove_a_risk_event(
+    db: Db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scenario "Audit is append-only" (risk-gate): the migration revokes UPDATE and DELETE."""
+    run_migrate(monkeypatch, db)
+    try:
+        assert as_engine(db, RISK_EVENT_INSERT)  # adding an audit row works
+        assert as_engine(db, "SELECT count(*) AS n FROM risk_event")[0]["n"] == 1  # and reading
+        for statement in (
+            "UPDATE risk_event SET decision = 'ALLOW', reason_code = NULL",
+            "DELETE FROM risk_event",
+            "TRUNCATE risk_event",
+        ):
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                as_engine(db, statement)
+        assert as_engine(db, "SELECT count(*) AS n FROM risk_event")[0]["n"] == 1  # untouched
+    finally:
+        as_migrate(db, "DELETE FROM risk_event")  # the owner role can tidy up; the engine cannot
+
+
+def test_the_engine_role_can_use_the_other_new_tables_and_the_order_stop_columns(
+    db: Db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_migrate(monkeypatch, db)
+    try:
+        as_engine(db, "INSERT INTO risk_limits VALUES ('main', '{\"a\": \"1\"}'::json, 1, now())")
+        as_engine(db, "UPDATE risk_limits SET version = 2")
+        assert as_engine(db, "SELECT version FROM risk_limits")[0]["version"] == 2
+        as_engine(
+            db,
+            "INSERT INTO risk_day_state VALUES ('main', current_date, 0, NULL, 0, NULL, 0, 0, "
+            "NULL, NULL, now())",
+        )
+        as_engine(db, "UPDATE risk_day_state SET entries_today = 3")
+        assert as_engine(db, "SELECT entries_today FROM risk_day_state")[0][0] == 3
+        as_engine(
+            db,
+            "INSERT INTO orders (order_id, account_id, segment, security_id, side, quantity, "
+            "product, order_type, limit_price, trigger_price, initial_stop, idempotency_key, "
+            "source, state, filled_quantity, paper, created_at, updated_at) VALUES ('o1', 'main', "
+            "'NSE_FNO', '53720', 'SELL', 65, 'INTRADAY', 'STOP_MARKET', NULL, 160.00, 190.05, "
+            "'k', 'risk-stop', 'Open', 0, true, now(), now())",
+        )
+        row = as_engine(db, "SELECT trigger_price, initial_stop FROM orders")[0]
+        assert (str(row["trigger_price"]), str(row["initial_stop"])) == ("160.00", "190.05")
+    finally:
+        for table in ("orders", "risk_day_state", "risk_limits"):
+            as_engine(db, f"DELETE FROM {table}")
+
+
+def test_downgrade_to_0003_removes_the_risk_schema_and_upgrade_restores_it(
+    db: Db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_migrate(monkeypatch, db)
+    command.downgrade(migrate.alembic_config(db.migrate_url()), "0003")
+
+    tables = {
+        r["tablename"]
+        for r in as_migrate(db, "SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+    }
+    assert not tables & {"risk_limits", "risk_day_state", "risk_event"}
+    columns = {
+        r["column_name"]
+        for r in as_migrate(
+            db, "SELECT column_name FROM information_schema.columns WHERE table_name = 'orders'"
+        )
+    }
+    assert not columns & {"trigger_price", "initial_stop"}
+    assert as_migrate(db, "SELECT version_num FROM migrations.alembic_version")[0][0] == "0003"
+
+    run_migrate(monkeypatch, db)  # back to head: the append-only grant is applied again
+    assert as_migrate(db, "SELECT version_num FROM migrations.alembic_version")[0][0] == HEAD
+    try:
+        as_engine(db, RISK_EVENT_INSERT)
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            as_engine(db, "DELETE FROM risk_event")
+    finally:
+        as_migrate(db, "DELETE FROM risk_event")
 
 
 def test_failing_migration_exits_nonzero_without_leaking_credentials(

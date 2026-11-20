@@ -6,7 +6,11 @@ Fills are deliberately conservative so paper results are not better than live:
     is missing or stale;
   * limit orders rest until a later tick trades at or through the limit, then fill at the
     limit (a real limit order never gets a better price from a later trade); one that is
-    marketable on arrival fills at once at the better of its limit and the latest price.
+    marketable on arrival fills at once at the better of its limit and the latest price;
+  * stop-market orders (the catastrophic stop) rest until a tick trades at or through their
+    trigger (a sell stop at or below it, a buy stop at or above it), then fill like a market
+    order: at the latest price moved against the trader by the slippage, which after a gap is
+    worse than the trigger. A stop already through its trigger on arrival triggers at once.
 Accepted optimism (documented in the README): whole-quantity fills, no queue position.
 
 It never makes a network call; the tick bus is its only input.
@@ -81,6 +85,15 @@ class PaperBroker:
             self._remember(broker_id, order)
             self._fill(broker_id, order, fill_at, instrument)
             return BrokerAck(broker_id)
+        if order.order_type is OrderType.STOP_MARKET:
+            assert order.trigger_price is not None  # guaranteed by the Order model
+            self._remember(broker_id, order)
+            last = self._fresh_price(order.key)
+            if last is not None and _triggered(order.side, order.trigger_price, last):
+                self._trigger(broker_id, order, last, instrument)
+            else:
+                self._resting[broker_id] = order
+            return BrokerAck(broker_id)
         assert order.limit_price is not None  # guaranteed by the Order model
         self._remember(broker_id, order)
         price = self._fresh_price(order.key)
@@ -123,19 +136,28 @@ class PaperBroker:
                 self.on_tick(item)
 
     def on_tick(self, tick: Tick) -> None:
-        """Record the price; fill every resting limit this tick trades through."""
+        """Record the price; fill every resting limit this tick trades through, and trigger every
+        resting stop it trades through."""
         self._prices[tick.key] = _Price(tick.ltp, tick.received_at)
         for broker_id, order in list(self._resting.items()):
+            if order.key != tick.key:
+                continue
+            instrument = self._instrument(order.key)
+            if instrument is None:
+                continue  # cannot price costs without the instrument; try next tick
+            if order.order_type is OrderType.STOP_MARKET:
+                assert order.trigger_price is not None
+                if _triggered(order.side, order.trigger_price, tick.ltp):
+                    del self._resting[broker_id]
+                    self._trigger(broker_id, order, tick.ltp, instrument)
+                continue
             assert order.limit_price is not None
-            if order.key == tick.key and _marketable(order.side, order.limit_price, tick.ltp):
-                instrument = self._instrument(order.key)
-                if instrument is None:
-                    continue  # cannot price costs without the instrument; try next tick
+            if _marketable(order.side, order.limit_price, tick.ltp):
                 del self._resting[broker_id]
                 self._fill(broker_id, order, order.limit_price, instrument)
 
     def restore(self, orders: list[Order]) -> None:
-        """After a restart, resume the resting limit orders the engine still has open."""
+        """After a restart, resume the resting limit and stop orders the engine still has open."""
         for order in orders:
             if order.state is OrderState.OPEN and order.broker_order_id is not None:
                 self._resting[order.broker_order_id] = order
@@ -153,6 +175,12 @@ class PaperBroker:
 
     def _remember(self, broker_id: str, order: Order) -> None:
         self._book[broker_id] = _book_entry(broker_id, order, OrderState.OPEN)
+
+    def _trigger(self, broker_id: str, order: Order, last: Decimal, instrument: Instrument) -> None:
+        """A stop has been reached: it fills like a market order at ``last`` moved against the
+        trader by the slippage. After a gap that is worse than the trigger, never better."""
+        price = market_fill_price(last, instrument.tick_size, self._slippage_ticks, order.side)
+        self._fill(broker_id, order, price, instrument)
 
     def _fill(self, broker_id: str, order: Order, price: Decimal, instrument: Instrument) -> None:
         costs = fill_costs(
@@ -185,6 +213,12 @@ def market_fill_price(
     if side is OrderSide.BUY:
         return last + slip
     return max(last - slip, tick)
+
+
+def _triggered(side: OrderSide, trigger: Decimal, price: Decimal) -> bool:
+    """A sell stop (protecting a long) triggers when the price trades at or below it; a buy stop
+    (protecting a short) when it trades at or above it."""
+    return price <= trigger if side is OrderSide.SELL else price >= trigger
 
 
 def _marketable(side: OrderSide, limit: Decimal, price: Decimal) -> bool:

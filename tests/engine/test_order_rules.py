@@ -14,9 +14,7 @@ import pytest
 
 from contracts.commands import PlaceOrder
 from contracts.market import Instrument, InstrumentKey
-from contracts.mode import TradingMode
 from contracts.orders import Order, OrderSide, OrderState, OrderType, ProductType
-from engine.orders.gate import LIVE_NOT_READY, PaperOnlyGate
 from engine.orders.machine import TRANSITIONS, InvalidTransition, can_transition, transition
 from engine.orders.validation import Holdings, validate
 
@@ -156,23 +154,15 @@ def order(state: OrderState = OrderState.REQUESTED, paper: bool = True, **change
     return Order(**{**values, **changes})  # type: ignore[arg-type]
 
 
-async def test_paper_orders_pass_the_stub_gate() -> None:
-    assert await PaperOnlyGate(TradingMode.PAPER).check(order()) is None
+# (The gate's own behaviour, live mode refused and a non-paper order refused in paper mode, is
+# tested against the real gate in ``test_risk_gate``; the stub that stood here is gone.)
 
-
-async def test_live_mode_before_the_risk_engine() -> None:
-    gate = PaperOnlyGate(TradingMode.LIVE)
-    assert await gate.check(order(paper=False)) == LIVE_NOT_READY
-    assert await gate.check(order(paper=True)) == LIVE_NOT_READY  # live mode refuses all
-
-
-async def test_non_paper_order_refused_even_in_paper_mode() -> None:
-    assert await PaperOnlyGate(TradingMode.PAPER).check(order(paper=False)) == LIVE_NOT_READY
+REFUSAL = "RISK_LIVE_NOT_ENABLED: live orders are not enabled yet"
 
 
 def test_gate_rejection_is_final() -> None:
-    rejected = transition(order(), OrderState.REJECTED, at=NOW, reason=LIVE_NOT_READY)
-    assert rejected.state.is_final and rejected.reason == LIVE_NOT_READY
+    rejected = transition(order(), OrderState.REJECTED, at=NOW, reason=REFUSAL)
+    assert rejected.state.is_final and rejected.reason == REFUSAL
     with pytest.raises(InvalidTransition):
         transition(rejected, OrderState.SUBMITTED, at=NOW)  # never reaches the broker
 
@@ -219,3 +209,20 @@ def test_transition_carries_changes_and_revalidates() -> None:
     assert opened.broker_order_id == "paper-1"
     with pytest.raises(ValueError):
         transition(order(state=S.OPEN), S.FILLED, at=NOW, filled_quantity=-1)
+
+
+# ---- add-risk-engine task 9.1: stop-market orders ------------------------------------------
+
+
+def test_a_stop_market_with_its_trigger_on_the_tick_grid_passes_validation() -> None:
+    stop = command(order_type=OrderType.STOP_MARKET, trigger_price=Decimal("160.00"))
+
+    assert check(stop) is None
+
+
+def test_a_stop_market_trigger_off_the_tick_grid_is_refused() -> None:
+    stop = command(order_type=OrderType.STOP_MARKET, trigger_price=Decimal("160.03"))
+
+    reason = check(stop)
+
+    assert reason is not None and "trigger price" in reason and "tick grid" in reason

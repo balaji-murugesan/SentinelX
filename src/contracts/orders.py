@@ -6,6 +6,12 @@ Trading terms used below:
                    only from holdings); MARGIN carries F&O positions overnight.
   * market order - fills at the best available price now; limit order - fills only at the
                    limit price or better.
+  * stop-market  - a resting order that does nothing until the price trades at or through its
+                   trigger price, then becomes a market order. It is how a stop-loss rests at
+                   the exchange: a sell stop below the price protects a long position.
+  * initial stop - the price at which the trader accepts being wrong on an entry. It sizes the
+                   trade (risk = distance to the stop x quantity) and is NOT a resting order;
+                   the engine watches it (the exchange-side backstop is the catastrophic stop).
   * fill         - one execution of (part of) an order at one price.
   * MTM          - mark-to-market: unrealized P&L of an open position at the latest price.
 
@@ -37,6 +43,7 @@ class ProductType(StrEnum):
 class OrderType(StrEnum):
     MARKET = "MARKET"
     LIMIT = "LIMIT"
+    STOP_MARKET = "STOP_MARKET"
 
 
 class OrderState(StrEnum):
@@ -56,12 +63,19 @@ class OrderState(StrEnum):
         return self in (OrderState.FILLED, OrderState.REJECTED, OrderState.CANCELLED)
 
 
-def check_limit_price(order_type: OrderType, limit_price: Decimal | None) -> None:
-    """A LIMIT order needs a limit price; a MARKET order must not have one."""
+def check_limit_price(
+    order_type: OrderType, limit_price: Decimal | None, trigger_price: Decimal | None = None
+) -> None:
+    """Which prices each order type carries. LIMIT needs a limit price; MARKET and STOP_MARKET
+    must not have one. STOP_MARKET needs a trigger price; the other types must not have one."""
     if order_type is OrderType.LIMIT and limit_price is None:
         raise ValueError("limit_price is required for a LIMIT order")
-    if order_type is OrderType.MARKET and limit_price is not None:
-        raise ValueError("limit_price must not be set for a MARKET order")
+    if order_type is not OrderType.LIMIT and limit_price is not None:
+        raise ValueError(f"limit_price must not be set for a {order_type.value} order")
+    if order_type is OrderType.STOP_MARKET and trigger_price is None:
+        raise ValueError("trigger_price is required for a STOP_MARKET order")
+    if order_type is not OrderType.STOP_MARKET and trigger_price is not None:
+        raise ValueError(f"trigger_price must not be set for a {order_type.value} order")
 
 
 class Order(BaseModel):
@@ -78,6 +92,13 @@ class Order(BaseModel):
     product: ProductType
     order_type: OrderType
     limit_price: Decimal | None = None
+    # New in add-risk-engine, optional with a default, so rows and payloads from before it still
+    # parse (schema_version stays 1). The trigger belongs to STOP_MARKET orders only; the
+    # initial stop belongs to entries (the risk rules require it, the contract does not).
+    # ``Field(default=None, gt=0)`` is a declarative guard, like a C# ``[Range]`` attribute: the
+    # value is checked when the model is built, and None (absent) skips the check.
+    trigger_price: Decimal | None = Field(default=None, gt=0)
+    initial_stop: Decimal | None = Field(default=None, gt=0)
     idempotency_key: str
     source: str
     state: OrderState = OrderState.REQUESTED
@@ -92,7 +113,7 @@ class Order(BaseModel):
     # @model_validator(mode="after") runs once all fields are set, for cross-field rules.
     @model_validator(mode="after")
     def _limit_price_matches_type(self) -> Self:
-        check_limit_price(self.order_type, self.limit_price)
+        check_limit_price(self.order_type, self.limit_price, self.trigger_price)
         return self
 
 

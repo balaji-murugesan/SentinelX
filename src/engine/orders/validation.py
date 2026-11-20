@@ -63,6 +63,13 @@ def validate(
         )
     if reason := _freeze_reason(command, instrument):
         return reason
+    if command.order_type is OrderType.STOP_MARKET:
+        assert command.trigger_price is not None  # guaranteed by the PlaceOrder model
+        if command.trigger_price % instrument.tick_size:
+            return (
+                f"trigger price {command.trigger_price} is not on the tick grid "
+                f"(tick size {instrument.tick_size})"
+            )
     if command.order_type is OrderType.LIMIT:
         assert command.limit_price is not None  # guaranteed by the PlaceOrder model
         if command.limit_price % instrument.tick_size:

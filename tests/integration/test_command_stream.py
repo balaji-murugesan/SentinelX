@@ -17,8 +17,9 @@ from contracts.commands import (
     COMMAND_GROUP,
     COMMAND_STREAM,
     REPLY_TTL_SECONDS,
+    AnyCommand,
     CommandResult,
-    PlaceOrder,
+    KillSwitch,
     ResumeRecovery,
     reply_stream,
 )
@@ -53,7 +54,7 @@ async def redis() -> AsyncIterator[Redis]:
     await client.aclose()
 
 
-async def send(redis: Redis, cmd: PlaceOrder) -> None:
+async def send(redis: Redis, cmd: AnyCommand) -> None:
     await redis.xadd(COMMAND_STREAM, {"data": cmd.model_dump_json()})
 
 
@@ -144,6 +145,31 @@ async def test_malformed_command_is_skipped_and_the_consumer_keeps_reading(redis
 
     assert reply.accepted
     assert len(repo.orders) == 1 and len(adapter.placed) == 1
+
+
+async def test_a_command_with_no_handler_is_answered_and_the_consumer_keeps_reading(
+    redis: Redis,
+) -> None:
+    """A kill_switch parses but nothing handles it until add-risk-engine group 10: it must get a
+    refusal, be acknowledged, and leave the loop alive (an exception here would stop it)."""
+    service, adapter, repo = build()
+    kill = KillSwitch(
+        command_id="c-kill", idempotency_key="k-kill", account_id="main", source="cli", sent_at=NOW
+    )
+    stop, task = await run_consumer(redis, service)
+    try:
+        await send(redis, kill)
+        refused = await reply_for(redis, "c-kill")
+        await send(redis, command("after-kill"))
+        placed = await reply_for(redis, "c-after-kill")
+        await eventually(lambda: _no_pending(redis))  # the kill was acknowledged, not replayed
+        assert not task.done()  # the consumer task is still running
+    finally:
+        await stop_consumer(stop, task)
+
+    assert not refused.accepted and "not supported" in (refused.reason or "")
+    assert placed.accepted
+    assert len(repo.orders) == 1 and len(adapter.placed) == 1  # only the normal order
 
 
 async def test_command_for_another_account_is_rejected_without_an_order(redis: Redis) -> None:

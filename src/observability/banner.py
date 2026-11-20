@@ -27,6 +27,25 @@ def log_startup_banner(
         logger.info(banner, **fields)
 
 
+def log_day_halt_banner(service: str, account: str, level: str, reason: str | None) -> None:
+    """Emit a banner when the engine starts on a day the risk engine has already locked.
+
+    The lock has no intraday resume: new entries are refused until the next trading day, and a
+    restart does not change that. Said loudly at start, so the owner is not left to find out from
+    a rejected order. ``level`` is the halt level's name and ``reason`` the engine's own text.
+    """
+    logger = structlog.get_logger(service)
+    logger.error(
+        f"=== SENTINELX {service.upper()} | DAY LOCKED ({level}) | NEW ENTRIES REFUSED UNTIL "
+        f"THE NEXT TRADING DAY | ACCOUNT: {account.upper()} ===",
+        service=service,
+        account=account,
+        day_halt=level,
+    )
+    if reason:
+        logger.error(f"DAY LOCKED: {reason}", service=service, account=account)
+
+
 def log_halted_banner(service: str, account: str, differences: list[str]) -> None:
     """Emit the HALTED block at ERROR level: one banner line, then one record per difference.
 
