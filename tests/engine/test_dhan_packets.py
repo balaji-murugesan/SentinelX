@@ -28,9 +28,11 @@ from engine.broker.dhan.packets import (
     round_to_tick,
 )
 
-# 2026-10-27 10:00:00 IST written as an "IST epoch" (IST wall clock counted as UTC).
-LTT_IST_EPOCH = int(datetime(2026, 10, 27, 10, 0, tzinfo=UTC).timestamp())
+# 2026-10-27 10:00:00 IST as Dhan sends it since 2026-11-20: a true UTC epoch. (Through
+# 2026-11-19 it was an "IST epoch", the IST wall clock counted as UTC; see
+# packets.LTT_IS_IST_EPOCH.)
 LTT_UTC = datetime(2026, 10, 27, 4, 30, tzinfo=UTC)
+LTT_EPOCH = int(LTT_UTC.timestamp())
 
 
 def header(code: int, segment: int, security_id: int) -> bytes:
@@ -38,19 +40,19 @@ def header(code: int, segment: int, security_id: int) -> bytes:
 
 
 def ticker(ltp: float, code: int = TICKER, segment: int = 0, security_id: int = 13) -> bytes:
-    return header(code, segment, security_id) + struct.pack("<fi", ltp, LTT_IST_EPOCH)
+    return header(code, segment, security_id) + struct.pack("<fi", ltp, LTT_EPOCH)
 
 
 def quote(ltp: float, ltq: int = 75, volume: int = 123456, security_id: int = 52175) -> bytes:
     body = struct.pack(
-        "<fhifiiiffff", ltp, ltq, LTT_IST_EPOCH, 101.5, volume, 10, 20, 100.0, 0.0, 110.0, 95.0
+        "<fhifiiiffff", ltp, ltq, LTT_EPOCH, 101.5, volume, 10, 20, 100.0, 0.0, 110.0, 95.0
     )
     return header(QUOTE, 2, security_id) + body
 
 
 def full(ltp: float) -> bytes:
     body = struct.pack(
-        "<fhifiiiiiiffff", ltp, 50, LTT_IST_EPOCH, 1.0, 999, 1, 2, 3, 4, 5, 1.0, 0.0, 2.0, 0.5
+        "<fhifiiiiiiffff", ltp, 50, LTT_EPOCH, 1.0, 999, 1, 2, 3, 4, 5, 1.0, 0.0, 2.0, 0.5
     )
     return header(FULL, 2, 52175) + body + bytes(100)
 
@@ -140,8 +142,11 @@ def test_high_price_needs_tick_rounding() -> None:
     [
         (timedelta(milliseconds=300), False),  # a normal live tick
         (timedelta(minutes=5), False),  # a thinly traded option
-        (timedelta(hours=5, minutes=30), True),  # constant True but Dhan sends true UTC
-        (-timedelta(hours=5, minutes=30), True),  # constant False but Dhan sends IST epoch
+        (timedelta(hours=5, minutes=30), True),  # constant True but Dhan sends true UTC (11-20)
+        (
+            -timedelta(hours=5, minutes=30),
+            True,
+        ),  # constant False but Dhan sends IST epoch (<=11-19)
         (timedelta(hours=5, minutes=30, seconds=590), True),  # inside the 10-minute tolerance
         (timedelta(hours=5, minutes=41), False),  # outside it
         (timedelta(hours=5, minutes=19), False),
@@ -152,5 +157,5 @@ def test_lag_near_ist_offset_flags_wrong_ltt_zone(lag: timedelta, wrong: bool) -
 
 
 def test_ltt_converted_to_utc() -> None:
-    assert ltt_to_utc(LTT_IST_EPOCH) == LTT_UTC
-    assert ltt_to_utc(LTT_IST_EPOCH).tzinfo is UTC
+    assert ltt_to_utc(LTT_EPOCH) == LTT_UTC
+    assert ltt_to_utc(LTT_EPOCH).tzinfo is UTC

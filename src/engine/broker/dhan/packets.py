@@ -47,11 +47,12 @@ SIZES = {
     DISCONNECT: HEADER.size + _DISCONNECT.size,
 }
 
-# ASSUMPTION, verified in task 7.2 (owner smoke test): Dhan's LTT is "IST epoch", i.e. the IST
-# wall-clock time counted as if it were UTC, as the DhanHQ SDK's display code implies. Converting
-# therefore subtracts 5h30m. If the smoke test shows exchange_time 5h30m away from the receive
-# time, flip this one constant.
-LTT_IS_IST_EPOCH = True
+# Dhan's LTT changed convention between sessions. Through 2026-11-19 it was an "IST epoch" (the
+# IST wall-clock time counted as if it were UTC), so conversion subtracted 5h30m. On 2026-11-20
+# (owner's smoke test 7.2) every tick arrived 5h30m off, so it is now a true UTC epoch and the
+# constant is False. If the lag guard below fires again, Dhan has changed back: flip this
+# one constant. (Automatic detection would survive such a change; not built, see task 7.2.)
+LTT_IS_IST_EPOCH = False
 _IST_OFFSET = timedelta(hours=5, minutes=30)
 # Guard for that assumption: if the constant is wrong, every exchange time is off by exactly
 # the IST offset, so a live tick's lag (receive time - exchange time) sits near +5h30m or
