@@ -12,8 +12,15 @@ def test_every_registered_rule_is_a_rule_the_limits_know_by_name() -> None:
     assert set(names) <= set(RULES)  # so each has a mode and a shadow rule
 
 
+# add-risk-guards added these rule names to the limits (task 3.1) before their checks exist
+# (groups 5-9). Each group that registers a check removes its name here, so a rule left without a
+# check, or a check whose name is still listed, fails the test below.
+NOT_BUILT_YET = {"lot_caps", "entry_pacing", "reject_breaker", "profit_target", "instrument_policy"}
+
+
 def test_every_rule_in_the_limits_table_is_registered() -> None:
-    assert {check.name for check in default_checks()} == set(RULES)
+    assert NOT_BUILT_YET <= set(RULES)
+    assert {check.name for check in default_checks()} == set(RULES) - NOT_BUILT_YET
 
 
 def test_only_price_sanity_judges_exits() -> None:

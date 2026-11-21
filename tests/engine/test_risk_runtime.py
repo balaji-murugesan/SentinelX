@@ -36,6 +36,7 @@ from engine.risk.runtime import RiskRuntime
 from tests.engine.risk_builders import NOW, OPTION, TODAY, fill, instrument_of, position
 from tests.engine.risk_fakes import MemoryRiskRepository
 from tests.engine.test_order_service import build
+from tests.engine.test_risk_checks_registry import NOT_BUILT_YET
 from tests.engine.test_risk_limits import BASE, edit
 from tests.engine.test_risk_stops import Clock, StopAdapter
 from tests.engine.trading_fakes import MemoryRepository
@@ -144,7 +145,8 @@ def test_the_engines_rules_are_exactly_the_ones_in_the_rule_table() -> None:
     The catastrophic-stop check has no mode on purpose (a missing stop always binds)."""
     names = {c.name for c in default_checks()} | {c.name for c in continuous_checks()}
 
-    assert names - {"catastrophic_stop"} == set(RULES)
+    assert NOT_BUILT_YET <= set(RULES)
+    assert names - {"catastrophic_stop"} == set(RULES) - NOT_BUILT_YET
 
 
 def test_the_engine_registers_every_check_once() -> None:

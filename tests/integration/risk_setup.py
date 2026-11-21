@@ -8,7 +8,9 @@ about them is a recommendation. They are chosen so a rule can never end a test b
     does not decide whether an entry is allowed;
   * the loss limit is huge and every optional floor term is off, so the simulated random walk can
     never breach the floor and trigger a kill;
-  * the price band is wide, so a far resting limit order still passes the price check.
+  * the price band is wide, so a far resting limit order still passes the price check;
+  * the lot caps, entry pacing and rejection breaker (add-risk-guards) are far above anything a
+    test does, and every optional add-risk-guards limit is unset.
 """
 
 import asyncio
@@ -40,6 +42,9 @@ ALL_DAY: dict[str, LimitValue] = {
     "lock_mode": "OFF", "trail_loss_x": None, "trail_loss_y": None, "lock_trigger": None,
     "lock_at": None, "trail_step": None, "trail_by": None, "giveback_arm": None,
     "giveback_abs": None, "giveback_pct": None,
+    "max_open_lots_per_underlying": 100, "max_open_lots_total": 100,
+    "max_gross_lots_per_day": 1000, "max_entries_per_minute": 100, "reject_breaker_n": 100,
+    "min_entry_gap_s": 1,
 }  # fmt: skip
 
 

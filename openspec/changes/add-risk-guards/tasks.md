@@ -26,14 +26,14 @@
 
 ## 3. Limits
 
-- [ ] 3.1 Extend `engine/risk/limits.py`:
+- [x] 3.1 Extend `engine/risk/limits.py`:
   - add `Unit.LOTS` and `Unit.SYMBOLS`, and `Direction.SUBSET` and `SUPERSET`;
   - add the rows in design §8;
   - add the new rule names (`lot_caps`, `entry_pacing`, `reject_breaker`, `profit_target`, `instrument_policy`) to `RULES`, all shadowable;
   - extend `RiskLimits` and `to_values`.
 
   Verify the per-row direction tests cover every new key, and that `parse_limits(limits.to_values()) == limits` holds with symbol lists.
-- [ ] 3.2 Add the consistency rules to `_consistency_problems` (spec `lot-caps`, `expiry-day-profile`, `profit-target`):
+- [x] 3.2 Add the consistency rules to `_consistency_problems` (spec `lot-caps`, `expiry-day-profile`, `profit-target`):
   - per-underlying cap ≤ total cap, for the base pair and the expiry pair;
   - each set expiry override no looser than its set base;
   - a giveback leg override only for a leg the base term sets;
@@ -41,8 +41,8 @@
   - a target requires a confirmation count.
 
   Verify one unit test per rule, each naming the scenario it covers.
-- [ ] 3.3 Implement `RiskLimits.floor_params(expiry: bool)`, so the expiry giveback overrides replace their base values when `expiry` is true. Extend the `hypothesis` property "a tightening never lowers the floor at any peak" to the expiry keys with `expiry` drawn both ways, and add a property that the expiry floor is never below the base floor. Verify both properties pass, and run the reviewer's mutation checks on the new consistency rules.
-- [ ] 3.4 Update `docs/risk-limits.example.json` with every new key, keeping it marked "example values, not a recommendation". Extend the README's "Setting risk limits" section: the new required keys, the after-the-close upgrade step, and that strike distance needs the underlying's index in `FEED_INSTRUMENTS`. Verify the example file is accepted by `parse_limits` in a test, and `cli risk set-limits --file` accepts it against `TEST_REDIS_URL`.
+- [x] 3.3 Implement `RiskLimits.floor_params(expiry: bool)`, so the expiry giveback overrides replace their base values when `expiry` is true. Extend the `hypothesis` property "a tightening never lowers the floor at any peak" to the expiry keys with `expiry` drawn both ways, and add a property that the expiry floor is never below the base floor. Verify both properties pass, and run the reviewer's mutation checks on the new consistency rules.
+- [x] 3.4 Update `docs/risk-limits.example.json` with every new key, keeping it marked "example values, not a recommendation". Extend the README's "Setting risk limits" section: the new required keys, the after-the-close upgrade step, and that strike distance needs the underlying's index in `FEED_INSTRUMENTS`. Verify the example file is accepted by `parse_limits` in a test, and `cli risk set-limits --file` accepts it against `TEST_REDIS_URL`.
 
 ## 4. Day counters and context
 

@@ -27,7 +27,7 @@ from contracts.snapshot import HaltLevel, PositionRef, RiskStatus, Snapshot, sna
 from engine.orders.commands import CommandConsumer
 from engine.risk.daybook import DayBook
 from engine.risk.kill import KillSwitch
-from engine.risk.limits import parse_limits
+from engine.risk.limits import MODE_PREFIX, REGISTRY, parse_limits
 from engine.risk.limits_service import LimitsService
 from engine.risk.sizing import SizingService
 from tests.engine.risk_builders import NOW, OPTION, instrument_of, order
@@ -54,6 +54,19 @@ def test_the_example_limits_file_is_valid_and_its_comments_are_dropped() -> None
 
     assert not any(key.startswith("_") for key in limits)
     assert parse_limits(limits).daily_max_loss == D(3000)  # the engine accepts every key and value
+
+
+def test_the_example_limits_file_shows_every_limit_and_says_it_is_not_a_recommendation() -> None:
+    """add-risk-guards task 3.4: every limit is in the file (an optional one may be null), so the
+    owner sees each new key, and the file still says its values are only examples."""
+    limits = cli.read_limits_file(EXAMPLE)
+    raw = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+
+    assert set(limits) == {key for key in REGISTRY if not key.startswith(MODE_PREFIX)}
+    assert "NOT A RECOMMENDATION" in raw["_note"]
+    parsed = parse_limits(limits)
+    assert parsed.allowed_underlyings == frozenset({"NIFTY", "BANKNIFTY"})
+    assert parsed.max_gross_lots_per_day == 10
 
 
 def test_a_fractional_number_in_a_limits_file_is_refused_with_the_fix(tmp_path: Path) -> None:

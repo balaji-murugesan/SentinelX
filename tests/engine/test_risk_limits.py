@@ -56,7 +56,23 @@ BASE: dict[str, LimitValue] = {
     "lock_mode": "LOCK", "lock_trigger": "1000", "lock_at": "200",
     "trail_step": "500", "trail_by": "250",
     "giveback_arm": "2000", "giveback_abs": "1000", "giveback_pct": "30",
+    # add-risk-guards' required limits (test values).
+    "max_open_lots_per_underlying": 10, "max_open_lots_total": 20, "max_gross_lots_per_day": 50,
+    "max_entries_per_minute": 5, "reject_breaker_n": 3, "min_entry_gap_s": 5,
 }  # fmt: skip
+
+# Every optional limit that add-risk-guards added, set, so each can be moved both ways. Kept out of
+# BASE (which the gate, monitor and kill tests share) so a later rule cannot change those tests.
+GUARDS: dict[str, LimitValue] = {
+    "daily_profit_target": "4000", "target_confirm_ticks": 2,
+    "min_premium": "5", "max_strike_distance_pct": "3",
+    "allowed_underlyings": ["BANKNIFTY", "NIFTY"], "denied_underlyings": ["ABC", "XYZ"],
+    "entry_cutoff_expiry": "14:00", "square_off_time_expiry": "14:30",
+    "max_open_lots_per_underlying_expiry": 2, "max_open_lots_total_expiry": 4,
+    "min_premium_expiry": "15",
+    "giveback_arm_expiry": "1200", "giveback_abs_expiry": "600", "giveback_pct_expiry": "20",
+}  # fmt: skip
+FULL: dict[str, LimitValue] = {**BASE, **GUARDS}
 
 
 def edit(**changes: LimitValue) -> dict[str, LimitValue]:
@@ -65,6 +81,10 @@ def edit(**changes: LimitValue) -> dict[str, LimitValue]:
 
 def limits(**changes: LimitValue) -> RiskLimits:
     return parse_limits(edit(**changes))
+
+
+def full(**changes: LimitValue) -> dict[str, LimitValue]:
+    return {**FULL, **changes}
 
 
 # ---- parsing (task 4.1) ---------------------------------------------------------------------
@@ -77,6 +97,63 @@ def test_a_complete_set_parses_and_round_trips_through_its_flat_form() -> None:
     assert parsed.entry_cutoff.hour == 15 and parsed.entry_cutoff.minute == 0
     assert parsed.lock_mode is LockMode.LOCK
     assert parse_limits(parsed.to_values()) == parsed
+
+
+def test_every_new_limit_round_trips_including_symbol_lists() -> None:
+    parsed = parse_limits(FULL)
+
+    assert parsed.max_open_lots_total == 20 and parsed.min_entry_gap_s == 5
+    assert parsed.allowed_underlyings == frozenset({"NIFTY", "BANKNIFTY"})
+    assert parsed.giveback_pct_expiry == D(20)
+    assert parse_limits(parsed.to_values()) == parsed
+    assert parsed.to_values()["denied_underlyings"] == ["ABC", "XYZ"]  # a sorted list
+
+
+def test_symbols_are_upper_cased_deduplicated_and_stored_sorted() -> None:
+    parsed = parse_limits(full(allowed_underlyings=["nifty", " BankNifty ", "NIFTY"]))
+
+    assert parsed.allowed_underlyings == frozenset({"NIFTY", "BANKNIFTY"})
+    assert parsed.to_values()["allowed_underlyings"] == ["BANKNIFTY", "NIFTY"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [[], [""], ["NIFTY", "  "], "NIFTY", ["NIFTY", 5], 5, True],
+)
+def test_a_malformed_symbol_list_rejects_the_whole_edit(value: object) -> None:
+    """risk-limits "Empty or malformed symbol": an empty list, an empty or blank symbol, a bare
+    string or a non-text member."""
+    raw: dict[str, LimitValue] = full(allowed_underlyings=value)  # type: ignore[arg-type]
+
+    with pytest.raises(InvalidLimits, match="allowed_underlyings"):
+        parse_limits(raw)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "max_open_lots_per_underlying", "max_open_lots_total", "max_gross_lots_per_day",
+        "max_entries_per_minute", "reject_breaker_n", "min_entry_gap_s",
+    ],
+)  # fmt: skip
+def test_a_document_without_a_new_required_limit_no_longer_parses(key: str) -> None:
+    """The BREAKING step of add-risk-guards: limits stored before it lack these keys, so they are
+    unusable (entries refused) until the owner loads a new file after the close."""
+    raw = dict(BASE)
+    del raw[key]
+
+    with pytest.raises(InvalidLimits, match=f"{key} is required"):
+        parse_limits(raw)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("max_open_lots_total", 0), ("max_open_lots_total", "8"), ("max_open_lots_total", True),
+     ("max_gross_lots_per_day", -1), ("min_entry_gap_s", 0)],
+)  # fmt: skip
+def test_a_lot_count_or_gap_is_a_whole_number_of_at_least_one(key: str, value: LimitValue) -> None:
+    with pytest.raises(InvalidLimits, match=key):
+        parse_limits(edit(**{key: value}))
 
 
 def test_to_values_gives_text_for_money_and_never_a_float() -> None:
@@ -250,6 +327,146 @@ def test_trail_loss_y_may_equal_trail_loss_x() -> None:
     assert limits(trail_loss_x="500", trail_loss_y="500")
 
 
+# ---- add-risk-guards consistency rules (task 3.2) -------------------------------------------
+
+
+def test_per_underlying_above_total_is_rejected() -> None:
+    """lot-caps "Per-underlying above total"."""
+    with pytest.raises(InvalidLimits, match="max_open_lots_per_underlying must not exceed"):
+        parse_limits(edit(max_open_lots_per_underlying=10, max_open_lots_total=8))
+    with pytest.raises(InvalidLimits, match="max_open_lots_per_underlying must not exceed"):
+        parse_limits(edit(max_open_lots_per_underlying=9, max_open_lots_total=8))  # one over
+    assert limits(max_open_lots_per_underlying=8, max_open_lots_total=8)  # equal is fine
+
+
+def test_the_expiry_lot_caps_must_keep_per_underlying_within_total() -> None:
+    """lot-caps "Per-underlying above total", for the expiry pair: both overrides, and an
+    override total below the base per-underlying cap that would still apply on an expiry day."""
+    with pytest.raises(InvalidLimits, match="on an expiry day the per-underlying lot cap"):
+        parse_limits(edit(max_open_lots_per_underlying_expiry=4, max_open_lots_total_expiry=3))
+    with pytest.raises(InvalidLimits, match=r"per-underlying lot cap \(10\).*total lot cap \(6\)"):
+        parse_limits(edit(max_open_lots_total_expiry=6))  # base per-underlying is 10
+    assert limits(max_open_lots_per_underlying_expiry=6, max_open_lots_total_expiry=6)
+
+
+@pytest.mark.parametrize(
+    ("override", "base", "looser", "equal"),
+    [
+        ("entry_cutoff_expiry", "entry_cutoff", "15:30", "15:00"),
+        ("square_off_time_expiry", "square_off_time", "15:20", "15:15"),
+        ("max_open_lots_per_underlying_expiry", "max_open_lots_per_underlying", 11, 10),
+        ("max_open_lots_total_expiry", "max_open_lots_total", 21, 20),
+        ("min_premium_expiry", "min_premium", "4", "5"),  # UP: a lower minimum is looser
+        ("giveback_arm_expiry", "giveback_arm", "2100", "2000"),
+        ("giveback_abs_expiry", "giveback_abs", "1100", "1000"),
+        ("giveback_pct_expiry", "giveback_pct", "35", "30"),
+    ],
+)
+def test_an_expiry_override_looser_than_its_base_is_rejected(
+    override: str, base: str, looser: LimitValue, equal: LimitValue
+) -> None:
+    """expiry-day-profile "Override looser than base" and "Override equal to base"."""
+    settings: dict[str, LimitValue] = {"min_premium": "5"}
+    with pytest.raises(InvalidLimits, match=f"{override} must be no looser than {base}"):
+        parse_limits(edit(**settings, **{override: looser}))
+    assert parse_limits(edit(**settings, **{override: equal}))
+
+
+def test_the_spec_cutoff_example_of_a_looser_override_is_rejected() -> None:
+    """expiry-day-profile "Override looser than base": cutoff 14:00, expiry cutoff 14:30."""
+    with pytest.raises(InvalidLimits, match="entry_cutoff_expiry must be no looser"):
+        parse_limits(edit(entry_cutoff="14:00", entry_cutoff_expiry="14:30"))
+
+
+def test_an_override_equal_to_its_base_is_accepted() -> None:
+    """expiry-day-profile "Override equal to base": both total caps at 8."""
+    assert limits(
+        max_open_lots_per_underlying=8, max_open_lots_total=8, max_open_lots_total_expiry=8
+    )
+
+
+def test_an_expiry_override_without_a_base_value_is_accepted() -> None:
+    """Unset base, nothing to compare: ``min_premium_expiry`` alone applies on expiry days."""
+    assert limits(min_premium_expiry="15").min_premium is None
+
+
+def test_a_giveback_override_that_adds_a_missing_leg_is_rejected() -> None:
+    """expiry-day-profile "Override adds a missing leg": a base giveback with only giveback_pct,
+    and giveback_abs_expiry set."""
+    with pytest.raises(InvalidLimits, match="giveback_abs_expiry needs giveback_abs"):
+        parse_limits(edit(giveback_abs=None, giveback_abs_expiry="500"))
+    with pytest.raises(InvalidLimits, match="giveback_pct_expiry needs giveback_pct"):
+        parse_limits(edit(giveback_pct=None, giveback_pct_expiry="20"))
+    assert limits(giveback_abs=None, giveback_pct_expiry="20")  # a leg the base has: fine
+
+
+def test_an_expiry_only_giveback_is_accepted_and_applies_only_on_the_expiry_floor() -> None:
+    """expiry-day-profile "Expiry-only giveback": no base giveback, arm and abs overrides."""
+    parsed = limits(
+        giveback_arm=None, giveback_abs=None, giveback_pct=None,
+        giveback_arm_expiry="2000", giveback_abs_expiry="1000",
+    )  # fmt: skip
+
+    assert parsed.floor_params().giveback_arm is None
+    assert parsed.floor_params(expiry=True).giveback_arm == D(2000)
+    assert parsed.floor_params(expiry=True).giveback_abs == D(1000)
+
+
+def test_an_expiry_only_giveback_must_be_a_valid_term_of_its_own() -> None:
+    """With the base term off, the overrides alone must form a valid giveback: a leg needs the
+    arm, and the arm needs a leg."""
+    no_base: dict[str, LimitValue] = {
+        "giveback_arm": None, "giveback_abs": None, "giveback_pct": None,
+    }  # fmt: skip
+    with pytest.raises(InvalidLimits, match="expiry-day equity floor settings"):
+        parse_limits(edit(**no_base, giveback_abs_expiry="1000"))
+    with pytest.raises(InvalidLimits, match="expiry-day equity floor settings"):
+        parse_limits(edit(**no_base, giveback_arm_expiry="2000"))
+
+
+def test_the_expiry_cutoff_must_be_earlier_than_the_expiry_square_off() -> None:
+    """expiry-day-profile "Expiry cutoff after the expiry square-off": 14:00 and 13:30. The
+    effective values count: an override on one side meets the base on the other."""
+    with pytest.raises(InvalidLimits, match=r"entry cutoff \(14:00\) must be earlier"):
+        parse_limits(edit(entry_cutoff_expiry="14:00", square_off_time_expiry="13:30"))
+    with pytest.raises(InvalidLimits, match=r"entry cutoff \(15:00\) must be earlier"):
+        parse_limits(edit(square_off_time_expiry="14:30"))  # the base cutoff is 15:00
+    with pytest.raises(InvalidLimits, match=r"entry cutoff \(14:30\) must be earlier"):
+        parse_limits(edit(entry_cutoff_expiry="14:30", square_off_time_expiry="14:30"))
+    assert limits(entry_cutoff_expiry="14:00", square_off_time_expiry="14:30")
+
+
+def test_a_target_without_a_confirmation_count_is_rejected() -> None:
+    """profit-target "Target without a confirmation count"."""
+    with pytest.raises(InvalidLimits, match="daily_profit_target needs target_confirm_ticks"):
+        parse_limits(edit(daily_profit_target="4000"))
+    assert limits(daily_profit_target="4000", target_confirm_ticks=1)
+    assert limits().daily_profit_target is None  # profit-target "No target set": optional
+
+
+# ---- the expiry-day floor (task 3.3) --------------------------------------------------------
+
+
+def test_the_expiry_floor_uses_each_set_giveback_override() -> None:
+    """expiry-day-profile "Entering an expiring contract": a base giveback of 2,000 and an expiry
+    giveback of 1,000 let at most 1,000 be given back from the peak."""
+    parsed = limits(
+        giveback_arm="3000", giveback_abs="2000", giveback_pct=None, giveback_abs_expiry="1000"
+    )
+
+    assert floor_of(parsed.floor_params(), D(6000)) == D(4000)
+    assert floor_of(parsed.floor_params(expiry=True), D(6000)) == D(5000)
+    assert parsed.floor_params(expiry=True).giveback_arm == D(3000)  # unset override: base
+
+
+def test_the_expiry_flag_defaults_to_the_base_floor() -> None:
+    parsed = parse_limits(FULL)
+
+    assert parsed.floor_params() == parsed.floor_params(expiry=False)
+    assert parsed.floor_params(expiry=True) != parsed.floor_params()
+    assert parse_limits(BASE).floor_params(expiry=True) == parse_limits(BASE).floor_params()
+
+
 # ---- the registry, both directions (task 4.1) -----------------------------------------------
 
 # key -> (a tighter value, a looser value), each applied on top of BASE. Directions come from design
@@ -283,6 +500,27 @@ DIRECTION_CASES: dict[str, tuple[LimitValue, LimitValue]] = {
     "giveback_arm": ("1500", "2500"),  # down
     "giveback_abs": ("800", "1200"),  # down
     "giveback_pct": ("25", "35"),  # down
+    # add-risk-guards (design §8), each applied on top of FULL.
+    "max_open_lots_per_underlying": (9, 11),  # down
+    "max_open_lots_total": (19, 21),  # down
+    "max_gross_lots_per_day": (49, 51),  # down
+    "max_entries_per_minute": (4, 6),  # down
+    "reject_breaker_n": (2, 4),  # down: tripping on fewer rejections is tighter
+    "min_entry_gap_s": (10, 2),  # UP: a longer gap between entries is tighter
+    "daily_profit_target": ("3000", "5000"),  # down: a lower target stops the day sooner
+    "target_confirm_ticks": (1, 3),  # down: fewer confirmations stop the day sooner
+    "min_premium": ("6", "4"),  # UP: a higher minimum refuses more cheap options
+    "max_strike_distance_pct": ("2", "5"),  # down
+    "allowed_underlyings": (["NIFTY"], ["BANKNIFTY", "FINNIFTY", "NIFTY"]),  # SUBSET
+    "denied_underlyings": (["ABC", "PQR", "XYZ"], ["XYZ"]),  # SUPERSET
+    "entry_cutoff_expiry": ("13:30", "14:15"),  # down: earlier is tighter
+    "square_off_time_expiry": ("14:20", "14:45"),  # down: earlier is tighter
+    "max_open_lots_per_underlying_expiry": (1, 3),  # down
+    "max_open_lots_total_expiry": (3, 5),  # down
+    "min_premium_expiry": ("20", "10"),  # UP
+    "giveback_arm_expiry": ("1000", "1400"),  # down: arming earlier is tighter
+    "giveback_abs_expiry": ("500", "700"),  # down
+    "giveback_pct_expiry": ("15", "25"),  # down
 }
 HANDLED_ELSEWHERE = {"lock_mode"} | {MODE_PREFIX + rule for rule in RULES}
 
@@ -295,15 +533,17 @@ def test_every_registry_row_has_a_direction_case() -> None:
 def test_a_move_in_the_tightening_direction_is_accepted_and_the_opposite_is_refused(
     key: str,
 ) -> None:
+    """On top of FULL, so the optional limits have a value to move from and every override sits
+    beside its base (the base moves stay consistent with the overrides)."""
     tighter, looser = DIRECTION_CASES[key]
-    base = parse_limits(BASE)
+    base = parse_limits(FULL)
 
-    assert loosened_keys(base, limits(**{key: tighter})) == []
-    assert loosened_keys(base, limits(**{key: looser})) == [key]
+    assert loosened_keys(base, parse_limits(full(**{key: tighter}))) == []
+    assert loosened_keys(base, parse_limits(full(**{key: looser}))) == [key]
     # And the edit as a whole, in market hours.
-    assert validate_edit(base, edit(**{key: tighter}), now=MID_DAY, peak=D(0), floor=None)
+    assert validate_edit(base, full(**{key: tighter}), now=MID_DAY, peak=D(0), floor=None)
     with pytest.raises(EditRejected, match=key) as refused:
-        validate_edit(base, edit(**{key: looser}), now=MID_DAY, peak=D(0), floor=None)
+        validate_edit(base, full(**{key: looser}), now=MID_DAY, peak=D(0), floor=None)
     assert refused.value.code == TIGHTEN_ONLY
 
 
@@ -311,18 +551,76 @@ def test_the_registry_directions_match_the_declared_table() -> None:
     """The counterpart of the cases above: a row whose direction is flipped is caught even if its
     case is flipped with it, because the declared direction is asserted here too."""
     up = {"exit_buffer_pct", "max_chase_steps", "cooldown_seconds", "trail_loss_y", "lock_at",
-          "trail_by"}  # fmt: skip
+          "trail_by", "min_entry_gap_s", "min_premium", "min_premium_expiry"}  # fmt: skip
+    sets = {"allowed_underlyings": Direction.SUBSET, "denied_underlyings": Direction.SUPERSET}
     for key in DIRECTION_CASES:
-        expected = Direction.UP if key in up else Direction.DOWN
+        expected = sets.get(key, Direction.UP if key in up else Direction.DOWN)
         assert REGISTRY[key].direction is expected, key
+
+
+def test_every_expiry_override_names_its_base_and_shares_its_unit_and_direction() -> None:
+    overrides = {key: spec.override_of for key, spec in REGISTRY.items() if spec.override_of}
+
+    assert overrides == {key: key.removesuffix("_expiry") for key in REGISTRY if "_expiry" in key}
+    for key, base in overrides.items():
+        assert REGISTRY[key].optional, key
+        assert REGISTRY[key].unit is REGISTRY[base].unit, key
+        assert REGISTRY[key].direction is REGISTRY[base].direction, key
+        assert REGISTRY[key].floor_term is REGISTRY[base].floor_term, key
+
+
+def test_shrinking_an_allow_list_mid_day_is_accepted() -> None:
+    """risk-limits "Shrinking an allow list mid-day"."""
+    stored = parse_limits(full(allowed_underlyings=["NIFTY", "BANKNIFTY"]))
+
+    new = validate_edit(
+        stored, full(allowed_underlyings=["nifty"]), now=MID_DAY, peak=D(0), floor=None
+    )
+    assert new.allowed_underlyings == frozenset({"NIFTY"})
+
+
+def test_removing_from_a_deny_list_mid_day_is_rejected_naming_it() -> None:
+    """risk-limits "Removing from a deny list mid-day"."""
+    stored = parse_limits(full(denied_underlyings=["XYZ", "ABC"]))
+
+    with pytest.raises(EditRejected, match="denied_underlyings") as refused:
+        validate_edit(stored, full(denied_underlyings=["XYZ"]), now=MID_DAY, peak=D(0), floor=None)
+    assert refused.value.code == TIGHTEN_ONLY
+
+
+def test_swapping_allow_list_members_mid_day_is_rejected() -> None:
+    """risk-limits "Swapping members mid-day": neither a subset nor a superset."""
+    stored = parse_limits(full(allowed_underlyings=["NIFTY"]))
+
+    with pytest.raises(EditRejected, match="allowed_underlyings") as refused:
+        validate_edit(
+            stored, full(allowed_underlyings=["BANKNIFTY"]), now=MID_DAY, peak=D(0), floor=None
+        )
+    assert refused.value.code == TIGHTEN_ONLY
+
+
+def test_the_same_symbols_in_another_case_are_no_change() -> None:
+    stored = parse_limits(full(denied_underlyings=["XYZ"]))
+
+    assert loosened_keys(stored, parse_limits(full(denied_underlyings=["xyz"]))) == []
+
+
+def test_removing_an_expiry_override_mid_day_is_rejected() -> None:
+    """expiry-day-profile "Removing an override mid-day"."""
+    stored = limits(entry_cutoff_expiry="14:00")
+
+    with pytest.raises(EditRejected, match="entry_cutoff_expiry") as refused:
+        validate_edit(stored, BASE, now=MID_DAY, peak=D(0), floor=None)
+    assert refused.value.code == TIGHTEN_ONLY
+    assert validate_edit(stored, BASE, now=AFTER_CLOSE, peak=D(0), floor=None)  # after the close
 
 
 @pytest.mark.parametrize(
     "key",
     [k for k, spec in REGISTRY.items() if spec.optional and spec.leg_of is None],
 )
-def test_switching_an_optional_floor_term_on_tightens_and_off_loosens(key: str) -> None:
-    on = parse_limits(BASE)
+def test_switching_an_optional_limit_on_tightens_and_off_loosens(key: str) -> None:
+    on = parse_limits(FULL)
     off = replace(on, **{key: None})  # built directly: skips the floor consistency checks
 
     assert loosened_keys(off, on) == []  # None -> value: enabling is tighter
@@ -609,6 +907,17 @@ _GIVEBACK = [
     ("1500", "1000", "30"), ("2000", "800", "30"), ("2000", "1000", "25"),
     ("2500", "1000", "30"), ("2000", "500", "20"), ("1500", None, "10"),
 ]  # fmt: skip
+# The expiry giveback overrides (arm, abs, pct). Many combine with a base giveback into an
+# inconsistent set (looser than the base, or a leg the base lacks); those are filtered out by
+# ``_parses``, and enough valid ones remain: with no base giveback, with each base leg, and
+# replacing one or several base values.
+_GIVEBACK_EXPIRY = [
+    (None, None, None),
+    ("1500", None, None), ("1000", None, None),
+    (None, "800", None), (None, "500", None), (None, None, "20"), (None, None, "25"),
+    (None, "800", "20"), ("1500", "800", None), ("1500", None, "20"), ("1500", "800", "20"),
+    ("2000", "1000", None), ("2000", None, "30"), ("1200", "500", "10"),
+]  # fmt: skip
 _MODES = ["OFF", "LOCK", "TRAIL", "LOCK_AND_TRAIL"]
 _DAILY = ["2000", "2500", "3000", "3500"]
 
@@ -629,6 +938,9 @@ def floor_settings(
     trigger, at = pick("lock_trigger,lock_at", _LOCK)
     step, by = pick("trail_step,trail_by", _TRAIL)
     arm, abs_, pct = pick("giveback_arm,giveback_abs,giveback_pct", _GIVEBACK)
+    arm_e, abs_e, pct_e = pick(
+        "giveback_arm_expiry,giveback_abs_expiry,giveback_pct_expiry", _GIVEBACK_EXPIRY
+    )
     mode = (like["lock_mode"] if like is not None and draw(st.booleans())
             else draw(st.sampled_from(_MODES)))  # fmt: skip
     daily = (
@@ -640,6 +952,7 @@ def floor_settings(
         "daily_max_loss": daily, "trail_loss_x": x, "trail_loss_y": y, "lock_mode": mode,
         "lock_trigger": trigger, "lock_at": at, "trail_step": step, "trail_by": by,
         "giveback_arm": arm, "giveback_abs": abs_, "giveback_pct": pct,
+        "giveback_arm_expiry": arm_e, "giveback_abs_expiry": abs_e, "giveback_pct_expiry": pct_e,
     }  # fmt: skip
 
 
@@ -650,11 +963,17 @@ def _parses(settings: dict[str, LimitValue]) -> RiskLimits | None:
         return None
 
 
-@settings(max_examples=600, deadline=None, suppress_health_check=[HealthCheck.filter_too_much])
-@given(data=st.data(), peak=st.decimals(min_value=0, max_value=30000, places=2))
+@settings(max_examples=1000, deadline=None, suppress_health_check=[HealthCheck.filter_too_much])
+@given(
+    data=st.data(),
+    peak=st.decimals(min_value=0, max_value=30000, places=2),
+    expiry=st.booleans(),
+)
 def test_an_edit_that_loosened_keys_calls_a_tightening_never_lowers_the_floor_at_any_peak(
-    data: st.DataObject, peak: Decimal
+    data: st.DataObject, peak: Decimal, expiry: bool
 ) -> None:
+    """With the expiry giveback keys in play, for the base floor and the expiry-day floor
+    (``expiry`` drawn both ways)."""
     old_settings = data.draw(floor_settings())
     new_settings = data.draw(floor_settings(like=old_settings))
     old, new = _parses(old_settings), _parses(new_settings)
@@ -662,6 +981,54 @@ def test_an_edit_that_loosened_keys_calls_a_tightening_never_lowers_the_floor_at
     assert old is not None and new is not None
     assume(loosened_keys(old, new) == [])
 
-    assert floor_of(new.floor_params(), peak) >= floor_of(old.floor_params(), peak), (
-        old_settings, new_settings, peak
+    after = floor_of(new.floor_params(expiry=expiry), peak)
+    before = floor_of(old.floor_params(expiry=expiry), peak)
+    assert after >= before, (old_settings, new_settings, peak, expiry)
+
+
+@settings(max_examples=600, deadline=None, suppress_health_check=[HealthCheck.filter_too_much])
+@given(data=st.data(), peak=st.decimals(min_value=0, max_value=30000, places=2))
+def test_the_expiry_floor_is_never_below_the_base_floor_at_any_peak(
+    data: st.DataObject, peak: Decimal
+) -> None:
+    """Design §10: the overrides are no looser than their bases and add no leg the base term
+    lacks, so turning the expiry giveback on can only raise the floor."""
+    settings_ = data.draw(floor_settings())
+    parsed = _parses(settings_)
+    assume(parsed is not None)
+    assert parsed is not None
+
+    expiry_floor = floor_of(parsed.floor_params(expiry=True), peak)
+    assert expiry_floor >= floor_of(parsed.floor_params(), peak), (settings_, peak)
+
+
+def test_switching_the_base_giveback_on_cannot_widen_an_expiry_only_giveback() -> None:
+    """The case ``_widened_legs`` looks at both floors for: an expiry-only giveback of 1,000
+    gains a 30% leg from the base term switched on in the same edit. At a peak of 5,000 the
+    expiry-day floor would drop from 4,000 to 3,500, though no expiry key changed."""
+    no_base: dict[str, LimitValue] = {
+        "giveback_arm": None, "giveback_abs": None, "giveback_pct": None,
+        "giveback_arm_expiry": "1500", "giveback_abs_expiry": "1000",
+    }  # fmt: skip
+    stored = limits(**no_base)
+    switched_on = limits(
+        **{**no_base, "giveback_arm": "2000", "giveback_abs": "1000", "giveback_pct": "30"}
+    )
+    assert floor_of(switched_on.floor_params(expiry=True), D(5000)) < floor_of(
+        stored.floor_params(expiry=True), D(5000)
+    )
+
+    assert loosened_keys(stored, switched_on) == ["giveback_pct"]
+    # Without the extra leg, switching the base term on is a tightening.
+    same_legs = limits(**{**no_base, "giveback_arm": "2000", "giveback_abs": "1000"})
+    assert loosened_keys(stored, same_legs) == []
+
+
+def test_adding_a_leg_to_an_expiry_only_giveback_loosens() -> None:
+    stored = limits(
+        giveback_arm=None, giveback_abs=None, giveback_pct=None,
+        giveback_arm_expiry="1500", giveback_abs_expiry="1000",
     )  # fmt: skip
+    wider = replace(stored, giveback_pct_expiry=D(30))
+
+    assert loosened_keys(stored, wider) == ["giveback_pct_expiry"]
