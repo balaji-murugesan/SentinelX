@@ -20,7 +20,7 @@
   - `OrderService` has fill listeners but no hook for broker rejections.
   - The instrument master can be searched but cannot map an underlying symbol to its spot instrument.
 
-Motivation and scope: proposal.md. Requirements: the six spec deltas. Owner decisions taken for this change (2026-11-21): spread check deferred, ban list loaded by CLI file, modification cap moved to S4, expiry giveback applies from the moment the account has expiring exposure.
+Motivation and scope: proposal.md. Requirements: the six spec deltas. Owner decisions taken for this change (2026-11-21): spread check deferred, ban list loaded by CLI file, modification cap moved to S4, expiry giveback applies from the moment the account has expiring exposure, lot caps count every segment except cash equity and index (§5) while the F&O ban list covers only `NSE_FNO` and `BSE_FNO`.
 
 ## Goals / Non-Goals
 
@@ -83,7 +83,7 @@ The rate limiter's refusal becomes `RateLimited(BrokerRejected)`, a subclass tha
 ### 5. Lot caps and pacing
 
 ```
-lots(q, k)    = ⌈|q| / lot_size(k)⌉ if k is F&O, else 0         # master lookup; unknown F&O → refuse
+lots(q, k)    = 0 if k is cash equity or index, else ⌈|q| / lot_size(k)⌉   # master lookup; unknown → refuse
 pending(u)    = Σ lots(|o.quantity| - o.filled_quantity, o.key) for non-final orders whose unfilled part classifies as ENTRY, underlying(o) = u, o ≠ order
 open(u)       = Σ lots(p.quantity, p.key) for open positions on u (carried included)
 per-underlying: open(u) + pending(u) + lots(order) ≤ cap_u      # cap_u = expiry cap if order expires today
@@ -91,7 +91,7 @@ total:          Σ_u open(u) + Σ_u pending(u) + lots(order) ≤ cap_total
 daily gross:    day.entry_lots_today + lots(order) ≤ max_gross_lots_per_day
 ```
 
-The caps count F&O contract lots only (segment `NSE_FNO` or `BSE_FNO`, from the instrument key, so an unknown equity is skipped and an unknown F&O contract is refused). An equity entry is not judged by them and adds 0 to `entry_lots_today`, though it still counts as an entry for `entries_today` and pacing. A non-final order is reclassified on its unfilled part against the current positions with the same `classify`, so a resting order that only reduces a position does not reserve lots. Pacing reads `recent_entries` (60 s window, `max_entries_per_minute`) and `day.last_entry_at` (`min_entry_gap_s`).
+The caps count the lots of every segment except cash equity and index (`NSE_EQ`, `BSE_EQ`, `IDX_I`), read from the instrument key, so an unknown equity is skipped and an unknown contract in any capped segment (MCX_COMM included) is refused. The exemption is a deny-list so that a segment added later is capped unless someone exempts it: forgetting fails closed (owner ruling, 2026-11-21). An equity entry is not judged by them and adds 0 to `entry_lots_today`, though it still counts as an entry for `entries_today` and pacing. A non-final order is reclassified on its unfilled part against the current positions with the same `classify`, so a resting order that only reduces a position does not reserve lots. Pacing reads `recent_entries` (60 s window, `max_entries_per_minute`) and `day.last_entry_at` (`min_entry_gap_s`).
 
 ### 6. Expiry profile
 

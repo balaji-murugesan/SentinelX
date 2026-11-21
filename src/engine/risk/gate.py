@@ -45,7 +45,7 @@ from engine.market_data.clock import utc_now
 from engine.orders.intent import Intent, classify
 from engine.positions.book import PositionId
 from engine.risk.audit import RiskAudit
-from engine.risk.checks.lots import fno_lots
+from engine.risk.checks.lots import capped_lots
 from engine.risk.decision import (
     CHECK_ERROR,
     HALTED_DAY,
@@ -264,9 +264,10 @@ class RiskEngine:
                 f"{STATE_UNAVAILABLE}: {order.key} is not in the instrument master, so its lots "
                 "cannot be counted"
             )
-        # The lots the lot caps count: whole F&O lots (a part lot counts as a whole one), and 0
-        # for an equity, which still counts as an entry for the entry counters and pacing.
-        lots = fno_lots(order.key, order.quantity, instrument.lot_size)
+        # The lots the lot caps count: whole lots in every capped segment (a part lot counts as a
+        # whole one), and 0 for a cash equity, which still counts as an entry for the entry
+        # counters and pacing.
+        lots = capped_lots(order.key, order.quantity, instrument.lot_size)
         expiring = expires_today(instrument, now)
         if (saved := await self._state.entry_allowed(lots, expiring)) is not None:
             # Every rule allowed it, but the day's counters could not be written first: refuse

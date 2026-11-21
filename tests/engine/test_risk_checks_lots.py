@@ -19,15 +19,16 @@ import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from contracts.market import Instrument, InstrumentKey
+from contracts.market import ExchangeSegment, Instrument, InstrumentKey
 from contracts.orders import Order, OrderSide, OrderState, Position, ProductType
 from engine.positions.book import position_id
+from engine.risk.checks.common import lot_capped
 from engine.risk.checks.lots import (
     LOTS_DAY,
     LOTS_TOTAL,
     LOTS_UNDERLYING,
     LotCaps,
-    fno_lots,
+    capped_lots,
     lots_of,
 )
 from engine.risk.checks.registry import default_checks
@@ -295,7 +296,7 @@ def test_carried_positions_and_pending_entries_count_toward_the_total() -> None:
     assert decision.code == LOTS_TOTAL and decision.inputs["open_or_pending"] == 6
 
 
-# ---- F&O only --------------------------------------------------------------------------------
+# ---- which segments are capped ---------------------------------------------------------------
 
 UNKNOWN_EQUITY = InstrumentKey.parse("NSE_EQ:99999")
 
@@ -339,20 +340,52 @@ def test_an_unknown_equity_is_skipped_not_refused() -> None:
     assert judge(entry(NIFTY, 1), positions=[held], orders=[pending]).code is None
 
 
-def test_an_unknown_fno_instrument_is_still_refused() -> None:
-    """Fail closed stays for F&O: an unknown NSE_FNO or BSE_FNO contract, ordered or held."""
-    for key in ("NSE_FNO:99999", "BSE_FNO:99999"):
-        unknown = InstrumentKey.parse(key)
-        assert judge(order(BUY, 75, key=unknown)).code == LOTS_UNDERLYING
-        held = position(key=unknown, quantity=75)
-        assert judge(entry(NIFTY, 1), positions=[held]).code == LOTS_UNDERLYING
+@pytest.mark.parametrize("segment", ["NSE_FNO", "BSE_FNO", "MCX_COMM"])
+def test_an_unknown_contract_in_a_capped_segment_is_still_refused(segment: str) -> None:
+    """Fail closed: an unknown F&O or MCX contract, ordered or held, is refused (spec "An unknown
+    commodity contract is refused")."""
+    unknown = InstrumentKey.parse(f"{segment}:99999")
+
+    assert judge(order(BUY, 75, key=unknown)).code == LOTS_UNDERLYING
+    held = position(key=unknown, quantity=75)
+    assert judge(entry(NIFTY, 1), positions=[held]).code == LOTS_UNDERLYING
 
 
-@pytest.mark.parametrize(
-    ("key", "lots"), [("NSE_FNO:1", 2), ("BSE_FNO:1", 2), ("NSE_EQ:1", 0), ("BSE_EQ:1", 0)]
-)
-def test_only_fno_contracts_have_lots(key: str, lots: int) -> None:
-    assert fno_lots(InstrumentKey.parse(key), 150, 75) == lots
+GOLD = make_instrument("MCX_COMM:70001", "GOLD", lot_size=1)
+CRUDE = make_instrument("MCX_COMM:70002", "CRUDEOIL", lot_size=100)
+
+
+def test_a_commodity_contract_is_capped() -> None:
+    """Spec "A commodity contract is capped": total cap 4 and 3 open MCX_COMM lots; a 2-lot entry
+    in another MCX_COMM contract is refused with RISK_LOTS_TOTAL."""
+    decision = judge(
+        entry(CRUDE, 2), limits=caps(per_underlying=4, total=4),
+        positions=[holding(GOLD, 3)], instruments=[GOLD, CRUDE],
+    )  # fmt: skip
+
+    assert decision.code == LOTS_TOTAL and decision.inputs["open_or_pending"] == 3
+
+
+def test_a_commodity_contract_has_capped_lots() -> None:
+    # The gate adds ``capped_lots`` to the day's gross lots (gate test below covers the call).
+    assert capped_lots(CRUDE.key, 200, CRUDE.lot_size) == 2
+
+
+# The exempt segments, written out here on purpose rather than imported: this is the drift guard.
+# A segment added to ``ExchangeSegment`` later shows up below as capped, and stays capped unless
+# someone exempts it in the code *and* here.
+EXEMPT = {"NSE_EQ", "BSE_EQ", "IDX_I"}
+
+
+@pytest.mark.parametrize("segment", list(ExchangeSegment))
+def test_every_segment_but_cash_and_index_is_capped(segment: ExchangeSegment) -> None:
+    key = InstrumentKey.parse(f"{segment.value}:99999")  # not in the master
+    exempt = segment.value in EXEMPT
+
+    assert lot_capped(key) is not exempt
+    assert capped_lots(key, 150, 75) == (0 if exempt else 2)
+    # An unknown instrument: skipped in an exempt segment, refused (fail closed) in a capped one.
+    assert judge(order(BUY, 150, key=key)).code == (None if exempt else LOTS_UNDERLYING)
 
 
 async def test_an_allowed_equity_entry_leaves_the_days_gross_lots_unchanged() -> None:

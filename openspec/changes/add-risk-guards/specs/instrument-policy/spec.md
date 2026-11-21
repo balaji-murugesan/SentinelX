@@ -48,7 +48,7 @@ Between 09:15 and 15:30 IST, a ban-list command for today SHALL be refused with 
 - **THEN** it is accepted
 
 ### Requirement: Entries in banned underlyings are refused
-An entry in a futures or options segment SHALL be refused with `RISK_FNO_BAN` when its underlying is on today's ban list.
+An entry in the `NSE_FNO` or `BSE_FNO` segment SHALL be refused with `RISK_FNO_BAN` when its underlying is on today's ban list. The exchange's F&O ban list does not cover commodity (`MCX_COMM`) or currency segments.
 
 #### Scenario: Banned stock option
 - **GIVEN** today's ban list holds XYZ
@@ -60,8 +60,13 @@ An entry in a futures or options segment SHALL be refused with `RISK_FNO_BAN` wh
 - **WHEN** an entry in XYZ cash equity arrives
 - **THEN** the ban list does not refuse it
 
+#### Scenario: Commodity contract
+- **GIVEN** no ban list is loaded for today
+- **WHEN** an entry in an `MCX_COMM` contract arrives
+- **THEN** neither `RISK_FNO_BAN` nor `RISK_BAN_LIST_MISSING` refuses it
+
 ### Requirement: F&O entries fail closed without today's ban list
-When no ban list is stored for today, or the stored lists cannot be read, every entry in a futures or options segment SHALL be refused with `RISK_BAN_LIST_MISSING`.
+When no ban list is stored for today, or the stored lists cannot be read, every entry in the `NSE_FNO` or `BSE_FNO` segment SHALL be refused with `RISK_BAN_LIST_MISSING`.
 
 #### Scenario: Morning without a list
 - **WHEN** at 09:20 IST no list has been loaded for today and an option entry arrives

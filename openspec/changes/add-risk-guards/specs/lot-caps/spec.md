@@ -6,8 +6,21 @@ Caps how large the book can grow, measured in lots, per underlying, in total and
 
 ## ADDED Requirements
 
-### Requirement: Lot caps count F&O contract lots only
-The lot caps SHALL count only instruments in an F&O (derivative) segment, decided from the instrument key's segment. An entry in a non-F&O instrument (an equity) SHALL NOT be judged by any lot cap, SHALL add no lots to the day's gross lots, and SHALL still count as an entry for the other entry counters. Non-F&O positions and orders SHALL count no lots, and a non-F&O instrument with no master record SHALL NOT cause a lot-cap refusal.
+### Requirement: Lot caps count every segment except cash equity and index
+The lot caps SHALL count the lots of instruments in every exchange segment except the cash equity and index segments (`NSE_EQ`, `BSE_EQ`, `IDX_I`), decided from the instrument key's segment. A segment added later SHALL be capped unless it is explicitly exempted.
+
+#### Scenario: A commodity contract is capped
+- **GIVEN** `max_open_lots_total` = 4 and 3 open lots of an MCX_COMM contract
+- **WHEN** a 2-lot entry in another MCX_COMM contract is submitted
+- **THEN** it is refused with `RISK_LOTS_TOTAL`
+
+#### Scenario: An unknown commodity contract is refused
+- **GIVEN** an MCX_COMM instrument missing from the master
+- **WHEN** an entry in it is judged
+- **THEN** it is refused with `RISK_LOTS_UNDERLYING`
+
+### Requirement: Cash equity and index instruments are exempt from the lot caps
+An entry in an exempt segment SHALL NOT be judged by any lot cap, SHALL add no lots to the day's gross lots, and SHALL still count as an entry for the other entry counters. Positions and orders in exempt segments SHALL count no lots, and an exempt instrument with no master record SHALL NOT cause a lot-cap refusal.
 
 #### Scenario: Equity holdings do not count
 - **GIVEN** `max_open_lots_total` = 8 and a carried CNC holding of 500 shares
@@ -20,7 +33,7 @@ The lot caps SHALL count only instruments in an F&O (derivative) segment, decide
 - **THEN** no lot cap refuses it and the day's gross lots stay at 20
 
 ### Requirement: Lots are counted from the instrument master
-An F&O order's or position's lots SHALL be its absolute quantity divided by the instrument's lot size from the instrument master. An F&O entry whose instrument, or any counted F&O instrument, has no master record SHALL be refused with the lot-cap code of the cap being checked.
+A capped order's or position's lots SHALL be its absolute quantity divided by the instrument's lot size from the instrument master. A capped entry whose instrument, or any counted capped instrument, has no master record SHALL be refused with the lot-cap code of the cap being checked.
 
 #### Scenario: Lots of an option order
 - **GIVEN** an option with a lot size of 75
@@ -28,7 +41,7 @@ An F&O order's or position's lots SHALL be its absolute quantity divided by the 
 - **THEN** it counts as 2 lots
 
 #### Scenario: Unknown instrument in the book
-- **GIVEN** an open F&O position whose instrument is missing from the master
+- **GIVEN** an open option position whose instrument is missing from the master
 - **WHEN** an entry on the same underlying is judged
 - **THEN** it is refused with `RISK_LOTS_UNDERLYING`
 

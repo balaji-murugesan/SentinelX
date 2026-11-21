@@ -6,8 +6,9 @@ Trading terms:
                     (the paper broker fills a market order at the latest price, plus slippage).
   * initial stop  - where the trader accepts being wrong. The distance from the entry price to it,
                     times the quantity, is the trade's *risk*: what is lost if the stop is hit.
-  * F&O           - futures and options: derivative contracts that trade in whole lots, in the
-                    exchanges' derivative segments. Equities and indices are not F&O.
+  * cash segment  - where shares trade (NSE_EQ, BSE_EQ). An equity's "lot" is one share. Index
+                    rows (IDX_I) are prices only and cannot be traded. Every other segment holds
+                    contracts that trade in whole lots: F&O, currency, commodity (MCX).
 """
 
 from decimal import Decimal
@@ -17,14 +18,19 @@ from contracts.market import ExchangeSegment, InstrumentKey
 from contracts.orders import Order, OrderSide, OrderType
 from engine.risk.decision import RiskContext
 
-# The derivative (F&O) segments. Decided from the instrument key alone, so an instrument the
-# master does not know still has a known segment. The lot caps count only these, and the ban list
-# applies only to these (instrument-policy spec).
-FNO_SEGMENTS: Final = frozenset({ExchangeSegment.NSE_FNO, ExchangeSegment.BSE_FNO})
+# The segments the lot caps do NOT count: cash equity and index rows only. This is a deny-list on
+# purpose (owner ruling 2026-11-21): a segment added later (a commodity or currency segment, a
+# second broker's) is capped unless someone exempts it here, so forgetting to update this set
+# fails closed, never open. Decided from the instrument key alone, so an instrument the master
+# does not know still has a known segment.
+LOT_CAP_EXEMPT_SEGMENTS: Final = frozenset(
+    {ExchangeSegment.NSE_EQ, ExchangeSegment.BSE_EQ, ExchangeSegment.IDX_I}
+)
 
 
-def is_fno(key: InstrumentKey) -> bool:
-    return key.segment in FNO_SEGMENTS
+def lot_capped(key: InstrumentKey) -> bool:
+    """Do the lot caps count ``key``? True for every segment except cash equity and index."""
+    return key.segment not in LOT_CAP_EXEMPT_SEGMENTS
 
 
 def money(value: Decimal) -> str:

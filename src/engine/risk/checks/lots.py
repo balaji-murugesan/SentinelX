@@ -14,11 +14,14 @@ refused when, counting its own lots:
 For an entry whose contract expires today the two open-lot caps are the expiry caps
 (``engine.risk.expiry.effective_lot_caps``); the daily gross cap is the same on every day.
 
-The caps count F&O contract lots only (owner decision, 2026-11-21): an equity's "lot" is one
-share, so a holding of shares would swamp a cap meant for derivative contracts. An entry in a
-non-F&O instrument is not judged by this rule, and non-F&O positions and orders count nothing.
-Whether an instrument is F&O comes from its key's segment (``common.is_fno``), so an equity the
-master does not know is still skipped, while an unknown F&O contract is refused.
+The caps count the lots of every instrument except cash equity and index rows (owner rulings,
+2026-11-21): an equity's "lot" is one share, so a holding of shares would swamp a cap meant for
+contracts. An entry in a cash equity is not judged by this rule, and cash positions and orders
+count nothing. Every other segment is capped (F&O, currency, MCX commodity, and any segment
+added later): the exemption is a deny-list (``common.lot_capped``), so a new segment that nobody
+thought of is capped, not waved through. The segment comes from the instrument key, so an
+equity the master does not know is still skipped, while an unknown contract in a capped segment
+is refused.
 
 Trading terms:
   * lot          - the exchange's trading unit for a contract, from the instrument master (a NIFTY
@@ -39,10 +42,10 @@ Trading terms:
   * expiry caps  - optional tighter open-lot caps for contracts that expire today, when premiums
                    move fastest.
 
-Fail closed (lot-caps "Lots are counted from the instrument master"): if the entry's F&O
-instrument, or any F&O instrument it would have to count, has no master record, its lots (and its
-underlying) cannot be known, so the entry is refused with ``RISK_LOTS_UNDERLYING``, the first cap
-checked.
+Fail closed (lot-caps "Lots are counted from the instrument master"): if the entry's capped
+instrument, or any capped instrument it would have to count, has no master record, its lots (and
+its underlying) cannot be known, so the entry is refused with ``RISK_LOTS_UNDERLYING``, the first
+cap checked.
 """
 
 from typing import Final
@@ -50,7 +53,7 @@ from typing import Final
 from contracts.market import InstrumentKey
 from contracts.orders import Order
 from engine.orders.intent import Intent, classify
-from engine.risk.checks.common import is_fno
+from engine.risk.checks.common import lot_capped
 from engine.risk.decision import ALLOW, Decision, RiskContext, reject
 from engine.risk.expiry import effective_lot_caps, expires_today
 
@@ -65,26 +68,26 @@ def lots_of(quantity: int, lot_size: int) -> int:
     return -(-abs(quantity) // lot_size)
 
 
-def fno_lots(key: InstrumentKey, quantity: int, lot_size: int) -> int:
-    """The lots the caps count for ``quantity`` units of ``key``: whole lots for an F&O contract,
-    0 for anything else (an equity). The gate adds this to the day's gross lots, so the check and
-    the count agree."""
-    return lots_of(quantity, lot_size) if is_fno(key) else 0
+def capped_lots(key: InstrumentKey, quantity: int, lot_size: int) -> int:
+    """The lots the caps count for ``quantity`` units of ``key``: whole lots in a capped segment,
+    0 in an exempt one (cash equity, index). The gate adds this to the day's gross lots, so the
+    check and the count agree."""
+    return lots_of(quantity, lot_size) if lot_capped(key) else 0
 
 
 def book_lots(ctx: RiskContext, order: Order) -> dict[str, int] | InstrumentKey:
-    """The open plus pending F&O lots per underlying, not counting ``order`` itself. Returns the
-    key of the first counted F&O instrument that has no master record instead, when there is one:
-    its lots and underlying cannot be known, so no cap can be judged. Non-F&O positions and orders
-    are skipped before any lookup, so an unknown equity changes nothing.
+    """The open plus pending capped lots per underlying, not counting ``order`` itself. Returns
+    the key of the first counted capped instrument that has no master record instead, when there
+    is one: its lots and underlying cannot be known, so no cap can be judged. Positions and orders
+    in exempt segments are skipped before any lookup, so an unknown equity changes nothing.
 
     The return type ``dict[str, int] | InstrumentKey`` is a union (either one); the caller tells
     them apart with ``isinstance``, like a C# ``is`` pattern."""
     lots: dict[str, int] = {}
 
     def count(key: InstrumentKey, quantity: int) -> InstrumentKey | None:
-        if not is_fno(key):
-            return None  # the caps count F&O contract lots only
+        if not lot_capped(key):
+            return None  # cash equity and index rows count no lots
         instrument = ctx.instruments(key)
         if instrument is None:
             return key
@@ -119,7 +122,7 @@ class LotCaps:
     applies_to_exits = False  # lot-caps "Lot caps never apply to exits"
 
     def pre_trade(self, ctx: RiskContext, order: Order) -> Decision:
-        if not is_fno(order.key):
+        if not lot_capped(order.key):
             return ALLOW  # an equity entry is not judged by the lot caps
         instrument = ctx.instruments(order.key)
         if instrument is None:
