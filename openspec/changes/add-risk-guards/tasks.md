@@ -99,7 +99,7 @@
   - exits are never blocked, as a property over every registered rule, the new ones included.
 
   Apply the mutation checks the reviewer requests.
-- [ ] 10.2 Definition of done: `uv run ruff format .`, `uv run ruff check .`, `uv run mypy src`, `uv run lint-imports`, `uv run pytest` and `openspec validate add-risk-guards --strict` all pass, and CI is green on the branch.
+- [x] 10.2 Definition of done: `uv run ruff format .`, `uv run ruff check .`, `uv run mypy src`, `uv run lint-imports`, `uv run pytest` and `openspec validate add-risk-guards --strict` all pass, and CI is green on the branch.
 - [ ] 10.3 (**owner**) Paper smoke test in market hours:
   - load the new limits file and today's ban list;
   - see an F&O entry refused before the list is loaded;
