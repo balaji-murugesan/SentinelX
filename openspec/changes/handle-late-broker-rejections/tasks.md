@@ -48,7 +48,7 @@ Start both test containers first (sx-redis-test on 6380, sx-pg-test on 5433). Ru
 
 ## 5. End to end and checks
 
-- [ ] 5.1 Add an end-to-end test through the risk runtime (the `Engine` harness in `tests/engine/test_risk_end_to_end.py`). An entry fills, so its stop is placed and acknowledged; the broker then rejects the stop on the stream. Verify that:
+- [x] 5.1 Add an end-to-end test through the risk runtime (the `Env` harness in `tests/engine/test_risk_runtime.py`, which builds the real `RiskRuntime` and stop manager; the `Engine` harness in `test_risk_end_to_end.py` builds neither). An entry fills, so its stop is placed and acknowledged; the broker then rejects the stop on the stream. Verify that:
   - the snapshot's risk block lists the position as unprotected;
   - an entry is refused for the missing stop;
   - the breaker's 5-minute count is 1;

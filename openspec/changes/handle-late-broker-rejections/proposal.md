@@ -41,9 +41,9 @@ The `order-flow-guards` requirement "Only rejections by the broker count" alread
 
 - Code:
   - `engine/orders/machine.py` gains the new transition.
-  - `engine/orders/service.py` gains a method that applies broker-book rejections without reporting them.
-  - `engine/orders/recovery.py` calls that method in `recover` and `_resume`.
-  - `engine/risk/stops.py` gains a rejection listener and a per-position late-rejection delay.
+  - `engine/orders/service.py` gains a method that applies broker-book rejections without reporting them, and `settled()`, which waits until updates already queued on the service lock have been applied.
+  - `engine/orders/recovery.py` calls that method in `recover` and, while halted, in `_resume`.
+  - `engine/risk/stops.py` gains a rejection listener and a per-position late-rejection delay. During a resize it keeps the old stop when the new stop was refused (design §4).
   - `engine/risk/runtime.py` registers the listener.
 - Tests:
   - `tests/engine/test_order_service_rejections.py`: the xfail test becomes a passing test.

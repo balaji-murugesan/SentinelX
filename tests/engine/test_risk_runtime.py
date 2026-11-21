@@ -17,10 +17,10 @@ from structlog.testing import capture_logs
 
 from contracts.commands import CommandResult, KillSwitch, PlaceOrder, SetBanList, SetRiskLimits
 from contracts.market import Instrument, InstrumentKey
-from contracts.orders import Order, OrderSide, OrderType, ProductType
+from contracts.orders import CostBreakdown, Order, OrderSide, OrderState, OrderType, ProductType
 from contracts.settings import load_settings
 from contracts.snapshot import HaltLevel, Snapshot
-from engine.broker.adapter import BrokerRejected
+from engine.broker.adapter import BrokerRejected, Filled, Rejected
 from engine.config import EngineSettings
 from engine.market_data.clock import ist_date
 from engine.market_data.provider import Tick
@@ -280,6 +280,89 @@ async def test_an_open_position_without_a_stop_halts_entries_end_to_end(
     await env.runtime.monitor.step()
     assert env.runtime.stops.unprotected() == frozenset()
     assert (await env.entry()).accepted  # the halt cleared by itself
+
+
+async def test_a_stop_the_broker_rejects_after_accepting_it_end_to_end(
+    env_factory: Callable[..., Env],
+) -> None:
+    """handle-late-broker-rejections task 5.1, through the assembly: an entry fills, so its stop is
+    placed and acknowledged (it rests, ``Open``); then the broker rejects that stop on its update
+    stream. The snapshot lists the position as unprotected and counts one broker rejection, an
+    entry is refused for the missing stop, no stop is sent again before the 1 s delay, and once
+    the new stop rests, entries are accepted again."""
+    env = await env_factory().ready()
+    stops = env.runtime.stops
+    assert stops is not None
+    writer = SnapshotWriter(
+        None,  # type: ignore[arg-type]
+        env.service,
+        _Subscription(),  # type: ignore[arg-type]
+        account_id="main",
+        interval_s=1,
+        now=env.clock,
+        risk=env.runtime.status,
+    )
+
+    def stop_orders() -> list[Order]:
+        return [
+            o
+            for o in env.service.orders.values()
+            if o.source == PROTECTIVE_STOP_SOURCE and o.order_type is OrderType.STOP_MARKET
+        ]
+
+    async def advance(seconds: float) -> None:
+        """Time passes with the feed alive and the monitor running, then the stop task's turn."""
+        env.clock.at += timedelta(seconds=seconds)
+        env.tick()
+        await env.runtime.monitor.step()
+        await stops.sweep()
+        await stops.process_queue()
+
+    entry = await env.entry()
+    assert entry.accepted, entry.reason
+    bought = env.service.orders[entry.order_id or ""]
+    await env.service.on_update(
+        Filled(
+            broker_order_id=bought.broker_order_id or "", fill_id="f1", quantity=65,
+            price=D("200.00"), at=env.clock.at, costs=CostBreakdown(),
+        )
+    )  # fmt: skip
+    await stops.process_queue()  # the fill queued the position: its stop goes out
+    [stop] = stop_orders()
+    assert stop.state is OrderState.OPEN and stop.broker_order_id  # acknowledged, resting
+    assert stops.unprotected() == frozenset()
+
+    await env.service.on_update(
+        Rejected(stop.broker_order_id, "RMS: stop rejected", env.clock.at)
+    )  # the broker rejects the resting stop on its update stream
+
+    assert env.service.orders[stop.order_id].state is OrderState.REJECTED
+    risk = Snapshot.model_validate_json(writer.build().model_dump_json()).risk
+    assert risk is not None
+    assert [(r.key, r.product) for r in risk.unprotected] == [(OPTION, ProductType.INTRADAY)]
+    assert risk.broker_rejections_5m == 1  # the breaker's 5-minute window counts it
+    await stops.sweep()
+    await stops.process_queue()
+    await env.runtime.monitor.step()  # the pass that sees the unprotected position
+    refused = await env.entry()
+    assert not refused.accepted and (refused.reason or "").startswith(UNPROTECTED)
+    assert len(stop_orders()) == 1  # nothing re-sent at once
+
+    await advance(0.5)
+    assert len(stop_orders()) == 1  # still within the 1 s delay
+    await advance(0.5)  # 1 s after the rejection: the new stop goes out
+    assert len(stop_orders()) == 2
+    new = stop_orders()[-1]
+    assert new.state is OrderState.OPEN and new.broker_order_id  # it rests at the broker
+    assert stops.unprotected() == frozenset()
+    risk = writer.build().risk
+    assert risk is not None and risk.unprotected == [] and risk.broker_rejections_5m == 1
+
+    for _ in range(5):  # past the entry gap since the first entry, with a monitor pass each second
+        await advance(1)
+    after = await env.entry()
+    assert after.accepted, after.reason  # the halt cleared by itself
+    assert len(stop_orders()) == 2  # and no further stop was sent meanwhile
 
 
 # ---- starting and stopping -------------------------------------------------------------------
