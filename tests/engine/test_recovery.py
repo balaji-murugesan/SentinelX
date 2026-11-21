@@ -11,11 +11,13 @@ from decimal import Decimal
 import pytest
 
 from contracts.commands import CancelOrder, ResumeRecovery
-from contracts.orders import CostBreakdown, OrderState
+from contracts.orders import CostBreakdown, Order, OrderSide, OrderState, OrderType
 from engine.broker.adapter import BrokerOrder, Filled
+from engine.orders.intent import PROTECTIVE_STOP_SOURCE
 from engine.orders.recovery import recover, recover_with_retry, resume_recovery
 from engine.orders.service import OrderService
 from engine.persistence.repository import LoadedState, PersistenceError
+from engine.risk.rejections import RejectionWindow
 from tests.engine.test_order_service import NOW, FakeAdapter, build, command
 from tests.engine.trading_fakes import MemoryRepository
 
@@ -26,8 +28,10 @@ class BookAdapter(FakeAdapter):
     def __init__(self) -> None:
         super().__init__()
         self.entries: list[BrokerOrder] = []
+        self.book_calls = 0
 
     async def order_book(self) -> list[BrokerOrder]:
+        self.book_calls += 1
         return self.entries
 
 
@@ -425,3 +429,144 @@ async def test_resume_when_the_broker_cannot_be_asked_keeps_the_halt() -> None:
 
     assert not answer.accepted and "order book unavailable" in (answer.reason or "")
     assert "main" in repo.halts and not service.reconciled
+
+
+# ---- rejections missed while the engine was down (handle-late-broker-rejections task 2.2) ----
+
+
+def breaker_on(service: OrderService) -> RejectionWindow:
+    """The real rejection breaker, registered the way ``RiskRuntime`` does it."""
+    breaker = RejectionWindow()
+    service.add_rejection_listener(breaker.record)
+    return breaker
+
+
+async def test_a_stop_rejected_while_the_engine_was_down_is_applied_without_halting() -> None:
+    """Trading-state "Stop rejected while the engine was down": the stored catastrophic stop is
+    ``Open``; the broker rejected it during the outage. Recovery moves it to ``Rejected``, does
+    not halt, and the breaker counts nothing. No stop rests any more, so the position is
+    unprotected (the stop manager places a new one)."""
+    service, _, repo = build()
+    entry = await service.place(command("k1"))
+    await service.on_update(Filled("b-1", "f1", 65, Decimal("100"), NOW, CostBreakdown()))
+    stop_command = command("stop-1", side=OrderSide.SELL).model_copy(
+        update={
+            "source": PROTECTIVE_STOP_SOURCE,
+            "order_type": OrderType.STOP_MARKET,
+            "trigger_price": Decimal("90.00"),
+        }
+    )
+    stop = await service.place(stop_command)
+    assert entry.order_id and stop.order_id
+    assert repo.orders[stop.order_id].state is OrderState.OPEN  # stored Open, then the crash
+    adapter = BookAdapter()
+    adapter.entries = [
+        BrokerOrder("b-1", entry.order_id, OrderState.FILLED, 65, Decimal("100")),
+        BrokerOrder("b-2", stop.order_id, OrderState.REJECTED, 0, None),
+    ]
+    restarted, _, _ = build(adapter=adapter, repository=repo)
+    breaker = breaker_on(restarted)
+
+    differences = await recover(restarted, repo, adapter, account_id="main")
+
+    assert differences == [] and restarted.reconciled and "main" not in repo.halts
+    rejected = restarted.orders[stop.order_id]
+    assert rejected.state is OrderState.REJECTED and rejected.reason == "broker reports Rejected"
+    assert repo.orders[stop.order_id] == rejected
+    assert breaker.recent(NOW) == ()
+    assert adapter.book_calls == 1  # the book is fetched once and passed in
+    resting = [
+        o
+        for o in restarted.orders.values()
+        if o.source == PROTECTIVE_STOP_SOURCE and o.state is OrderState.OPEN
+    ]
+    assert resting == [] and sum(p.quantity for p in restarted.positions.values()) == 65
+
+
+async def test_resume_clears_a_halt_left_by_a_missed_rejection() -> None:
+    """Trading-state "Resume clears a halt left by a missed rejection": the engine is halted, the
+    broker still had the order open at the restart and rejected it afterwards. Resume applies the
+    rejection before it reads the database back, so nothing differs and the halt is cleared."""
+    repo, order_id = await open_order_before_crash()
+    difference = f"order {order_id}: engine Open filled 0, broker Rejected filled 0"
+    await repo.store_halt("main", [difference], NOW)
+    service, adapter = await halted_service(repo, matching_book(order_id))
+    breaker = breaker_on(service)
+    adapter.entries = [BrokerOrder("b-1", order_id, OrderState.REJECTED, 0, None)]
+
+    answer = await resume(service, repo, adapter)
+
+    assert answer.accepted and answer.reason is None
+    assert "main" not in repo.halts and service.reconciled and service.halt_differences == []
+    stored = repo.orders[order_id]
+    assert stored.state is OrderState.REJECTED and stored.reason == "broker reports Rejected"
+    assert service.orders[order_id] == stored
+    assert breaker.recent(NOW) == ()
+
+
+async def test_a_cancel_in_the_book_still_halts() -> None:
+    """Trading-state "Other differences still halt": only a rejection is applied."""
+    repo, order_id = await open_order_before_crash()
+    adapter = BookAdapter()
+    adapter.entries = [BrokerOrder("b-1", order_id, OrderState.CANCELLED, 0, None)]
+
+    service, _, differences = await restart(repo, adapter)
+
+    assert differences == [f"order {order_id}: engine Open filled 0, broker Cancelled filled 0"]
+    assert not service.reconciled and repo.halts["main"].differences == tuple(differences)
+    assert service.orders[order_id].state is OrderState.OPEN
+    assert repo.orders[order_id].state is OrderState.OPEN
+
+
+async def test_resume_on_a_running_engine_leaves_a_rejection_to_the_update_stream() -> None:
+    """Not halted: a ``Rejected`` in the book is still on its way down the update stream, which
+    must apply it so the breaker counts it. Resume changes nothing and has nothing to clear."""
+    repo, order_id = await open_order_before_crash()
+    service, adapter, differences = await restart(repo, matching_book(order_id))
+    assert differences == [] and service.reconciled
+    breaker = breaker_on(service)
+    adapter.entries = [BrokerOrder("b-1", order_id, OrderState.REJECTED, 0, None)]
+
+    answer = await resume(service, repo, adapter)
+
+    assert answer.accepted and answer.reason is None  # "not halted: nothing to clear"
+    assert service.orders[order_id].state is OrderState.OPEN
+    assert repo.orders[order_id].state is OrderState.OPEN
+    assert breaker.recent(NOW) == () and "main" not in repo.halts
+
+
+class UpdatesFail(MemoryRepository):
+    """``update_order`` fails once ``failing`` is set; reads and halt writes still work."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failing = False
+
+    async def update_order(self, order: Order) -> None:
+        if self.failing:
+            raise PersistenceError("database down")
+        await super().update_order(order)
+
+
+async def test_resume_keeps_the_halt_when_the_rejection_cannot_be_stored() -> None:
+    """Design §3: the database fails as resume applies the rejection. The write is queued and the
+    database still says ``Open``, so resume is refused and the stored halt, with its own reason,
+    stays (fail closed)."""
+    repo = UpdatesFail()
+    placing, _, _ = build(repository=repo)
+    order_id = (await placing.place(command("k1", limit="100"))).order_id or ""
+    await repo.store_halt("main", ["seeded difference for the test"], NOW)
+    service, adapter = await halted_service(repo, matching_book(order_id))
+    adapter.entries = [BrokerOrder("b-1", order_id, OrderState.REJECTED, 0, None)]
+    repo.failing = True
+
+    answer = await resume(service, repo, adapter)
+
+    assert not answer.accepted
+    assert answer.reason == "trading state cannot be saved: resume is refused until it recovers"
+    assert repo.halts["main"].differences == ("seeded difference for the test",)  # not overwritten
+    assert not service.reconciled
+    assert repo.orders[order_id].state is OrderState.OPEN  # the write did not reach the database
+    assert service.orders[order_id].state is OrderState.REJECTED and not service.persistence_ok
+    refused = await service.place(command("k2", limit="100"))
+    assert not refused.accepted

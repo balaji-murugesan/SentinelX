@@ -18,16 +18,16 @@ Start both test containers first (sx-redis-test on 6380, sx-pg-test on 5433). Ru
 
 ## 2. Recovery applies broker-book rejections
 
-- [ ] 2.1 Add the `OrderService` method of design §3. Under the lock it moves `Open` orders with zero fills, whose book entry is `REJECTED` with zero fills, to `Rejected` with reason `"broker reports Rejected"`, stored through `_advance`. It does not call the rejection listeners, and it logs a warning with ids only. Verify with unit tests:
+- [x] 2.1 Add the `OrderService` method of design §3. Under the lock it moves `Open` orders with zero fills, whose book entry is `REJECTED` with zero fills, to `Rejected` with reason `"broker reports Rejected"`, stored through `_advance`. It does not call the rejection listeners, and it logs a warning with ids only. Verify with unit tests:
   - it moves only that case;
   - an `Open` order the book reports `Cancelled`, `Open`, or `Rejected` with a fill, and an order missing from the book, are all left unchanged;
   - no rejection listener fires.
-- [ ] 2.2 Call the method in `recover` (after the book is fetched, before `_order_differences`), and in `_resume` (after the book is fetched, before `repository.load`). Verify with tests in `tests/engine/test_recovery*.py`:
+- [x] 2.2 Call the method in `recover` (after the book is fetched, before `_order_differences`), and in `_resume` (after the book is fetched, before `repository.load`, and only while the engine is halted). Verify with tests in `tests/engine/test_recovery*.py`:
   - spec "Stop rejected while the engine was down": not halted, order `Rejected`, breaker count 0;
   - spec "Resume clears a halt left by a missed rejection";
   - spec "Other differences still halt", where the book reports `Cancelled`;
   - with the database failing during resume, the halt stays.
-- [ ] 2.3 Add a Postgres integration test in `tests/integration/`. Store an `Open` order, restart recovery against a scripted book that reports it `Rejected`, and verify the stored order and its audit record are `Rejected` after recovery.
+- [x] 2.3 Add a Postgres integration test in `tests/integration/`. Store an `Open` order, restart recovery against a scripted book that reports it `Rejected`, and verify the stored order and its audit record are `Rejected` after recovery.
 
 ## 3. Stops rejected after acceptance
 

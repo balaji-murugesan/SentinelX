@@ -12,6 +12,7 @@ order's own handling is the same either way: the existing rejection tests cover 
 tests here also check the order still ends ``Rejected`` with its reason.
 """
 
+import asyncio
 from datetime import timedelta
 from decimal import Decimal
 
@@ -19,7 +20,14 @@ import pytest
 from structlog.testing import capture_logs
 
 from contracts.orders import CostBreakdown, Order, OrderSide, OrderState, Position, ProductType
-from engine.broker.adapter import BrokerOrder, BrokerRejected, Filled, RateLimited, Rejected
+from engine.broker.adapter import (
+    BrokerOrder,
+    BrokerRejected,
+    Cancelled,
+    Filled,
+    RateLimited,
+    Rejected,
+)
 from engine.orders.service import OrderService
 from engine.persistence.repository import LoadedState
 from engine.positions.book import position_id
@@ -305,6 +313,129 @@ async def test_unknown_orders_resolved_as_rejected_by_reconciliation_report_noth
     order = service.orders[order_id]
     assert order.state is OrderState.REJECTED and order.reason == reason
     assert seen.orders == []
+
+
+async def test_a_rejection_in_the_book_moves_an_open_unfilled_order_and_reports_nothing() -> None:
+    """``apply_book_rejections`` (handle-late-broker-rejections task 2.1, design §3): an ``Open``
+    order with nothing filled that the book reports ``Rejected`` with nothing filled becomes
+    ``Rejected``, stored with its audit record, and logged with ids only. It is restart recovery
+    catching up, not the broker refusing an order now, so no listener hears of it."""
+    service, _, repo = build()
+    order = await acknowledged(service)
+    seen = listening(service)
+    book = {order.order_id: BrokerOrder("b-1", order.order_id, OrderState.REJECTED, 0, None)}
+
+    with capture_logs() as logs:
+        await service.apply_book_rejections(book)
+
+    rejected = service.orders[order.order_id]
+    assert rejected.state is OrderState.REJECTED and rejected.reason == "broker reports Rejected"
+    assert repo.orders[order.order_id] == rejected
+    assert repo.events[-1] == (order.order_id, "Rejected", "broker reports Rejected")
+    assert seen.orders == []
+    warnings = [e for e in logs if e["event"] == "broker_rejection_applied_at_recovery"]
+    assert warnings == [
+        {
+            "event": "broker_rejection_applied_at_recovery", "log_level": "warning",
+            "order_id": order.order_id, "broker_order_id": "b-1",
+        }
+    ]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        BrokerOrder("b-1", "?", OrderState.CANCELLED, 0, None),
+        BrokerOrder("b-1", "?", OrderState.OPEN, 0, None),
+        BrokerOrder("b-1", "?", OrderState.REJECTED, 20, Decimal("100")),  # with a fill
+        None,  # missing from the book
+    ],
+    ids=["cancelled", "open", "rejected-with-a-fill", "missing"],
+)
+async def test_any_other_book_entry_leaves_the_open_order_unchanged(
+    entry: BrokerOrder | None,
+) -> None:
+    """Only that one case is applied; every other disagreement is left for recovery to report as a
+    difference (and halt on)."""
+    service, _, repo = build()
+    order = await acknowledged(service)
+    seen = listening(service)
+    stored_events = len(repo.events)
+    book = {} if entry is None else {order.order_id: entry}
+
+    await service.apply_book_rejections(book)
+
+    assert service.orders[order.order_id] == order and repo.orders[order.order_id] == order
+    assert len(repo.events) == stored_events and seen.orders == []
+
+
+async def test_a_rejection_in_the_book_leaves_a_partly_filled_order_unchanged() -> None:
+    """A ``PartiallyFilled`` order is not ``Open``: the book's ``Rejected`` is not applied to it."""
+    service, _, _ = build()
+    order = service.orders[(await service.place(command(quantity=130))).order_id or ""]
+    await service.on_update(
+        Filled(
+            broker_order_id=order.broker_order_id or "", fill_id="f1", quantity=65,
+            price=Decimal("100"), at=NOW, costs=CostBreakdown(),
+        )
+    )  # fmt: skip
+    partial = service.orders[order.order_id]
+    book = {order.order_id: BrokerOrder("b-1", order.order_id, OrderState.REJECTED, 0, None)}
+
+    await service.apply_book_rejections(book)
+
+    assert service.orders[order.order_id] == partial
+
+
+async def test_a_rejection_in_the_book_leaves_a_cancelled_order_unchanged() -> None:
+    """Nothing filled, but ``Cancelled`` (through a real stream cancel), not ``Open``: unchanged,
+    and nothing raises (a final order has no ``Rejected`` transition)."""
+    service, _, repo = build()
+    order = await acknowledged(service)
+    await service.on_update(Cancelled(order.broker_order_id or "", "cancelled by owner", NOW))
+    cancelled = service.orders[order.order_id]
+    assert cancelled.state is OrderState.CANCELLED and cancelled.filled_quantity == 0
+    stored_events = len(repo.events)
+    book = {order.order_id: BrokerOrder("b-1", order.order_id, OrderState.REJECTED, 0, None)}
+
+    await service.apply_book_rejections(book)
+
+    assert service.orders[order.order_id] == cancelled and len(repo.events) == stored_events
+
+
+async def test_a_rejection_in_the_book_leaves_an_unknown_order_unchanged() -> None:
+    """Nothing filled, but ``Unknown`` (the acknowledgement timed out), not ``Open``: unchanged,
+    and nothing raises. Recovery and resume run ``reconcile_unknown`` first, so there such an order
+    is already settled; the method is called on one directly here to pin its own state check."""
+    adapter = OrderBook([])
+    service, _, repo = build(adapter=adapter, timeout_s=0.05)
+    order_id = (await service.place(command())).order_id or ""
+    unknown = service.orders[order_id]
+    assert unknown.state is OrderState.UNKNOWN and unknown.filled_quantity == 0
+    stored_events = len(repo.events)
+    book = {order_id: BrokerOrder("b-9", order_id, OrderState.REJECTED, 0, None)}
+
+    await service.apply_book_rejections(book)
+
+    assert service.orders[order_id] == unknown and len(repo.events) == stored_events
+
+
+async def test_book_rejections_wait_for_the_service_lock() -> None:
+    """``apply_book_rejections`` changes orders only while it holds the service lock, so it can
+    never interleave with a placement or a stream update (design §3)."""
+    service, _, _ = build()
+    order = await acknowledged(service)
+    book = {order.order_id: BrokerOrder("b-1", order.order_id, OrderState.REJECTED, 0, None)}
+    lock = service._lock  # type: ignore[attr-defined]
+
+    await lock.acquire()  # someone else holds the lock (a placement, an update)
+    task = asyncio.create_task(service.apply_book_rejections(book))
+    await asyncio.sleep(0.01)  # give the task every chance to run
+    assert not task.done() and service.orders[order.order_id].state is OrderState.OPEN
+    lock.release()
+    await asyncio.wait_for(task, 1)
+
+    assert service.orders[order.order_id].state is OrderState.REJECTED
 
 
 async def test_the_listener_is_called_inside_the_service_lock() -> None:

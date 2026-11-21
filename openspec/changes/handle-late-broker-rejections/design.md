@@ -49,7 +49,8 @@ A new `OrderService` method takes the broker's order book, keyed by engine order
 
 - **What it changes:** under the service lock, every order that is `Open` with `filled_quantity == 0`, and whose book entry is `REJECTED` with `filled_quantity == 0`, is moved to `Rejected` with reason `"broker reports Rejected"`. The move goes through `_advance`, so the order is stored and gets an audit record. It does **not** call `_report_rejection` (order-flow-guards: rejections applied during restart recovery do not count). It logs a warning per order, with ids only.
 - **Where `recover` calls it:** right after it fetches the book and before `_order_differences`. The book is fetched once and passed in.
-- **Where `_resume` calls it:** after it fetches the book and **before** `repository.load`, so the database it then compares already holds the `Rejected` state. If that write is queued (the database is failing), `_stale_memory` reports a memory/database mismatch and the halt stays. That fails closed.
+- **Where `_resume` calls it:** after it fetches the book and **before** `repository.load`, so the database it then compares already holds the `Rejected` state. It does this **only while the engine is halted** (`not service.reconciled`). On a running engine, a rejection in the book is still on its way down the update stream. The stream must apply it, so the breaker counts it and the stop manager backs off.
+- **If the write is queued** (the database is failing), resume is refused with "trading state cannot be saved: resume is refused until it recovers" before the load, and the halt stays with its original reason. That fails closed.
 
 **Why this is safe:** both sides agree nothing was filled, and `Rejected` is the broker's own final state. This is the same trust `reconcile_unknown` already places in the book for `Unknown` orders.
 

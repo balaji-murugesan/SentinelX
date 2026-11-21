@@ -4,7 +4,8 @@ Steps, in order:
   1. load open orders, fills, positions and applied fill ids from the database;
   2. rebuild the paper broker's resting orders from the open orders (``restore_broker``);
   3. settle orders the crash caught mid-submission, then reconcile ``Unknown`` ones;
-  4. compare every open order with the broker's order book;
+  4. apply rejections the broker's order book shows for ``Open``, unfilled orders (missed while
+     the engine was down), then compare every open order with that book;
   5. rebuild positions from fills and compare with the stored positions.
 
 Any difference HALTS the engine: ``service.reconciled = False``, so new orders are rejected
@@ -32,6 +33,7 @@ from engine.positions.book import PositionId, position_id, rebuild
 log = structlog.get_logger("engine.orders.recovery")
 
 _LIVE = (OrderState.OPEN, OrderState.PARTIALLY_FILLED)
+_RESUME_REFUSED = "trading state cannot be saved: resume is refused until it recovers"
 
 
 async def recover(
@@ -70,6 +72,8 @@ async def recover(
         found.append(f"broker order book unavailable: {error}")
         book = {}
     else:
+        # A rejection missed while the engine was down is applied, not reported (design §3).
+        await service.apply_book_rejections(book)
         found += _order_differences(service.orders.values(), book)
     found += _position_differences(service.positions, state.fills)
 
@@ -154,10 +158,12 @@ async def resume_recovery(
 ) -> CommandResult:
     """Handle ``cli recovery resume``: re-check, and clear the halt only if nothing differs.
 
-    Idempotent like every command: a repeated key returns the first answer. The check compares
-    the broker's order book and the *database* (not the live in-memory book, which it leaves
-    alone); it also refuses while memory and database disagree, which means the data was edited
-    after this engine loaded it, so the owner must restart the engine first.
+    Idempotent like every command: a repeated key returns the first answer. Before checking it
+    settles the in-memory orders the broker's book decides: ``Unknown`` orders are reconciled
+    and, while halted, ``Open`` unfilled orders the book reports ``Rejected`` become ``Rejected``
+    (both stored). The check then compares the broker's order book and the *database*; it also
+    refuses while memory and database disagree, which means the data was edited after this
+    engine loaded it, so the owner must restart the engine first.
     """
 
     def result(accepted: bool, reason: str | None) -> CommandResult:
@@ -193,11 +199,19 @@ async def _resume(
     result: Callable[[bool, str | None], CommandResult],
 ) -> CommandResult:
     if not service.persistence_ok:
-        return result(False, "trading state cannot be saved: resume is refused until it recovers")
+        return result(False, _RESUME_REFUSED)
     found: list[str] = []
     try:
         await service.reconcile_unknown()
         book = {b.engine_order_id: b for b in await adapter.order_book()}
+        if not service.reconciled:
+            # Halted only: on a running engine a rejection in the book is still on its way down
+            # the update stream, which must apply it so the breaker counts it. Before the load,
+            # so the database compared below already holds the Rejected state (design §3).
+            await service.apply_book_rejections(book)
+        if not service.persistence_ok:
+            # A write above was queued (the database is failing): the halt stays (fail closed).
+            return result(False, _RESUME_REFUSED)
         state = await repository.load(account_id)
     except (BrokerError, TimeoutError, OSError) as error:
         return result(False, f"broker order book unavailable: {error}")

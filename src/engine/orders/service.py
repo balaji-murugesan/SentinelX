@@ -58,6 +58,7 @@ from engine.broker.adapter import (
     BrokerAck,
     BrokerAdapter,
     BrokerError,
+    BrokerOrder,
     BrokerRejected,
     BrokerUpdate,
     Cancelled,
@@ -538,8 +539,9 @@ class OrderService:
         ``BrokerRejected`` at placement, and when a broker ``Rejected`` update is applied. Entries
         and exits alike. It is **not** called for a gate refusal (the order never reached the
         broker), for the engine's own rate limiter (``RateLimited``), or for the orders restart
-        recovery marks rejected (``settle_in_flight``, ``reconcile_unknown``): none of those is the
-        broker refusing an order (order-flow-guards "Only rejections by the broker count").
+        recovery marks rejected (``settle_in_flight``, ``reconcile_unknown``,
+        ``apply_book_rejections``): none of those is the broker refusing an order now
+        (order-flow-guards "Only rejections by the broker count").
 
         The listener is a plain (not ``async``) function on purpose: it runs inside the lock, so it
         can only record and return. It cannot await ``place`` or ``cancel``, which take the same
@@ -583,6 +585,41 @@ class OrderService:
                 elif order.state is OrderState.SUBMITTED:
                     await self._advance(
                         order, OrderState.UNKNOWN, reason="engine restarted while submitting"
+                    )
+
+    async def apply_book_rejections(self, book: dict[str, BrokerOrder]) -> None:
+        """Apply rejections the engine missed while it was down (trading-state "A rejection missed
+        while the engine was down is applied at recovery"; handle-late-broker-rejections design §3).
+
+        ``book`` is the broker's order book keyed by engine order id, fetched once by the caller.
+        An order that is ``Open`` with nothing filled, whose book entry is ``Rejected`` with nothing
+        filled, is moved to ``Rejected`` and stored (with its audit record) through ``_advance``.
+        Both sides agree nothing was filled and ``Rejected`` is the broker's own final state, the
+        same trust ``reconcile_unknown`` places in the book. Every other disagreement is left alone
+        for recovery to report as a difference (and halt on).
+
+        The rejection listeners are not called: this is restart recovery catching up, not the
+        broker refusing an order now, so the breaker does not count it (order-flow-guards "Only
+        rejections by the broker count"). If the write fails it is queued as usual
+        (``persistence_ok`` goes false), and the caller keeps the engine halted (fail closed).
+        """
+        async with self._lock:
+            for order in list(self.orders.values()):
+                entry = book.get(order.order_id)
+                if (
+                    order.state is OrderState.OPEN
+                    and order.filled_quantity == 0
+                    and entry is not None
+                    and entry.state is OrderState.REJECTED
+                    and entry.filled_quantity == 0
+                ):
+                    log.warning(
+                        "broker_rejection_applied_at_recovery",
+                        order_id=order.order_id,
+                        broker_order_id=entry.broker_order_id,
+                    )
+                    await self._advance(
+                        order, OrderState.REJECTED, reason="broker reports Rejected"
                     )
 
     # ---- Unknown orders --------------------------------------------------------------------
