@@ -62,6 +62,7 @@ from engine.broker.adapter import (
     BrokerUpdate,
     Cancelled,
     Filled,
+    RateLimited,
     Rejected,
 )
 from engine.market_data.clock import ist_date, market_close_utc, utc_now
@@ -80,6 +81,8 @@ log = structlog.get_logger()
 type Write = Callable[[], Awaitable[None]]  # a deferred database write, replayable later
 # Called with each fill and the position it produced; see ``OrderService.add_fill_listener``.
 type FillListener = Callable[[Fill, Position], Awaitable[None]]
+# Called with the order the broker has just rejected; see ``OrderService.add_rejection_listener``.
+type RejectionListener = Callable[[Order], None]
 CANNOT_SAVE = "trading state cannot be saved"
 PROBE_KEY = "persistence-probe"  # a read that proves the database answers again
 RETRY_MIN_S = 0.5  # first wait before retrying failed writes; doubles up to RETRY_MAX_S
@@ -117,6 +120,7 @@ class OrderService:
         self._retry_max_s = retry_max_s
         self._pending: deque[Write] = deque()  # writes not yet in the database, oldest first
         self._fill_listeners: list[FillListener] = []
+        self._rejection_listeners: list[RejectionListener] = []
         self._lock = asyncio.Lock()
         self.orders: dict[str, Order] = {}
         self.positions: dict[PositionId, Position] = {}
@@ -216,7 +220,7 @@ class OrderService:
             with self._tracer.start_as_current_span("broker.place") as broker_span:
                 # Wait for a turn from the rate limiter first (if there is one): an exit may
                 # wait up to a minute for a token, and that is not a broker that did not answer.
-                # An entry with no token is refused here, as ``BrokerRejected``.
+                # An entry with no token is refused here, as ``RateLimited``.
                 send = await self._admit_place(order)
                 started = time.perf_counter()
                 try:
@@ -226,8 +230,15 @@ class OrderService:
                     latency_ms = (time.perf_counter() - started) * 1000
                     broker_span.set_attribute("broker.latency_ms", latency_ms)
                     span.set_attribute("broker.latency_ms", latency_ms)
-        except BrokerRejected as error:
+        except RateLimited as error:
+            # The engine's own limiter refused it: rejected exactly like a broker refusal, but the
+            # broker never saw it, so it is not reported as a broker rejection (order-flow-guards
+            # "Rate-limited entry does not count"). This clause must stay before the next one:
+            # ``RateLimited`` is a ``BrokerRejected``, and the first matching ``except`` wins.
             await self._advance(order, OrderState.REJECTED, reason=str(error))
+        except BrokerRejected as error:
+            rejected = await self._advance(order, OrderState.REJECTED, reason=str(error))
+            self._report_rejection(rejected)
         except TimeoutError:
             # The broker may or may not have the order. 6.2 reconciles against the order book.
             log.warning("order_ack_timeout", order_id=order.order_id)
@@ -448,7 +459,10 @@ class OrderService:
                     if order.state is not OrderState.CANCELLED:  # expiry may have got there first
                         await self._advance(order, OrderState.CANCELLED, reason=update.reason)
                 case Rejected():
-                    await self._advance(order, OrderState.REJECTED, reason=update.reason)
+                    rejected = await self._advance(order, OrderState.REJECTED, reason=update.reason)
+                    # Reported only once the rejection is applied: an update for an order that is
+                    # already final raises above and changes nothing, so it counts nothing.
+                    self._report_rejection(rejected)
         except InvalidTransition:
             # The order stays as it was (spec "Update after a final state").
             log.error(
@@ -513,6 +527,33 @@ class OrderService:
         A listener that has orders to send puts the work on a queue and returns.
         """
         self._fill_listeners.append(listener)
+
+    def add_rejection_listener(self, listener: RejectionListener) -> None:
+        """Call ``listener(order)`` each time the *broker* rejects an order the engine sent, with
+        the order already moved to ``Rejected`` (add-risk-guards design §4). The rejection breaker
+        (``engine.risk.rejections``) counts these: a run of them (no margin, a broker outage)
+        stops new entries for a while.
+
+        It is called in exactly two places, both inside the service lock: when the adapter raises
+        ``BrokerRejected`` at placement, and when a broker ``Rejected`` update is applied. Entries
+        and exits alike. It is **not** called for a gate refusal (the order never reached the
+        broker), for the engine's own rate limiter (``RateLimited``), or for the orders restart
+        recovery marks rejected (``settle_in_flight``, ``reconcile_unknown``): none of those is the
+        broker refusing an order (order-flow-guards "Only rejections by the broker count").
+
+        The listener is a plain (not ``async``) function on purpose: it runs inside the lock, so it
+        can only record and return. It cannot await ``place`` or ``cancel``, which take the same
+        lock and would wait on it forever (see ``add_fill_listener``)."""
+        self._rejection_listeners.append(listener)
+
+    def _report_rejection(self, order: Order) -> None:
+        for listener in self._rejection_listeners:
+            try:
+                listener(order)
+            except Exception:
+                # A listener is a client of the rejection, never part of applying it: the order is
+                # already Rejected in memory and queued for storage, and stays so.
+                log.error("rejection_listener_failed", order_id=order.order_id, exc_info=True)
 
     # ---- restart recovery (task 8.1; ``engine.orders.recovery`` drives these) -----------------
 

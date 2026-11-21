@@ -115,6 +115,11 @@ class RiskState(Protocol):
         """The times of the entries allowed in the last 60 s (entry pacing), oldest first."""
         ...
 
+    def broker_rejections(self, now: datetime) -> tuple[datetime, ...]:
+        """The times of the broker rejections in the last 300 s (the rejection breaker), oldest
+        first."""
+        ...
+
     async def entry_allowed(self, lots: int, expiring: bool) -> str | None:
         """Count one allowed entry of ``lots`` lots (``expiring``: its contract expires today) and
         persist the count, the lots, the entry time and the expiry flag before the entry is sent.
@@ -289,6 +294,7 @@ class RiskEngine:
             instruments=self._instruments,
             quote=self._state.quote,
             recent_entries=self._state.recent_entries(now),
+            broker_rejections=self._state.broker_rejections(now),
         )
 
     # ---- audit -----------------------------------------------------------------------------

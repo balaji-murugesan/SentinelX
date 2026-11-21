@@ -8,7 +8,8 @@ needs the service's orders and positions. So ``RiskRuntime(...)`` builds everyth
 need the service (limits, day book, audit, monitor, gate), the caller builds the service with
 ``runtime.gate``, and ``attach(service)`` then builds what needs the service (stops, flattener,
 kill switch, square-off, sizing), binds the gate and monitor to it and registers the two fill
-listeners. Think of it as constructor injection where one dependency is supplied afterwards.
+listeners and the rejection listener. Think of it as constructor injection where one dependency
+is supplied afterwards.
 
 What runs, and what happens if it crashes (``engine.main`` supervises each with ``_keep_alive``):
   * ``start()``           once, after recovery: loads the limits and the day, seeds the day book
@@ -54,6 +55,7 @@ from engine.risk.gate import RiskEngine
 from engine.risk.kill import ChaseFlattener, KillSwitch, SquareOff
 from engine.risk.limits_service import LimitsService
 from engine.risk.monitor import RiskMonitor
+from engine.risk.rejections import RejectionWindow
 from engine.risk.repository import RiskRepository
 from engine.risk.sizing import SizingService
 from engine.risk.stops import CatastrophicStops
@@ -87,6 +89,9 @@ class RiskRuntime:
         self.sizing: SizingService | None = None
 
         self.audit = RiskAudit(risk_repository)
+        # The broker rejections of the last 5 minutes: fed by the order service (``attach``), read
+        # by the rejection breaker in the gate and the monitor, and counted in the snapshot.
+        self.rejections = RejectionWindow()
         self.limits = LimitsService(
             account_id=account, repository=risk_repository, results=repository,
             figures=self._figures, now=now,
@@ -102,7 +107,7 @@ class RiskRuntime:
             interval_s=settings.risk_monitor_interval_s,
             persist_interval_s=settings.risk_persist_interval_s,
             on_kill=self._on_kill, ensure_flat=self._ensure_flat, lock_pending=self._lock_pending,
-            unprotected=self._unprotected,
+            unprotected=self._unprotected, rejections=self.rejections.recent,
             now=now,
         )  # fmt: skip
         self.gate = RiskEngine(
@@ -142,6 +147,8 @@ class RiskRuntime:
         # fill (the listener runs inside the service's lock). Both run for every fill.
         service.add_fill_listener(self.daybook.on_fill)
         service.add_fill_listener(self.stops.on_fill)
+        # Every order the broker rejects goes into the window the rejection breaker reads.
+        service.add_rejection_listener(self.rejections.record)
 
     # ---- start-up, after recovery ------------------------------------------------------------
 
@@ -261,5 +268,6 @@ class RiskRuntime:
             entries_today=day.entries_today, entry_lots_today=day.entry_lots_today,
             loss_streak=day.loss_streak,
             cooldown_until=day.cooldown_until,
+            broker_rejections_5m=len(self.rejections.recent(self._now())),
             unprotected=[PositionRef(key=k, product=prod) for _, k, prod in unprotected],
         )  # fmt: skip

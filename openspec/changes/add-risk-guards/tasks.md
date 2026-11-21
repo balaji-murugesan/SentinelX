@@ -56,8 +56,8 @@
 
 ## 6. Rejection breaker
 
-- [ ] 6.1 Add `OrderService.add_rejection_listener`, called inside the lock when the adapter raises `BrokerRejected` and when a broker `Rejected` update is applied. Make the rate limiter raise a new `RateLimited(BrokerRejected)` subclass, and do not report it to listeners. Verify with order-service tests: the listener fires for both broker paths, and not for gate refusals, `RateLimited`, `settle_in_flight` or `reconcile_unknown`. Existing rejection behaviour is unchanged.
-- [ ] 6.2 Implement `RejectionWindow` (`engine/risk/rejections.py`, 300 s, pruned on read) and `RejectBreaker`, both pre-trade and continuous. Register the window as a rejection listener in `RiskRuntime`, fill `RiskContext.broker_rejections` in both the gate's and the monitor's context builders, add the check to both registries, and report `broker_rejections_5m` in the snapshot. Verify the `order-flow-guards` breaker scenarios as unit tests (trip, clear at the window edge, exits accepted), and a monitor test that the critical log is written once per trip.
+- [x] 6.1 Add `OrderService.add_rejection_listener`, called inside the lock when the adapter raises `BrokerRejected` and when a broker `Rejected` update is applied. Make the rate limiter raise a new `RateLimited(BrokerRejected)` subclass, and do not report it to listeners. Verify with order-service tests: the listener fires for both broker paths, and not for gate refusals, `RateLimited`, `settle_in_flight` or `reconcile_unknown`. Existing rejection behaviour is unchanged.
+- [x] 6.2 Implement `RejectionWindow` (`engine/risk/rejections.py`, 300 s, pruned on read) and `RejectBreaker`, both pre-trade and continuous. Register the window as a rejection listener in `RiskRuntime`, fill `RiskContext.broker_rejections` in both the gate's and the monitor's context builders, add the check to both registries, and report `broker_rejections_5m` in the snapshot. Verify the `order-flow-guards` breaker scenarios as unit tests (trip, clear at the window edge, exits accepted), and a monitor test that the critical log is written once per trip.
 
 ## 7. Instrument policy and the ban list
 
@@ -112,3 +112,8 @@
 - Start implementing only after PR #9 (`add-risk-engine`) is reviewed and merged. Every group from 2 to 9 touches a migration, the `RiskGate` and its rules, the order path or the kill switch, so each pauses for the owner's review after the reviewer approves (CLAUDE.md commit policy).
 - Archive after `add-risk-engine` is archived (`openspec archive add-risk-guards --yes`), because the `risk-limits` delta adds to a spec that change creates.
 - Tell `add-trailing-exits` (S4) that it now owns the modification cap, and that its exit manager must keep the flattener's `positions` filter.
+- Propose a separate OpenSpec change for broker rejections after the acknowledgement (design, Risks: "A broker rejection after the acknowledgement is not applied"). It must land before S7 enables `DhanBroker` order placement. Minimum content:
+  - add `S.REJECTED` to `TRANSITIONS[S.OPEN]` in `engine/orders/machine.py`;
+  - a MODIFIED `orders` spec delta, and the PRD §5 diagram line `Open --> Rejected: broker reject after ack`;
+  - tests through a real acknowledgement (the order reaches `Open` the normal way) covering: the rejection listener fires (turn `test_an_acknowledged_order_rejected_by_the_broker_counts` from xfail into a passing test); the lot-cap reservation is released; a rejected catastrophic SL makes its position unprotected and is re-placed; a rejected chase exit is re-placed;
+  - a cap on how often a stop that the broker keeps rejecting may be re-placed.

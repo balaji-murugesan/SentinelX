@@ -17,13 +17,14 @@ import pytest
 from structlog.testing import capture_logs
 
 from contracts.commands import SetRiskLimits
-from contracts.orders import OrderSide
+from contracts.orders import Order, OrderSide, OrderState
 from contracts.snapshot import HaltLevel
 from engine.market_data.bus import TickBus
 from engine.market_data.provider import Tick
 from engine.persistence.repository import PersistenceError
 from engine.positions.book import position_id
 from engine.risk.audit import RiskAudit
+from engine.risk.checks.flow import REJECT_BREAKER, RejectBreaker
 from engine.risk.checks.stale import (
     FEED_DOWN,
     FLOOR_BREACH,
@@ -35,9 +36,11 @@ from engine.risk.checks.stale import (
 from engine.risk.daybook import DayBook
 from engine.risk.decision import ALLOW, ContinuousCheck, Decision, RiskContext, RiskTrigger
 from engine.risk.floor import floor_of
+from engine.risk.limits import MODE_PREFIX
 from engine.risk.limits_service import LimitsService, LimitsStatus
 from engine.risk.monitor import REFERENCE_MISSING, RiskMonitor, mark_key, previous_weekday
 from engine.risk.pnl import estimate_exit_cost
+from engine.risk.rejections import RejectionWindow
 from engine.risk.state import DayState
 from tests.engine.risk_builders import (
     NOW,
@@ -46,6 +49,7 @@ from tests.engine.risk_builders import (
     TODAY,
     fill,
     instrument_of,
+    order,
     position,
 )
 from tests.engine.risk_fakes import MemoryRiskRepository, StubTrading
@@ -84,6 +88,7 @@ class Env:
         at: datetime = NOW,
         checks: tuple[ContinuousCheck, ...] = CHECKS,
         on_kill: bool = True,
+        rejections: RejectionWindow | None = None,
     ) -> None:
         self.clock = Clock(at)
         self.repo = repo or MemoryRiskRepository()
@@ -104,12 +109,14 @@ class Env:
             figures=self._figures, now=self.clock,
         )  # fmt: skip
         self.audit = RiskAudit(self.repo)
+        self.rejections = rejections or RejectionWindow()
         self.monitor = RiskMonitor(
             account_id="main", limits=self.limits, daybook=self.daybook, repository=self.repo,
             audit=self.audit, instruments=instrument_of, checks=checks,
             subscribed=lambda: self.subscribed, interval_s=1.0, persist_interval_s=10.0,
             on_kill=self._kill if on_kill else None, ensure_flat=self._ensure_flat,
-            unprotected=lambda: self.unprotected, now=self.clock,
+            unprotected=lambda: self.unprotected, rejections=self.rejections.recent,
+            now=self.clock,
         )  # fmt: skip
         self.monitor.bind(self.trading)
 
@@ -1110,3 +1117,73 @@ async def test_the_continuous_checks_see_the_recent_entries_from_the_day_book() 
     assert ctx.recent_entries == (NOW,)
     assert (ctx.broker_rejections, ctx.target_confirmations, ctx.ban_list) == ((), 0, None)
     assert ctx.spot_key("NIFTY") is None
+
+
+# ---- the rejection breaker (add-risk-guards task 6.2) -----------------------------------------
+
+
+def rejected_at(at: datetime) -> Order:
+    return order(OrderSide.BUY, 65, updated_at=at, state=OrderState.REJECTED)
+
+
+async def test_the_continuous_checks_see_the_broker_rejections_of_the_last_5_minutes() -> None:
+    seeing = _Seeing()
+    env = await Env(checks=(seeing,)).ready()
+    env.rejections.record(rejected_at(NOW - timedelta(seconds=301)))  # out of the window
+    env.rejections.record(rejected_at(NOW - timedelta(seconds=10)))
+
+    await stepped(env)
+
+    assert seeing.seen[-1].broker_rejections == (NOW - timedelta(seconds=10),)
+    assert env.monitor.broker_rejections(NOW) == (NOW - timedelta(seconds=10),)  # the gate's view
+
+
+def breaker_trips(logs: list[dict]) -> list[dict]:  # type: ignore[type-arg]
+    return [
+        e for e in logs if e["event"] == "risk decision started" and e["code"] == REJECT_BREAKER
+    ]
+
+
+async def test_the_breaker_logs_one_critical_alert_per_trip_not_one_per_pass() -> None:
+    """Spec "Margin rejection storm" (the monitor's half): three rejections trip the breaker; the
+    critical alert and the audit row are written once while it holds, through many passes. Once
+    it has cleared (spec "Breaker clears") a new storm trips it again, with a new alert."""
+    env = await Env(checks=(RejectBreaker(),)).ready()  # BASE: reject_breaker_n = 3
+    for seconds in (0, 60, 120):
+        env.rejections.record(rejected_at(NOW + timedelta(seconds=seconds)))
+    env.clock.advance(120)
+
+    with capture_logs() as logs:
+        for _ in range(5):
+            await stepped(env, 1)
+    halt = env.monitor.entry_halt()
+    assert halt is not None and halt.code == REJECT_BREAKER  # a standing halt of new entries
+    trips = breaker_trips(logs)
+    assert len(trips) == 1 and trips[0]["log_level"] == "critical"
+    assert len(env.rows(REJECT_BREAKER)) == 1
+
+    env.clock.at = NOW + timedelta(minutes=5, seconds=30)  # 10:35:30: the first is 330 s old
+    await stepped(env)
+    assert env.monitor.entry_halt() is None  # cleared by itself
+
+    for seconds in (0, 1, 2):
+        env.rejections.record(rejected_at(env.clock.at + timedelta(seconds=seconds)))
+    with capture_logs() as again:
+        await stepped(env, 3)
+        await stepped(env, 1)
+    assert [e["log_level"] for e in breaker_trips(again)] == ["critical"]  # one for the new trip
+    assert len(env.rows(REJECT_BREAKER)) == 2
+
+
+async def test_a_breaker_in_shadow_mode_logs_a_warning_and_halts_nothing() -> None:
+    env = await Env(
+        checks=(RejectBreaker(),), limits={**BASE, MODE_PREFIX + "reject_breaker": "shadow"}
+    ).ready()
+    for seconds in (0, 1, 2):
+        env.rejections.record(rejected_at(NOW + timedelta(seconds=seconds)))
+
+    with capture_logs() as logs:
+        await stepped(env, 3)
+
+    assert env.monitor.entry_halt() is None  # tried out, not enforced
+    assert [e["log_level"] for e in breaker_trips(logs)] == ["warning"]

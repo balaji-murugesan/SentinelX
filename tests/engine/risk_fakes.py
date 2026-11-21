@@ -88,6 +88,7 @@ class StubState:
         self.counted: list[tuple[int, bool]] = []  # the (lots, expiring) of each counted entry
         self.count_fails: str | None = None  # a reason: make the count fail like a database error
         self.recent: tuple[datetime, ...] = ()  # what ``recent_entries`` returns
+        self.rejections: tuple[datetime, ...] = ()  # what ``broker_rejections`` returns
 
     def unavailable(self, now: datetime) -> str | None:
         return self.unavailable_reason
@@ -106,6 +107,9 @@ class StubState:
 
     def recent_entries(self, now: datetime) -> tuple[datetime, ...]:
         return self.recent
+
+    def broker_rejections(self, now: datetime) -> tuple[datetime, ...]:
+        return self.rejections
 
     async def entry_allowed(self, lots: int, expiring: bool) -> str | None:
         if self.count_fails is not None:

@@ -51,6 +51,7 @@ from engine.market_data.provider import Tick
 from engine.positions.book import PositionId
 from engine.risk.audit import RiskAudit
 from engine.risk.checks.common import money
+from engine.risk.checks.flow import REJECT_BREAKER
 from engine.risk.checks.stale import MTM_BLIND
 from engine.risk.daybook import NOT_LOADED, DayBook
 from engine.risk.decision import (
@@ -80,6 +81,9 @@ OUTLIER_TICK: Final = "RISK_OUTLIER_TICK"
 REFERENCE_MISSING: Final = "RISK_REFERENCE_MISSING"
 MTM_UNKNOWN: Final = "RISK_MTM_UNKNOWN"
 BEATS_TOLERATED: Final = 3  # the gate refuses entries after this many intervals without a beat
+# Decisions below KILL whose start is still logged as critical (an alert for the owner), once per
+# episode: the rejection breaker tripping (order-flow-guards "Broker rejections trip a breaker").
+CRITICAL_ON_START: Final = frozenset({REJECT_BREAKER})
 
 type KillHook = Callable[[Decision], Awaitable[None]]
 type EnsureFlatHook = Callable[[str], Awaitable[None]]
@@ -123,6 +127,7 @@ class RiskMonitor:
         ensure_flat: EnsureFlatHook | None = None,
         lock_pending: Callable[[], bool] = lambda: False,
         unprotected: Callable[[], frozenset[PositionId]] = frozenset,
+        rejections: Callable[[datetime], tuple[datetime, ...]] = lambda now: (),
         now: Callable[[], datetime] = utc_now,
     ) -> None:
         """``on_kill`` is called with the KILL decision on every pass while a breach holds, so it
@@ -132,7 +137,9 @@ class RiskMonitor:
         ``lock_pending`` says a kill was asked for while today's state could not be read and is
         still waiting to be recorded on the day: the monitor then asks ``ensure_flat`` too, even
         though the loaded day is not locked yet, which is how that kill reaches the day.
-        ``unprotected`` returns the open positions that have no catastrophic stop."""
+        ``unprotected`` returns the open positions that have no catastrophic stop. ``rejections``
+        returns the times of the broker rejections within 300 s of the time it is given
+        (``RejectionWindow.recent``); the default, none, suits a monitor with no order service."""
         self._account_id = account_id
         self._limits = limits
         self._daybook = daybook
@@ -148,6 +155,7 @@ class RiskMonitor:
         self._ensure_flat = ensure_flat
         self._lock_pending = lock_pending
         self._unprotected = unprotected
+        self._rejections = rejections
         self._now = now
         self._trading: TradingView | None = None
         self._tracker: MtmTracker | None = None
@@ -201,6 +209,9 @@ class RiskMonitor:
 
     def recent_entries(self, now: datetime) -> tuple[datetime, ...]:
         return self._daybook.recent_entries(now)
+
+    def broker_rejections(self, now: datetime) -> tuple[datetime, ...]:
+        return self._rejections(now)
 
     async def entry_allowed(self, lots: int, expiring: bool) -> str | None:
         return await self._daybook.entry_allowed(lots, expiring)
@@ -396,6 +407,7 @@ class RiskMonitor:
             unpriced_for=unpriced,
             unprotected=self._unprotected(),
             recent_entries=self._daybook.recent_entries(now),
+            broker_rejections=self._rejections(now),
         )
         return run_continuous(self._checks, ctx, RiskTrigger.TIMER)
 
@@ -487,7 +499,12 @@ class RiskMonitor:
 
     async def _audit_changes(self, results: list[RuleResult], now: datetime) -> None:
         """Tracked by code, not by rule name: two checks share the rule name ``stale_data``, and
-        one's silence must not look like the other's change."""
+        one's silence must not look like the other's change.
+
+        A KILL starts with a critical log line, and so does an enforced code in
+        ``CRITICAL_ON_START`` (the rejection breaker): once when it trips, not on every pass while
+        it holds, and again only after it has cleared and trips anew. A shadow rule's trip is
+        logged as a warning: it is being tried out and has stopped nothing."""
         firing = [
             (r, r.decision.code)
             for r in results
@@ -496,7 +513,10 @@ class RiskMonitor:
         for result, code in firing:
             if code in self._active_codes:
                 continue
-            level = log.critical if result.decision.severity >= Severity.KILL else log.warning
+            critical = result.decision.severity >= Severity.KILL or (
+                result.enforced and code in CRITICAL_ON_START
+            )
+            level = log.critical if critical else log.warning
             level(
                 "risk decision started",
                 code=code,

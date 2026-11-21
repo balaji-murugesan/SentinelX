@@ -19,6 +19,7 @@ from contracts.commands import CommandResult, KillSwitch, PlaceOrder, SetRiskLim
 from contracts.orders import Order, OrderSide, OrderType, ProductType
 from contracts.settings import load_settings
 from contracts.snapshot import HaltLevel, Snapshot
+from engine.broker.adapter import BrokerRejected
 from engine.config import EngineSettings
 from engine.market_data.provider import Tick
 from engine.orders.commands import CommandConsumer
@@ -27,6 +28,7 @@ from engine.orders.snapshot import SnapshotWriter
 from engine.persistence.repository import PersistenceError
 from engine.positions.book import position_id
 from engine.risk import runtime as runtime_module
+from engine.risk.checks.flow import REJECT_BREAKER
 from engine.risk.checks.protection import UNPROTECTED
 from engine.risk.checks.registry import continuous_checks, default_checks
 from engine.risk.decision import Decision, RiskContext, kill
@@ -156,7 +158,7 @@ def test_the_engine_registers_every_check_once() -> None:
 
     assert max(Counter(type(c) for c in default_checks()).values()) == 1
     assert Counter(c.name for c in continuous_checks()) == {
-        "equity_floor": 1, "stale_data": 2, "catastrophic_stop": 1,
+        "equity_floor": 1, "stale_data": 2, "catastrophic_stop": 1, "reject_breaker": 1,
     }  # fmt: skip
     assert max(Counter(type(c) for c in continuous_checks()).values()) == 1
 
@@ -470,6 +472,78 @@ async def test_the_snapshot_shows_the_days_gross_entry_lots_and_it_round_trips(
 class _Subscription:
     def get_nowait(self) -> None:
         return None
+
+
+async def test_broker_rejections_trip_the_breaker_through_the_assembly(
+    env_factory: Callable[..., Env],
+) -> None:
+    """Spec "Margin rejection storm" end to end: the real order service reports each broker refusal
+    to the runtime's window; the entry right after the third is refused by the gate's breaker at
+    once, the monitor's next pass holds the halt and logs one critical alert, an exit is still
+    accepted (and its rejection counts), the snapshot shows the count, and five minutes later
+    the breaker has cleared by itself."""
+    env = await env_factory().ready({**BASE, "reject_breaker_n": 3, "min_entry_gap_s": 1})
+    sent: list[Order] = []
+
+    async def margin_shortfall(order: Order) -> Any:
+        sent.append(order)
+        raise BrokerRejected("RMS: insufficient margin")
+
+    env.adapter.place = margin_shortfall  # type: ignore[method-assign]
+    for _ in range(3):
+        env.clock.at += timedelta(seconds=2)
+        await env.runtime.monitor.step()
+        env.tick()
+        assert (await env.entry()).accepted  # sent; the broker refused it
+    assert len(env.runtime.rejections.recent(env.clock.at)) == 3
+
+    env.clock.at += timedelta(seconds=2)
+    env.tick()
+    refused = await env.entry()  # before the monitor's next pass: the pre-trade breaker
+    assert not refused.accepted and (refused.reason or "").startswith(REJECT_BREAKER)
+    assert len(sent) == 3  # the refused entry never reached the broker
+
+    with capture_logs() as logs:
+        await env.runtime.monitor.step()
+        await env.runtime.monitor.step()
+    trips = [e for e in logs if e.get("code") == REJECT_BREAKER]
+    assert [e["log_level"] for e in trips] == ["critical"]  # once, though two passes saw it
+
+    held = position(OPTION, 65, "200.00")
+    env.service.positions[position_id(held)] = held
+    exit_ = await env.service.place(
+        PlaceOrder(
+            command_id="x", idempotency_key="x", account_id="main", source="cli", sent_at=NOW,
+            key=OPTION, side=OrderSide.SELL, quantity=65, product=ProductType.INTRADAY,
+            order_type=OrderType.LIMIT, limit_price=D("199.00"),
+        )
+    )  # fmt: skip
+    assert exit_.accepted  # spec "Exit while tripped"; the broker refused it, which counts too
+    writer = SnapshotWriter(
+        None,  # type: ignore[arg-type]
+        env.service,
+        _Subscription(),  # type: ignore[arg-type]
+        account_id="main",
+        interval_s=1,
+        now=env.clock,
+        risk=env.runtime.status,
+    )
+    snapshot = Snapshot.model_validate_json(writer.build().model_dump_json())
+    assert snapshot.risk is not None and snapshot.risk.broker_rejections_5m == 4
+
+    env.clock.at += timedelta(minutes=5, seconds=1)  # every rejection is now over 300 s old
+    risk = env.runtime.status()
+    assert risk is not None and risk.broker_rejections_5m == 0
+    # Cleared by itself: the next pass drops the standing halt and an entry goes through. (The held
+    # position is taken away first: without its stop, its own halt would refuse the entry.)
+    del env.service.positions[position_id(held)]
+    env.tick()  # a live feed: five silent minutes would halt entries for their own reason
+    await env.runtime.monitor.step()
+    assert env.runtime.monitor.entry_halt() is None
+    after = await env.entry()
+    assert not (after.reason or "").startswith(REJECT_BREAKER)
+    assert after.accepted, after.reason  # sent again (and this broker still refuses it)
+    assert len(sent) == 5  # the three entries, the exit, and this one
 
 
 # ---- the command consumer's kill hook --------------------------------------------------------
