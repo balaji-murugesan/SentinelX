@@ -11,7 +11,8 @@ Scenarios: "Carried delivery position is flattened", "Entry fills during cancel"
 filling", "Replacement waits for the cancel", "Not flat in time", "Stop after exit", "Kill twice",
 "Resume does not help", "Next day", "No broker lock", "Floor breach kills without any client",
 "Persistence down at a breach", "Mixed book at square-off" and "Not a halt"; and, for
-add-risk-guards task 8.3, the flattener's positions filter and "Expiry square-off".
+add-risk-guards task 8.3, the flattener's positions filter and "Expiry square-off"; for task 9.2,
+"A kill outranks the target" and that the recovery resume command does not clear a target halt.
 """
 
 import asyncio
@@ -885,6 +886,68 @@ async def test_resume_cannot_clear_the_day_lock() -> None:
     assert w.daybook.day().halt_level is HaltLevel.KILL  # ... and the day lock is not
     stored = await w.risk.load_day("main", TODAY)
     assert stored is not None and stored.halt_level is HaltLevel.KILL
+
+
+async def target_halted(w: World) -> None:
+    """Lock the day at TARGET_HALT the way the monitor does (add-risk-guards task 9.2)."""
+    w.daybook.raise_halt(HaltLevel.TARGET_HALT, "RISK_TARGET_HALT: banked")
+    assert await w.daybook.flush()
+
+
+async def test_resume_cannot_clear_a_target_halt() -> None:
+    """profit-target "The target halt holds for the rest of the day": the recovery resume command
+    clears a reconciliation halt and leaves the day's TARGET_HALT, in memory and stored."""
+    w = await world()
+    await target_halted(w)
+    await w.repo.store_halt("main", ["seeded difference"], NOW)
+    w.service.reconciled, w.service.halt_differences = False, ["seeded difference"]
+    resume = ResumeRecovery(
+        command_id="r1", idempotency_key="resume-1", account_id="main", source="cli", sent_at=NOW
+    )
+
+    answer = await resume_recovery(w.service, w.repo, w.broker, resume, account_id="main")
+
+    assert answer.accepted and w.service.reconciled  # the reconciliation halt is cleared ...
+    assert w.daybook.day().halt_level is HaltLevel.TARGET_HALT  # ... and the day lock is not
+    stored = await w.risk.load_day("main", TODAY)
+    assert stored is not None and stored.halt_level is HaltLevel.TARGET_HALT
+
+
+async def test_a_kill_outranks_the_target() -> None:
+    """Spec "A kill outranks the target": on a day locked at TARGET_HALT a kill is not "already
+    stopped" (that is only at KILL): it raises the day to KILL, stored, and keeps flattening."""
+    w = await world()
+    w.hold(OPTION, 65)
+    await target_halted(w)
+
+    refusal = await w.kill.trigger("floor breached", "risk")
+    await w.finish_flatten()
+
+    assert refusal is None  # this call did it
+    assert w.daybook.day().halt_level is HaltLevel.KILL
+    assert "floor breached" in (w.daybook.day().halt_reason or "")
+    stored = await w.risk.load_day("main", TODAY)
+    assert stored is not None and stored.halt_level is HaltLevel.KILL
+    assert w.flat()
+
+
+async def test_a_target_halt_starts_the_flatten_and_cancels_resting_entries() -> None:
+    """The monitor's ``ensure_flat`` is the same call for a target halt as for a kill: the day is
+    locked (TARGET_HALT is above MTM_BLIND), so a resting entry is cancelled and the book is
+    flattened."""
+    w = await world()
+    w.hold(OPTION, 65)
+    w.market[OPTION] = D("90")  # the entry below rests
+    entry = await w.service.place(command("entry", side=BUY, quantity=65, limit="85.00"))
+    assert entry.order_id
+    w.market[OPTION] = D("100")
+    await target_halted(w)
+
+    await w.kill.ensure()
+    await w.finish_flatten()
+
+    assert entry.order_id in w.broker.cancel_asked
+    assert w.flat() and w.daybook.day().halt_level is HaltLevel.TARGET_HALT
 
 
 async def test_next_day_the_lock_is_gone() -> None:

@@ -12,8 +12,8 @@ It does three jobs and is the ``RiskState`` the gate reads:
      (add-risk-guards task 8.2: persisted, one-way, and from then on the floor uses the stricter
      expiry giveback), raises the peak and the floor (the ratchet), runs the continuous checks
      (floor breach, silent feed, blind positions) and acts on the most severe decision, then
-     persists on a throttle. Before it acts on a KILL it writes the ratchet (and goes on if that
-     write fails: the breach is acted on either way).
+     persists on a throttle. Before it acts on a KILL or a profit-target halt it writes the
+     day's state (and goes on if that write fails: the stop is acted on either way).
   3. **A heartbeat**: ``step`` stamps the time it finished. The gate refuses entries if that stamp
      is older than three intervals, so a monitor that has died cannot leave the account unwatched;
      ``engine.main._keep_alive`` restarts it.
@@ -21,7 +21,10 @@ It does three jobs and is the ``RiskState`` the gate reads:
 What a decision does here: a KILL refuses entries at once (a standing halt), writes the ratchet,
 then calls the kill switch (``on_kill``, idempotent, on every pass while the breach holds). A
 blind book (``RISK_MTM_BLIND``) raises a persisted day halt (entries are then refused for the day
-by the gate) with no broker lock. While the day is locked, for either reason, the monitor asks
+by the gate) with no broker lock. A confirmed profit target (``RISK_TARGET_HALT``, add-risk-guards
+task 9.2; the monitor counts the consecutive passes at or above the target) does the same at
+``HaltLevel.TARGET_HALT``, after the KILL branch so a breach in the same pass wins. While the day is
+locked, for any of these reasons, the monitor asks
 for the flatten on **every** pass (``ensure_flat``, idempotent), so one that failed or was cut
 short by a crash starts again. Any other halt is *standing*: the gate refuses entries for as long
 as the condition holds, and it clears by itself on the first pass where the check stops firing.
@@ -56,6 +59,7 @@ from engine.risk.banlist import BanListService
 from engine.risk.checks.common import money
 from engine.risk.checks.flow import REJECT_BREAKER
 from engine.risk.checks.stale import MTM_BLIND
+from engine.risk.checks.target import TARGET_HALT, next_confirmations
 from engine.risk.daybook import NOT_LOADED, DayBook
 from engine.risk.decision import (
     ContinuousCheck,
@@ -175,6 +179,9 @@ class RiskMonitor:
         self._applied: RiskLimits | None = None  # the limits the tracker was last configured with
         self._last_limits: RiskLimits | None = None  # the last limits that were in force
         self._reading: MtmReading | None = None
+        # Consecutive passes with MTM_day at or above the profit target (add-risk-guards task 9.1).
+        # Memory only: a restart starts it at zero, and the target halt is in the day row anyway.
+        self._target_confirmations = 0
         self._standing: Decision | None = None
         self._outliers: list[Tick] = []  # outlier ticks seen since the last pass, to be audited
         self._beat: datetime | None = None
@@ -258,6 +265,7 @@ class RiskMonitor:
             await self._pass()
         except Exception:
             log.error("risk monitor pass failed", exc_info=True)
+            self._target_confirmations = 0  # a failed pass did not see MTM_day at the target
             self._standing = halt_new_entries(
                 STATE_UNAVAILABLE, "the risk monitor failed while watching the account"
             )
@@ -269,6 +277,7 @@ class RiskMonitor:
             await self._limits.load()
         if not await self._ensure_day(now):
             self._reading, self._standing = None, None  # entries are refused for that reason
+            self._target_confirmations = 0  # MTM_day is unknown on this pass
             return
         trading = self._trading
         # If the limits are lost mid-run (a failed save that could not be read back), keep
@@ -277,6 +286,7 @@ class RiskMonitor:
         limits = self._limits.current or self._last_limits
         if limits is None or trading is None:
             self._reading, self._standing = None, None  # nothing to watch against yet
+            self._target_confirmations = 0
             return
         self._last_limits = limits
         references_ok = await self._ensure_references(now)
@@ -285,6 +295,11 @@ class RiskMonitor:
         # refuses entries): measuring from average prices would raise the peak and floor, and
         # they never come back down.
         self._reading = self._evaluate(tracker, now) if references_ok else None
+        # Counted before the checks run, from this pass's MTM_day: a dip, an unknown MTM_day or no
+        # target set puts it back to zero (profit-target "A dip resets the count").
+        self._target_confirmations = next_confirmations(
+            self._target_confirmations, self.mtm_day(), limits.daily_profit_target
+        )
         exposure_switched_on = self._note_expiry_exposure(now)  # before the ratchet uses it
         self._ratchet(tracker, limits)
         results = self._judge(limits, trading, now)
@@ -314,6 +329,7 @@ class RiskMonitor:
     def _new_day(self) -> None:
         if self._tracker is not None:
             self._tracker.new_day()
+        self._target_confirmations = 0  # a new day's MTM_day starts again from zero
         self._noticed.clear()  # (a standing halt needs no clearing: every pass recomputes it)
         self._references_for = None
         self._watch_since.clear()
@@ -458,6 +474,7 @@ class RiskMonitor:
             unprotected=self._unprotected(),
             recent_entries=self._daybook.recent_entries(now),
             broker_rejections=self._rejections(now),
+            target_confirmations=self._target_confirmations,  # the monitor's only: see task 9.1
             ban_list=self.ban_list(now),
             spot_key=self._spot_key,
         )
@@ -478,10 +495,17 @@ class RiskMonitor:
                 log.error("the day state could not be written before the kill", exc_info=True)
             await self._kill(winner.decision)
             return
+        # After the KILL branch, so a breach in the same pass wins (profit-target "A breach and the
+        # target together"). Only an enforced target acts: in shadow mode it is only logged.
+        if any(r.enforced and r.decision.code == TARGET_HALT for r in results):
+            target = next(r.decision for r in results if r.decision.code == TARGET_HALT)
+            await self._lock_target_day(target)
         if any(r.enforced and r.decision.code == MTM_BLIND for r in results):
             blind = next(r.decision for r in results if r.decision.code == MTM_BLIND)
             await self._lock_blind_day(blind)
-        others = most_severe(r for r in results if r.decision.code != MTM_BLIND)
+        # The two day locks are not standing halts: the gate refuses entries for them through the
+        # day's halt level (RISK_HALTED_DAY), which does not clear when the condition does.
+        others = most_severe(r for r in results if r.decision.code not in (MTM_BLIND, TARGET_HALT))
         self._standing = None if others is None else others.decision
 
     async def _kill(self, decision: Decision) -> None:
@@ -502,10 +526,32 @@ class RiskMonitor:
         self._daybook.raise_halt(HaltLevel.MTM_BLIND, reason)
         await self._daybook.flush()
 
+    async def _lock_target_day(self, decision: Decision) -> None:
+        """The profit target is reached: lock entries for the rest of the day at ``TARGET_HALT``,
+        persisted before anything is acted on. The flatten is then asked for by
+        ``_keep_flattening`` (as for a blind book or a kill), which also cancels pending entries.
+
+        An automatic stop with no intraday resume (CLAUDE.md safety rule 16): the level lives in
+        the day's row, which only rises (``raise_halt``) and is replaced by the next IST date's
+        row, so neither a restart nor the recovery resume command (it clears only a
+        reconciliation halt) can clear it. ``TARGET_HALT`` (20) sits between ``MTM_BLIND`` and
+        ``KILL``, so a later kill still escalates the day to ``KILL``. The broker's own lock
+        after an automatic stop (D-030) is an optional broker capability that no adapter offers
+        yet (stage 7 adds it); like the floor's kill, this path calls none."""
+        if self._daybook.day().halt_level >= HaltLevel.TARGET_HALT:
+            return  # already done today (or a kill locked it higher)
+        reason = decision.reason() or TARGET_HALT
+        log.critical("profit target reached: locking the day and flattening", reason=reason)
+        self._daybook.raise_halt(HaltLevel.TARGET_HALT, reason)
+        try:
+            await self._daybook.flush()  # written before acting; a failed write is retried later
+        except Exception:  # a failure, of any kind, is not a reason to leave the book open
+            log.error("the day state could not be written before the target halt", exc_info=True)
+
     async def _keep_flattening(self) -> None:
-        """While the day is locked (a blind book, or a kill), keep asking for the flatten. It is
-        asked on every pass, not once, so a flatten that failed or was cut short by a crash is
-        started again."""
+        """While the day is locked (a blind book, the profit target, or a kill), keep asking for
+        the flatten. It is asked on every pass, not once, so a flatten that failed or was cut
+        short by a crash is started again."""
         day = self._daybook.day()
         pending = self._lock_pending()
         if (day.halt_level < HaltLevel.MTM_BLIND and not pending) or self._ensure_flat is None:

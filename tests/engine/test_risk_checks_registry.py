@@ -1,7 +1,7 @@
 """The registered pre-trade rules (add-risk-engine group 6): each is named in the limits' rule
 table, exactly one applies to exits, and the order is the tie-break."""
 
-from engine.risk.checks.registry import default_checks
+from engine.risk.checks.registry import continuous_checks, default_checks
 from engine.risk.limits import RULES
 
 
@@ -12,15 +12,15 @@ def test_every_registered_rule_is_a_rule_the_limits_know_by_name() -> None:
     assert set(names) <= set(RULES)  # so each has a mode and a shadow rule
 
 
-# add-risk-guards added these rule names to the limits (task 3.1) before their checks exist
-# (groups 5-9). Each group that registers a check removes its name here, so a rule left without a
-# check, or a check whose name is still listed, fails the test below.
-NOT_BUILT_YET = {"profit_target"}
+# Rules that judge only the account, never an order, so only the monitor runs them: the profit
+# target (add-risk-guards task 9.1). Every other rule in the table is a pre-trade rule.
+CONTINUOUS_ONLY = {"profit_target"}
 
 
 def test_every_rule_in_the_limits_table_is_registered() -> None:
-    assert NOT_BUILT_YET <= set(RULES)
-    assert {check.name for check in default_checks()} == set(RULES) - NOT_BUILT_YET
+    assert CONTINUOUS_ONLY <= set(RULES)
+    assert {check.name for check in default_checks()} == set(RULES) - CONTINUOUS_ONLY
+    assert CONTINUOUS_ONLY <= {check.name for check in continuous_checks()}
 
 
 def test_only_price_sanity_judges_exits() -> None:

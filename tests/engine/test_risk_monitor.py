@@ -4,7 +4,10 @@ Driven with a fake clock, ``on_tick`` and ``step`` (no real tasks, no real time)
 goes quiet", "Feed returns", "After the close", "Blind too long", "Next day", "Breach" and
 "Restart after a high peak"; the heartbeat the gate reads; the ratchet and its persistence; the
 previous close; and the fail-closed paths. add-risk-guards task 8.2: the expiry giveback
-("Entering an expiring contract", "Expiring position closed", "Restart keeps it").
+("Entering an expiring contract", "Expiring position closed", "Restart keeps it"). Tasks 9.1 and
+9.2: the profit target's confirmation count and its day lock ("Confirmed target", "A dip resets
+the count", "Unknown MTM resets the count", "No target set", "A breach and the target together",
+"MTM falls back" and "Restart keeps the halt").
 
 The kill and flatten hooks read the stored day state *at the moment they are called*, which is how
 these tests prove that the ratchet and the day lock are persisted before the engine acts.
@@ -36,8 +39,17 @@ from engine.risk.checks.stale import (
     FloorBreach,
     MtmBlind,
 )
+from engine.risk.checks.target import TARGET_HALT, ProfitTarget
 from engine.risk.daybook import DayBook
-from engine.risk.decision import ALLOW, ContinuousCheck, Decision, RiskContext, RiskTrigger
+from engine.risk.decision import (
+    ALLOW,
+    ContinuousCheck,
+    Decision,
+    RiskContext,
+    RiskTrigger,
+    Severity,
+    kill,
+)
 from engine.risk.floor import floor_of
 from engine.risk.limits import MODE_PREFIX
 from engine.risk.limits_service import LimitsService, LimitsStatus
@@ -1460,3 +1472,266 @@ async def test_a_monitor_without_ban_lists_has_no_list_and_knows_no_spot() -> No
 
     assert env.monitor.ban_list(env.clock.at) is None
     assert spy.seen[-1].ban_list is None and spy.seen[-1].spot_key("NIFTY") is None
+
+
+# ---- the profit target (add-risk-guards tasks 9.1 and 9.2) ------------------------------------
+
+# A target of 500 confirmed on 2 consecutive passes. The carried position is 65 units bought at
+# 100: at 110 its MTM_day is 650 less the exit charge (above the target), at 106 it is 390 less
+# the charge (below). The peak stays under every floor term's trigger, so the floor stays far below.
+TARGET_LIMITS = {**BASE, "daily_profit_target": "500", "target_confirm_ticks": 2}
+TARGET_CHECKS: tuple[ContinuousCheck, ...] = (*CHECKS, ProfitTarget())
+
+
+async def target_env(**kwargs) -> Env:  # type: ignore[no-untyped-def]
+    options = {"positions": [carried()], "limits": TARGET_LIMITS, "checks": TARGET_CHECKS}
+    return await Env(**{**options, **kwargs}).ready()
+
+
+async def priced(env: Env, price: str) -> None:
+    """One second on, a tick at ``price``, and a monitor pass."""
+    env.clock.advance(1)
+    env.tick(price)
+    await stepped(env)
+
+
+async def test_the_monitor_counts_the_confirmations_into_its_own_context() -> None:
+    """The monitor fills ``target_confirmations``: one more per pass at or above the target."""
+    seeing = _Seeing()
+    env = await target_env(checks=(seeing,))
+    await stepped(env)  # at the cost price: below the target
+
+    await priced(env, "110")
+    await priced(env, "110")
+
+    assert [ctx.target_confirmations for ctx in seeing.seen] == [0, 1, 2]
+    assert seeing.seen[-1].mtm_day is not None and seeing.seen[-1].mtm_day >= D(500)
+
+
+async def test_a_confirmed_target_locks_the_day_persisted_before_it_asks_for_the_flatten() -> None:
+    """Spec "Confirmed target" through the monitor, and the TARGET_HALT branch of ``_act``: the
+    halt level and its reason are stored BEFORE the flatten is asked for (the hook reads the
+    stored row), the day is not killed, and the lock is announced once, not on every pass."""
+    env = await target_env()
+    await stepped(env)
+    await priced(env, "110")
+    assert env.daybook.day().halt_level is HaltLevel.NONE  # one confirmation is not enough
+    assert env.flat_calls == []
+
+    with capture_logs() as logs:
+        await priced(env, "110")
+        await priced(env, "111")
+        await priced(env, "112")
+
+    day = env.daybook.day()
+    assert day.halt_level is HaltLevel.TARGET_HALT
+    assert (day.halt_reason or "").startswith(TARGET_HALT)
+    first_saw = env.flat_saw[0]
+    assert first_saw is not None and first_saw.halt_level is HaltLevel.TARGET_HALT  # stored first
+    assert (first_saw.halt_reason or "").startswith(TARGET_HALT)
+    assert env.flat_calls[0].startswith(TARGET_HALT) and len(env.flat_calls) == 3  # every pass
+    assert env.kills == []  # a target halt is its own level, not a kill
+    assert sum(e["event"].startswith("profit target reached") for e in logs) == 1
+    assert env.monitor.entry_halt() is None  # a day lock, not a standing halt
+
+
+async def test_a_dip_resets_the_count_through_the_monitor() -> None:
+    """Spec "A dip resets the count": above, below, above is not yet reached; one more pass is."""
+    env = await target_env()
+    await stepped(env)
+
+    await priced(env, "110")
+    await priced(env, "106")  # below the target
+    await priced(env, "110")
+    assert env.daybook.day().halt_level is HaltLevel.NONE and env.flat_calls == []
+
+    await priced(env, "110")
+    assert env.daybook.day().halt_level is HaltLevel.TARGET_HALT
+
+
+async def test_an_unknown_mtm_resets_the_count_through_the_monitor() -> None:
+    """Spec "Unknown MTM resets the count": a held instrument with no price makes MTM_day unknown
+    for a pass, and the count starts again from zero afterwards."""
+    env = await target_env()
+    await stepped(env)
+    await priced(env, "110")
+    held = dict(env.trading.positions)
+    unpriced = position(STOCK, 10, "200.00")
+
+    env.trading.positions = {**held, position_id(unpriced): unpriced}  # never ticked
+    await priced(env, "110")
+    assert env.monitor.mtm_day() is None
+    env.trading.positions = held
+    await priced(env, "110")
+    assert env.daybook.day().halt_level is HaltLevel.NONE  # one confirmation since the reset
+
+    await priced(env, "110")
+    assert env.daybook.day().halt_level is HaltLevel.TARGET_HALT
+
+
+async def test_a_count_left_at_the_end_of_a_day_does_not_carry_into_the_next() -> None:
+    """One confirmation on Monday, then Tuesday's first pass at or above the target: a new day
+    counts from zero, so it takes Tuesday's own two passes to reach the target."""
+    env = await target_env()
+    await stepped(env)
+    await priced(env, "110")  # Monday: one confirmation
+
+    env.clock.at = NOW + timedelta(days=1)
+    env.tick("110")
+    await stepped(env)
+    assert env.daybook.day().trade_date == TODAY + timedelta(days=1)
+    assert env.daybook.day().halt_level is HaltLevel.NONE and env.flat_calls == []
+
+    await priced(env, "110")
+    assert env.daybook.day().halt_level is HaltLevel.TARGET_HALT
+
+
+async def test_a_pass_that_fails_resets_the_count() -> None:
+    """A pass that raises after counting (here the ratchet) did not complete a confirmation: the
+    count starts again, so one more pass at or above the target is not enough."""
+    env = await target_env()
+    await stepped(env)
+    await priced(env, "110")
+    real = env.monitor._ratchet  # type: ignore[attr-defined]
+
+    def broken(*args: object) -> None:
+        raise RuntimeError("ratchet bug")
+
+    env.monitor._ratchet = broken  # type: ignore[attr-defined,method-assign]
+    await priced(env, "110")  # counted, then failed before acting
+    env.monitor._ratchet = real  # type: ignore[attr-defined,method-assign]
+    halt = env.monitor.entry_halt()
+    assert halt is not None and halt.code == "RISK_STATE_UNAVAILABLE"
+    await priced(env, "110")
+    assert env.daybook.day().halt_level is HaltLevel.NONE and env.flat_calls == []
+
+    await priced(env, "110")
+    assert env.daybook.day().halt_level is HaltLevel.TARGET_HALT
+
+
+async def test_a_pass_with_the_day_unavailable_resets_the_count() -> None:
+    """A pass on which the day's state cannot be read sees no MTM_day: the count starts again."""
+    env = await target_env()
+    await stepped(env)
+    await priced(env, "110")
+    real = env.monitor._ensure_day  # type: ignore[attr-defined]
+
+    async def unavailable(now: datetime) -> bool:
+        return False
+
+    env.monitor._ensure_day = unavailable  # type: ignore[attr-defined,method-assign]
+    await priced(env, "110")
+    env.monitor._ensure_day = real  # type: ignore[attr-defined,method-assign]
+    await priced(env, "110")
+    assert env.daybook.day().halt_level is HaltLevel.NONE and env.flat_calls == []
+
+    await priced(env, "110")
+    assert env.daybook.day().halt_level is HaltLevel.TARGET_HALT
+
+
+async def test_with_no_target_set_nothing_is_counted_or_halted() -> None:
+    """Spec "No target set" through the monitor: BASE sets no target."""
+    seeing = _Seeing()
+    env = await target_env(limits=BASE, checks=(*TARGET_CHECKS, seeing))
+    await stepped(env)
+
+    for _ in range(5):
+        await priced(env, "110")
+
+    assert {ctx.target_confirmations for ctx in seeing.seen} == {0}
+    assert env.daybook.day().halt_level is HaltLevel.NONE and env.flat_calls == []
+
+
+async def test_a_target_in_shadow_mode_logs_a_warning_and_neither_halts_nor_flattens() -> None:
+    env = await target_env(limits={**TARGET_LIMITS, MODE_PREFIX + "profit_target": "shadow"})
+    await stepped(env)
+
+    with capture_logs() as logs:
+        for _ in range(4):
+            await priced(env, "110")
+
+    assert env.daybook.day().halt_level is HaltLevel.NONE
+    assert env.flat_calls == [] and env.monitor.entry_halt() is None
+    started = [
+        e for e in logs if e["event"] == "risk decision started" and e["code"] == TARGET_HALT
+    ]
+    assert [e["log_level"] for e in started] == ["warning"]  # tried out, once per episode
+    assert len(env.rows(TARGET_HALT)) == 1  # and audited, as a shadow verdict
+
+
+class Says:
+    """A continuous check that always returns ``decision``."""
+
+    def __init__(self, name: str, decision: Decision) -> None:
+        self.name, self.decision = name, decision
+
+    def continuous(self, ctx: RiskContext, event: RiskTrigger) -> Decision:
+        return self.decision
+
+
+async def test_a_breach_and_the_target_together_act_on_the_kill() -> None:
+    """Spec "A breach and the target together": one pass sees both, and the engine acts on the
+    kill. The target branch comes after the KILL branch, so it does not run in that pass."""
+    target = Decision(Severity.TARGET_HALT, TARGET_HALT, "target")
+    env = await target_env(
+        checks=(Says("profit_target", target), Says("equity_floor", kill(FLOOR_BREACH, "breach")))
+    )
+
+    await stepped(env)
+
+    assert [k.code for k in env.kills] == [FLOOR_BREACH]
+    assert env.daybook.day().halt_level is HaltLevel.NONE  # (the fake kill hook locks nothing)
+    halt = env.monitor.entry_halt()
+    assert halt is not None and halt.code == FLOOR_BREACH
+
+
+async def test_after_a_target_halt_the_day_stays_locked_when_mtm_falls_back() -> None:
+    """Spec "MTM falls back": the lock does not clear with the condition (the gate then refuses
+    every entry with RISK_HALTED_DAY: test_risk_runtime.py), and the flatten is still asked for."""
+    env = await target_env()
+    await stepped(env)
+    await priced(env, "110")
+    await priced(env, "110")
+    asked = len(env.flat_calls)
+
+    await priced(env, "90")  # MTM_day now a loss, well below the target
+    await priced(env, "90")
+
+    assert env.daybook.day().halt_level is HaltLevel.TARGET_HALT
+    assert len(env.flat_calls) == asked + 2
+
+
+async def test_a_target_halt_whose_write_fails_still_asks_for_the_flatten() -> None:
+    """Exits come first: a day-state write that fails, of any kind, does not leave the book open.
+    The lock holds in memory (the gate reads it) and the write is retried later."""
+    env = await target_env()
+    await stepped(env)
+    await priced(env, "110")
+
+    async def broken(state: DayState) -> DayState:
+        raise RuntimeError("driver bug")
+
+    env.repo.save_day = broken  # type: ignore[method-assign]
+    await priced(env, "110")
+
+    assert env.daybook.day().halt_level is HaltLevel.TARGET_HALT
+    assert env.flat_calls != []
+    saw = env.flat_saw[0]
+    assert saw is None or saw.halt_level is HaltLevel.NONE  # not stored, and the flatten went on
+
+
+async def test_a_monitor_restarted_on_a_target_halted_day_asks_for_the_flatten_at_once() -> None:
+    """Spec "Restart keeps the halt" at the monitor: the lock is read from the stored day row (the
+    confirmation count starts at zero after a restart, and is not needed), so the first pass of
+    the new process asks for the flatten again."""
+    repo = MemoryRiskRepository()
+    reason = "RISK_TARGET_HALT: banked"
+    await repo.save_day(
+        DayState("main", TODAY, NOW, halt_level=HaltLevel.TARGET_HALT, halt_reason=reason)
+    )
+    env = await target_env(repo=repo)
+
+    await stepped(env)
+
+    assert env.flat_calls == [reason]
+    assert env.daybook.day().halt_level is HaltLevel.TARGET_HALT

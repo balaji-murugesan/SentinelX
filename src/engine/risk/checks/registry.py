@@ -17,6 +17,7 @@ from engine.risk.checks.prices import PriceSanity, StaleQuote
 from engine.risk.checks.protection import Unprotected
 from engine.risk.checks.stale import FeedDown, FloorBreach, MtmBlind
 from engine.risk.checks.stops import InitialStop, PerTradeRisk, StopDistance
+from engine.risk.checks.target import ProfitTarget
 from engine.risk.decision import ContinuousCheck, PreTradeCheck
 
 
@@ -43,5 +44,6 @@ def default_checks() -> list[PreTradeCheck]:
 def continuous_checks() -> list[ContinuousCheck]:
     """The checks the monitor runs on its timer, in the order they break a tie: the floor first
     (a KILL outranks everything anyway), then a silent feed, a blind book, an unprotected
-    position and (add-risk-guards, appended) the rejection breaker."""
-    return [FloorBreach(), FeedDown(), MtmBlind(), Unprotected(), RejectBreaker()]
+    position and (add-risk-guards, appended) the rejection breaker and the profit target. The
+    profit target is continuous only: no order can reach it, so it is not in ``default_checks``."""
+    return [FloorBreach(), FeedDown(), MtmBlind(), Unprotected(), RejectBreaker(), ProfitTarget()]

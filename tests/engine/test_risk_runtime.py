@@ -41,7 +41,6 @@ from engine.risk.runtime import RiskRuntime
 from tests.engine.risk_builders import NOW, OPTION, TODAY, fill, instrument_of, position
 from tests.engine.risk_fakes import MemoryRiskRepository
 from tests.engine.test_order_service import build
-from tests.engine.test_risk_checks_registry import NOT_BUILT_YET
 from tests.engine.test_risk_limits import BASE, edit
 from tests.engine.test_risk_stops import Clock, StopAdapter
 from tests.engine.trading_fakes import MemoryRepository
@@ -159,8 +158,7 @@ def test_the_engines_rules_are_exactly_the_ones_in_the_rule_table() -> None:
     The catastrophic-stop check has no mode on purpose (a missing stop always binds)."""
     names = {c.name for c in default_checks()} | {c.name for c in continuous_checks()}
 
-    assert NOT_BUILT_YET <= set(RULES)
-    assert names - {"catastrophic_stop"} == set(RULES) - NOT_BUILT_YET
+    assert names - {"catastrophic_stop"} == set(RULES)
 
 
 def test_the_engine_registers_every_check_once() -> None:
@@ -171,6 +169,7 @@ def test_the_engine_registers_every_check_once() -> None:
     assert max(Counter(type(c) for c in default_checks()).values()) == 1
     assert Counter(c.name for c in continuous_checks()) == {
         "equity_floor": 1, "stale_data": 2, "catastrophic_stop": 1, "reject_breaker": 1,
+        "profit_target": 1,
     }  # fmt: skip
     assert max(Counter(type(c) for c in continuous_checks()).values()) == 1
 
@@ -655,6 +654,145 @@ async def test_broker_rejections_trip_the_breaker_through_the_assembly(
     assert not (after.reason or "").startswith(REJECT_BREAKER)
     assert after.accepted, after.reason  # sent again (and this broker still refuses it)
     assert len(sent) == 5  # the three entries, the exit, and this one
+
+
+# ---- the profit target (add-risk-guards task 9.2) ---------------------------------------------
+
+# A target of 500 confirmed on 2 consecutive passes. The test position is 65 units bought at 200:
+# at 210 its MTM_day is 650 less the exit charge, above the target.
+TARGET = {**BASE, "daily_profit_target": "500", "target_confirm_ticks": 2}
+
+
+async def reach_the_target(env: Env) -> CommandResult:
+    """From a ready engine: a resting entry, then an open position whose MTM_day stays above the
+    target for two monitor passes. Returns the entry's result."""
+    entry = await env.entry()  # acknowledged, and nothing fills it: a pending entry
+    assert entry.accepted, entry.reason
+    held = position(OPTION, 65, "200.00", realized_pnl=D("0"))
+    env.service.positions[position_id(held)] = held
+    env.trading_repo.positions[(held.account_id, str(held.key), held.product.value)] = held
+    for _ in range(2):
+        env.clock.at += timedelta(seconds=1)
+        env.tick("210")
+        await env.runtime.monitor.step()
+    return entry
+
+
+async def test_a_confirmed_target_flattens_the_book_through_the_assembly(
+    env_factory: Callable[..., Env],
+) -> None:
+    """Spec "Target flattens the book" through the real assembly: the halt is stored, the pending
+    entry is cancelled and the position is exited by the kill switch's flattener; spec "Snapshot
+    after a target halt": the risk block shows TARGET_HALT with its reason."""
+    env = await env_factory().ready(TARGET)
+
+    entry = await reach_the_target(env)
+
+    day = env.runtime.daybook.day()
+    assert day.halt_level is HaltLevel.TARGET_HALT
+    assert (day.halt_reason or "").startswith("RISK_TARGET_HALT")
+    stored = await env.risk_repo.load_day("main", TODAY)
+    assert stored is not None and stored.halt_level is HaltLevel.TARGET_HALT
+    assert ("cancel", entry.order_id) in env.adapter.events
+    await until(
+        lambda: any(
+            o.source == "risk-kill" and o.side is OrderSide.SELL for o in env.adapter.placed
+        )
+    )
+    status = env.runtime.status()
+    assert status is not None
+    snapshot = Snapshot.model_validate_json(
+        Snapshot(
+            account_id="main", taken_at=NOW, open_orders=[], positions=[], risk=status
+        ).model_dump_json()
+    )  # fmt: skip
+    assert snapshot.risk is not None and snapshot.risk.halt_level is HaltLevel.TARGET_HALT
+    assert (snapshot.risk.halt_reason or "").startswith("RISK_TARGET_HALT")
+    await env.abandon_flatten()
+
+
+async def test_after_a_target_halt_entries_are_refused_when_mtm_falls_back(
+    env_factory: Callable[..., Env],
+) -> None:
+    """Spec "MTM falls back": MTM_day falls well below the target (a loss of about 325), and an
+    entry is refused with RISK_HALTED_DAY."""
+    env = await env_factory().ready(TARGET)
+    await reach_the_target(env)
+
+    env.clock.at += timedelta(seconds=1)
+    env.tick("195")
+    await env.runtime.monitor.step()
+    refused = await env.entry()
+
+    mtm = env.runtime.monitor.mtm_day()
+    assert mtm is not None and mtm < 0
+    assert not refused.accepted and (refused.reason or "").startswith("RISK_HALTED_DAY")
+    assert env.runtime.daybook.day().halt_level is HaltLevel.TARGET_HALT
+    await env.abandon_flatten()
+
+
+async def test_a_blind_locked_day_moves_up_to_the_target_halt_when_the_target_is_confirmed(
+    env_factory: Callable[..., Env],
+) -> None:
+    """TARGET_HALT ranks above MTM_BLIND (profit-target "Reaching the target locks the day at
+    TARGET_HALT"): a day already locked by a blind book, whose target is then confirmed, moves up
+    to TARGET_HALT. The snapshot's risk block and the audit carry the target's reason."""
+    from engine.risk.state import DayState
+
+    repo = MemoryRiskRepository()
+    await repo.save_day(
+        DayState("main", TODAY, NOW, halt_level=HaltLevel.MTM_BLIND, halt_reason="book is blind")
+    )
+    env = env_factory(risk_repo=repo)
+    held = position(OPTION, 65, "200.00", realized_pnl=D("0"))
+    env.service.positions[position_id(held)] = held
+    env.trading_repo.positions[(held.account_id, str(held.key), held.product.value)] = held
+    await env.ready(TARGET)  # the price is 200; the blind lock's flatten is under way
+
+    for _ in range(2):
+        env.clock.at += timedelta(seconds=1)
+        env.tick("210")  # 650 less the exit charge: above the target of 500
+        await env.runtime.monitor.step()
+    await env.runtime.audit.drain()
+
+    status = env.runtime.status()
+    assert status is not None and status.halt_level is HaltLevel.TARGET_HALT
+    assert (status.halt_reason or "").startswith("RISK_TARGET_HALT")
+    stored = await repo.load_day("main", TODAY)
+    assert stored is not None and stored.halt_level is HaltLevel.TARGET_HALT
+    assert any(e.reason_code == "RISK_TARGET_HALT" for e in repo.events)
+    await env.abandon_flatten()
+
+
+async def test_a_restart_keeps_the_target_halt_and_resumes_the_flatten(
+    env_factory: Callable[..., Env],
+) -> None:
+    """Spec "Restart keeps the halt": a new engine on the same database, the position still open
+    after reconciliation. Entries are refused and the flatten starts again on its first pass,
+    even with MTM_day back below the target. (That the confirmation count itself does not survive
+    a restart is a monitor test: test_risk_monitor.py.)"""
+    first = await env_factory().ready(TARGET)
+    await reach_the_target(first)
+    await first.abandon_flatten()  # the process dies mid-flatten
+
+    second = env_factory(risk_repo=first.risk_repo)  # the same database
+    held = position(OPTION, 65, "200.00", realized_pnl=D("0"))
+    second.service.positions[position_id(held)] = held
+    second.trading_repo.positions[(held.account_id, str(held.key), held.product.value)] = held
+    await second.runtime.start(second.stop)
+    await second.runtime.monitor.step()  # the first pass: it asks for the flatten at once
+    second.tick("195")  # the price fell: MTM_day is a loss, far below the target now
+    await second.runtime.monitor.step()
+
+    assert second.runtime.daybook.day().halt_level is HaltLevel.TARGET_HALT
+    await until(
+        lambda: any(
+            o.source == "risk-kill" and o.side is OrderSide.SELL for o in second.adapter.placed
+        )
+    )
+    refused = await second.entry()
+    assert not refused.accepted and (refused.reason or "").startswith("RISK_HALTED_DAY")
+    await second.abandon_flatten()
 
 
 # ---- the command consumer's kill hook --------------------------------------------------------

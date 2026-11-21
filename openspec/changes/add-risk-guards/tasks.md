@@ -80,8 +80,8 @@
 
 ## 9. Profit target
 
-- [ ] 9.1 Implement the monitor's `target_confirmations` counter (reset on a dip, on unknown MTM, or with no target set) and `ProfitTarget` (`checks/target.py`, continuous, `Severity.TARGET_HALT`, `RISK_TARGET_HALT`), and append it to `continuous_checks()`. Fill `RiskContext.target_confirmations` in the monitor's context builder only: the target is continuous, so the gate keeps the default. Verify the `profit-target` confirmation scenarios as unit tests.
-- [ ] 9.2 Add a `TARGET_HALT` branch to `Monitor._act`, after the KILL branch: `raise_halt(HaltLevel.TARGET_HALT)`, `flush()` before acting, then the existing flatten. Verify with monitor tests:
+- [x] 9.1 Implement the monitor's `target_confirmations` counter (reset on a dip, on unknown MTM, or with no target set) and `ProfitTarget` (`checks/target.py`, continuous, `Severity.TARGET_HALT`, `RISK_TARGET_HALT`), and append it to `continuous_checks()`. Fill `RiskContext.target_confirmations` in the monitor's context builder only: the target is continuous, so the gate keeps the default. Verify the `profit-target` confirmation scenarios as unit tests.
+- [x] 9.2 Add a `TARGET_HALT` branch to `Monitor._act`, after the KILL branch: `raise_halt(HaltLevel.TARGET_HALT)`, `flush()` before acting, then the existing flatten. Verify with monitor tests:
   - "Target flattens the book";
   - "A kill outranks the target" and "A breach and the target together";
   - "MTM falls back" (entry refused with `RISK_HALTED_DAY`);

@@ -499,7 +499,8 @@ class KillSwitch:
         return self._pending is not None
 
     def _locked(self) -> bool:
-        """Is the day locked (a kill, a blind book), or a kill waiting to be recorded?"""
+        """Is the day locked (a kill, a blind book, the profit target: any level from
+        ``MTM_BLIND`` up), or a kill waiting to be recorded?"""
         if self._pending is not None:
             return True
         if self._daybook.unavailable(self._now()) is not None:
