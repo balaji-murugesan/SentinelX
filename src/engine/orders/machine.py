@@ -7,9 +7,15 @@ what to do with a refused transition (log it, keep the order unchanged).
     Requested -> Submitted | Rejected
     Submitted -> Open | Rejected | Unknown        (Unknown: no broker ack in time)
     Unknown   -> Open | Rejected                  (after reconciling with the broker)
-    Open      -> PartiallyFilled | Filled | Cancelled
+    Open      -> PartiallyFilled | Filled | Cancelled | Rejected
+                                                  (Rejected: the broker's risk system refuses an
+                                                  order it had already acknowledged)
     PartiallyFilled -> PartiallyFilled | Filled | Cancelled   (another part fills)
     Filled, Rejected, Cancelled: final
+
+There is deliberately no ``PartiallyFilled -> Rejected``: an ``Open`` order has nothing filled,
+so rejecting it changes no position, but a partly filled one does (handle-late-broker-rejections
+design §1). A rejection that arrives after a fill is refused like any other invalid transition.
 """
 
 from datetime import datetime
@@ -22,7 +28,7 @@ TRANSITIONS: dict[OrderState, frozenset[OrderState]] = {
     S.REQUESTED: frozenset({S.SUBMITTED, S.REJECTED}),
     S.SUBMITTED: frozenset({S.OPEN, S.REJECTED, S.UNKNOWN}),
     S.UNKNOWN: frozenset({S.OPEN, S.REJECTED}),
-    S.OPEN: frozenset({S.PARTIALLY_FILLED, S.FILLED, S.CANCELLED}),
+    S.OPEN: frozenset({S.PARTIALLY_FILLED, S.FILLED, S.CANCELLED, S.REJECTED}),
     S.PARTIALLY_FILLED: frozenset({S.PARTIALLY_FILLED, S.FILLED, S.CANCELLED}),
     S.FILLED: frozenset(),
     S.REJECTED: frozenset(),

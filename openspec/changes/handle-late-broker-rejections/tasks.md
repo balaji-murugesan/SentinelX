@@ -4,13 +4,13 @@ Start both test containers first (sx-redis-test on 6380, sx-pg-test on 5433). Ru
 
 ## 1. The `Open → Rejected` transition
 
-- [ ] 1.1 Add `S.REJECTED` to `TRANSITIONS[S.OPEN]` in `engine/orders/machine.py`, and add it to the module docstring's diagram. Add the PRD §5 diagram line `Open --> Rejected: broker reject after ack`. Verify with state-machine unit tests: `Open → Rejected` is allowed; `PartiallyFilled → Rejected` is still refused; every final state still refuses every target.
-- [ ] 1.2 In `tests/engine/test_order_service_rejections.py`, remove the xfail marker from `test_an_acknowledged_order_rejected_by_the_broker_counts`. Remove the `awaiting_update` helper, and rewrite its users to go through a real acknowledgement (design §2). Verify:
+- [x] 1.1 Add `S.REJECTED` to `TRANSITIONS[S.OPEN]` in `engine/orders/machine.py`, and add it to the module docstring's diagram. Add the PRD §5 diagram line `Open --> Rejected: broker reject after ack`. Verify with state-machine unit tests: `Open → Rejected` is allowed; `PartiallyFilled → Rejected` is still refused; every final state still refuses every target.
+- [x] 1.2 In `tests/engine/test_order_service_rejections.py`, remove the xfail marker from `test_an_acknowledged_order_rejected_by_the_broker_counts`. Remove the `awaiting_update` helper, and rewrite its users to go through a real acknowledgement (design §2). Verify:
   - the formerly xfail test passes;
   - the stored audit trail reads Requested → Submitted → Open → Rejected, with the broker's reason;
   - a repeat `Rejected` for that order reports nothing and logs `invalid_transition` (spec "Repeat of the rejection");
   - a `Rejected` update for a `PartiallyFilled` order leaves it `PartiallyFilled` with its filled quantity (spec "Rejection after a partial fill is refused").
-- [ ] 1.3 Tests for the resting-order readers after a late rejection, each through a real acknowledgement then a stream `Rejected`. Verify:
+- [x] 1.3 Tests for the resting-order readers after a late rejection, each through a real acknowledgement then a stream `Rejected`. Verify:
   - lot caps no longer reserve the rejected entry (spec "Rejected entry releases its reservation", open-lots cap 2);
   - the exposure check no longer counts it;
   - the snapshot's open orders no longer list it;
@@ -58,4 +58,4 @@ Start both test containers first (sx-redis-test on 6380, sx-pg-test on 5433). Ru
 ## Workflow follow-up
 
 - Archive after `add-risk-engine` and `add-risk-guards` are archived, in that order (`openspec archive handle-late-broker-rejections --yes`). The `catastrophic-stop` and `kill-switch` deltas add to specs that `add-risk-engine` creates.
-- Tell the S7 `DhanBroker` work that it must map Dhan's order-update `REJECTED` status to `Rejected`. If it finds Dhan rejects a partly filled order, it must propose a change rather than map that silently (design, Risks).
+- Tell the S7 `DhanBroker` work that it must map Dhan's order-update `REJECTED` status to `Rejected`. If it finds Dhan rejects a partly filled order, it must propose a change rather than map that silently (design, Risks). It must also confirm the stream never sends a fill after a rejection for the same order: such a fill is only kept in memory as an unapplied fill, with no position and no stop (the same as a fill after `Cancelled` today).

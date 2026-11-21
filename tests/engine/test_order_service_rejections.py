@@ -3,6 +3,9 @@ spec "Only rejections by the broker count").
 
 The listener fires for the two ways the broker refuses an order the engine sent: the adapter
 raising ``BrokerRejected`` at placement, and a broker ``Rejected`` update. Entries and exits alike.
+The update path is driven through a real acknowledgement: the order reaches ``Open`` the normal way
+and the broker then rejects it (handle-late-broker-rejections task 1.2; orders spec "A broker
+rejection after the acknowledgement is applied").
 It does not fire for a gate refusal, for the engine's own rate limiter (``RateLimited``), or for
 the orders restart recovery marks rejected (``settle_in_flight``, ``reconcile_unknown``). The
 order's own handling is the same either way: the existing rejection tests cover that, and the
@@ -13,9 +16,10 @@ from datetime import timedelta
 from decimal import Decimal
 
 import pytest
+from structlog.testing import capture_logs
 
-from contracts.orders import Order, OrderSide, OrderState, Position, ProductType
-from engine.broker.adapter import BrokerOrder, BrokerRejected, RateLimited, Rejected
+from contracts.orders import CostBreakdown, Order, OrderSide, OrderState, Position, ProductType
+from engine.broker.adapter import BrokerOrder, BrokerRejected, Filled, RateLimited, Rejected
 from engine.orders.service import OrderService
 from engine.persistence.repository import LoadedState
 from engine.positions.book import position_id
@@ -65,43 +69,32 @@ async def test_the_listener_fires_when_the_broker_refuses_at_placement() -> None
     assert len(adapter.placed) == 1  # and never resent (safety rule 4)
 
 
-async def awaiting_update(service: OrderService) -> Order:
-    """An ``Unknown`` order carrying a broker id: a state the engine never produces today (an
-    ``Unknown`` order gets its broker id only by reconciling, which moves it to ``Open``). It is
-    built by hand because the state machine lets a ``Rejected`` update apply only to a
-    ``Submitted`` or ``Unknown`` order, and an acknowledged order is ``Open``. So the tests that use
-    it check only the call site in ``_apply_update``, not a path production can reach: see
-    ``test_an_acknowledged_order_rejected_by_the_broker_counts`` (xfail) for the real one."""
-    order_id = (await service.place(command())).order_id or ""
-    assert service.orders[order_id].state is OrderState.UNKNOWN
-    order = service.orders[order_id].model_copy(update={"broker_order_id": "b-9"})
-    service.orders[order_id] = order
+async def acknowledged(service: OrderService, key: str = "k1") -> Order:
+    """An order placed the normal way and acknowledged by the broker: ``Open``, with the broker id
+    ``FakeAdapter`` gave it (``b-<n>``)."""
+    order = service.orders[(await service.place(command(key))).order_id or ""]
+    assert order.state is OrderState.OPEN and order.broker_order_id
     return order
 
 
 async def test_the_listener_fires_when_a_broker_rejected_update_is_applied() -> None:
-    service, _, _ = build(adapter=FakeAdapter(hang=True), timeout_s=0.05)
-    order = await awaiting_update(service)
+    service, _, _ = build()
+    order = await acknowledged(service)
     seen = listening(service)
 
-    await service.on_update(Rejected("b-9", "price band", NOW))
+    await service.on_update(Rejected(order.broker_order_id or "", "price band", NOW))
 
     rejected = service.orders[order.order_id]
     assert rejected.state is OrderState.REJECTED and rejected.reason == "price band"
     assert seen.orders == [rejected]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="no Open -> Rejected transition yet: a broker rejection after the acknowledgement is "
-    "not applied. Fixed by the separate change in add-risk-guards tasks.md, Workflow follow-up.",
-)
 async def test_an_acknowledged_order_rejected_by_the_broker_counts() -> None:
-    """The production path: the broker acknowledges the order (``Open``) and its risk system then
-    rejects it on the update stream. ``strict``: once the transition exists this passes, and the
-    xfail marker must be removed (an unexpected pass fails the run)."""
-    service, _, _ = build()
+    """Orders spec "Acknowledged entry rejected by the broker" (handle-late-broker-rejections task
+    1.2): the broker acknowledges the order (``Open``) and its risk system then rejects it on the
+    update stream. The order is ``Rejected`` with the broker's reason, the stored audit trail reads
+    Requested -> Submitted -> Open -> Rejected, and one broker rejection is reported."""
+    service, _, repo = build()
     seen = listening(service)
     order_id = (await service.place(command())).order_id or ""
     order = service.orders[order_id]
@@ -110,8 +103,55 @@ async def test_an_acknowledged_order_rejected_by_the_broker_counts() -> None:
     await service.on_update(Rejected("b-1", "RMS: insufficient margin", NOW))
 
     rejected = service.orders[order_id]
-    assert rejected.state is OrderState.REJECTED
+    assert rejected.state is OrderState.REJECTED and rejected.reason == "RMS: insufficient margin"
     assert seen.orders == [rejected]
+    assert repo.orders[order_id] == rejected  # stored, not only in memory
+    assert [(state, reason) for oid, state, reason in repo.events if oid == order_id] == [
+        ("Requested", None), ("Submitted", None), ("Open", None),
+        ("Rejected", "RMS: insufficient margin"),
+    ]  # fmt: skip
+
+
+async def test_a_repeat_of_the_rejection_reports_nothing_and_logs_an_invalid_transition() -> None:
+    """Orders spec "Repeat of the rejection": the broker sends the same rejection again for an
+    order that is already ``Rejected``. Nothing changes and no second rejection is reported."""
+    service, _, repo = build()
+    order = await acknowledged(service)
+    seen = listening(service)
+    update = Rejected(order.broker_order_id or "", "RMS: insufficient margin", NOW)
+    await service.on_update(update)
+    rejected, stored_events = service.orders[order.order_id], len(repo.events)
+
+    with capture_logs() as logs:
+        await service.on_update(update)
+
+    assert service.orders[order.order_id] == rejected
+    assert len(seen.orders) == 1 and len(repo.events) == stored_events
+    assert [e["order_id"] for e in logs if e["event"] == "invalid_transition"] == [order.order_id]
+
+
+async def test_a_rejection_after_a_partial_fill_is_refused() -> None:
+    """Orders spec "Rejection after a partial fill is refused": 1 of 2 lots has filled, so the
+    order stays ``PartiallyFilled`` with its filled quantity and nothing is reported."""
+    service, _, _ = build()
+    order = service.orders[(await service.place(command(quantity=130))).order_id or ""]
+    broker_id = order.broker_order_id or ""
+    await service.on_update(
+        Filled(
+            broker_order_id=broker_id, fill_id="f1", quantity=65, price=Decimal("100"), at=NOW,
+            costs=CostBreakdown(),
+        )
+    )  # fmt: skip
+    partial = service.orders[order.order_id]
+    assert partial.state is OrderState.PARTIALLY_FILLED and partial.filled_quantity == 65
+    seen = listening(service)
+
+    with capture_logs() as logs:
+        await service.on_update(Rejected(broker_id, "RMS: insufficient margin", NOW))
+
+    assert service.orders[order.order_id] == partial
+    assert seen.orders == []
+    assert [e["order_id"] for e in logs if e["event"] == "invalid_transition"] == [order.order_id]
 
 
 async def test_a_rejected_exit_counts_too() -> None:
@@ -269,14 +309,16 @@ async def test_unknown_orders_resolved_as_rejected_by_reconciliation_report_noth
 
 async def test_the_listener_is_called_inside_the_service_lock() -> None:
     """It runs while the lock is held, so it sees a consistent book (design §4)."""
-    adapter = FakeAdapter(hang=True)
-    service, _, _ = build(adapter=adapter, timeout_s=0.05)
-    await awaiting_update(service)
+    adapter = FakeAdapter()
+    service, _, _ = build(adapter=adapter)
+    order = await acknowledged(service)
     held: list[bool] = []
     service.add_rejection_listener(lambda order: held.append(service._lock.locked()))  # type: ignore[attr-defined]
 
-    await service.on_update(Rejected("b-9", "price band", NOW + timedelta(seconds=1)))
-    adapter._hang, adapter._refuse = False, "no margin"  # type: ignore[attr-defined]
+    await service.on_update(
+        Rejected(order.broker_order_id or "", "price band", NOW + timedelta(seconds=1))
+    )
+    adapter._refuse = "no margin"  # type: ignore[attr-defined]
     await service.place(command("k2"))
 
     assert held == [True, True]  # the update path, then the placement path

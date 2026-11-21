@@ -175,6 +175,7 @@ ALLOWED = {
     (S.SUBMITTED, S.OPEN), (S.SUBMITTED, S.REJECTED), (S.SUBMITTED, S.UNKNOWN),
     (S.UNKNOWN, S.OPEN), (S.UNKNOWN, S.REJECTED),
     (S.OPEN, S.PARTIALLY_FILLED), (S.OPEN, S.FILLED), (S.OPEN, S.CANCELLED),
+    (S.OPEN, S.REJECTED),  # handle-late-broker-rejections: the broker rejects after its ack
     (S.PARTIALLY_FILLED, S.PARTIALLY_FILLED), (S.PARTIALLY_FILLED, S.FILLED),
     (S.PARTIALLY_FILLED, S.CANCELLED),
 }  # fmt: skip
@@ -194,6 +195,34 @@ def test_every_pair(source: OrderState, target: OrderState) -> None:
     else:
         with pytest.raises(InvalidTransition):
             transition(o, target, at=NOW)
+
+
+def test_an_open_order_can_be_rejected_by_the_broker_with_its_reason() -> None:
+    """handle-late-broker-rejections task 1.1: the broker refuses an order it had acknowledged."""
+    opened = order(state=S.OPEN, broker_order_id="b-1")
+
+    rejected = transition(opened, S.REJECTED, at=NOW, reason="RMS: insufficient margin")
+
+    assert rejected.state is S.REJECTED and rejected.reason == "RMS: insufficient margin"
+    assert rejected.broker_order_id == "b-1" and rejected.state.is_final
+
+
+def test_a_partially_filled_order_still_cannot_be_rejected() -> None:
+    """Orders spec "Rejection after a partial fill is refused": units have filled, so a late
+    rejection would change a position; the order stays as it was."""
+    partial = order(state=S.PARTIALLY_FILLED, quantity=130, filled_quantity=65)
+
+    with pytest.raises(InvalidTransition):
+        transition(partial, S.REJECTED, at=NOW, reason="RMS: insufficient margin")
+    assert partial.state is S.PARTIALLY_FILLED and partial.filled_quantity == 65
+
+
+@pytest.mark.parametrize("final", [S.FILLED, S.REJECTED, S.CANCELLED])
+def test_every_final_state_refuses_every_target(final: OrderState) -> None:
+    assert final.is_final and TRANSITIONS[final] == frozenset()
+    for target in S:
+        with pytest.raises(InvalidTransition):
+            transition(order(state=final), target, at=NOW)
 
 
 def test_update_after_a_final_state_leaves_order_unchanged() -> None:

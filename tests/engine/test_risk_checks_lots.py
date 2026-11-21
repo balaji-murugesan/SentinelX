@@ -21,6 +21,7 @@ from hypothesis import strategies as st
 
 from contracts.market import ExchangeSegment, Instrument, InstrumentKey
 from contracts.orders import Order, OrderSide, OrderState, Position, ProductType
+from engine.broker.adapter import Rejected
 from engine.positions.book import position_id
 from engine.risk.checks.common import lot_capped
 from engine.risk.checks.lots import (
@@ -55,6 +56,7 @@ from tests.engine.risk_builders import (
     position,
 )
 from tests.engine.risk_fakes import MemoryRiskRepository, StubState
+from tests.engine.test_order_service import build, command
 from tests.engine.test_risk_gate import harness
 
 D = Decimal
@@ -177,6 +179,29 @@ def test_reservation_released_on_rejection(final: OrderState) -> None:
     done = resting(NIFTY_2, 3, "p1", state=final)
 
     assert judge(entry(NIFTY, 2), limits=caps(per_underlying=4), orders=[done]).code is None
+
+
+async def test_rejected_entry_releases_its_reservation() -> None:
+    """Spec "Rejected entry releases its reservation" (handle-late-broker-rejections task 1.3),
+    through the real gate inside the real service: open-lots cap 2 and an acknowledged (``Open``),
+    unfilled 2-lot entry. It reserves its lots until the broker rejects it on the update stream;
+    then a new 2-lot entry on the same underlying is not refused by the lot caps."""
+    h = await harness(
+        bind=False, checks=[LotCaps()],
+        limits_values={**_base(), "max_open_lots_per_underlying": 2},
+    )  # fmt: skip
+    service, _, _ = build(gate=h.gate)
+    h.gate.bind(service)
+    two_lots = 2 * 65  # the service's NIFTY option has a lot size of 65
+    first = await service.place(command("e1", quantity=two_lots))
+    acked = service.orders[first.order_id or ""]
+    assert acked.state is OrderState.OPEN and acked.broker_order_id  # acknowledged the normal way
+    blocked = await service.place(command("e2", quantity=two_lots))
+    assert (blocked.reason or "").split(":")[0] == LOTS_UNDERLYING  # the reservation holds
+
+    await service.on_update(Rejected(acked.broker_order_id, "RMS: insufficient margin", NOW))
+
+    assert (await service.place(command("e3", quantity=two_lots))).accepted
 
 
 @pytest.mark.parametrize(("open_lots", "allowed"), [(1, True), (2, True), (3, False)])
