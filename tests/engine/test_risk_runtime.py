@@ -440,6 +440,33 @@ async def test_the_snapshot_carries_the_risk_block_and_it_round_trips(
     assert Snapshot.model_validate_json(snapshot.model_dump_json()) == snapshot
 
 
+async def test_the_snapshot_shows_the_days_gross_entry_lots_and_it_round_trips(
+    env_factory: Callable[..., Env],
+) -> None:
+    """Spec lot-caps "Snapshot shows the count": 6 lots allowed today (in 3 entries), then one
+    more 1-lot entry through the gate, shows 7 gross lots and 4 entries."""
+    from engine.risk.state import DayState
+
+    repo = MemoryRiskRepository()
+    await repo.save_day(DayState("main", TODAY, NOW, entries_today=3, entry_lots_today=6))
+    env = await env_factory(risk_repo=repo).ready()
+    assert (await env.entry()).accepted  # 65 units of the test option: one lot
+    writer = SnapshotWriter(
+        None,  # type: ignore[arg-type]
+        env.service,
+        _Subscription(),  # type: ignore[arg-type]
+        account_id="main",
+        interval_s=1,
+        now=env.clock,
+        risk=env.runtime.status,
+    )
+
+    snapshot = Snapshot.model_validate_json(writer.build().model_dump_json())
+
+    assert snapshot.risk is not None
+    assert (snapshot.risk.entry_lots_today, snapshot.risk.entries_today) == (7, 4)
+
+
 class _Subscription:
     def get_nowait(self) -> None:
         return None

@@ -199,8 +199,11 @@ class RiskMonitor:
     def entry_halt(self) -> Decision | None:
         return self._standing
 
-    async def entry_allowed(self) -> str | None:
-        return await self._daybook.entry_allowed()
+    def recent_entries(self, now: datetime) -> tuple[datetime, ...]:
+        return self._daybook.recent_entries(now)
+
+    async def entry_allowed(self, lots: int, expiring: bool) -> str | None:
+        return await self._daybook.entry_allowed(lots, expiring)
 
     # ---- ticks -----------------------------------------------------------------------------
 
@@ -392,6 +395,7 @@ class RiskMonitor:
             feed_subscribed=self._subscribed(),
             unpriced_for=unpriced,
             unprotected=self._unprotected(),
+            recent_entries=self._daybook.recent_entries(now),
         )
         return run_continuous(self._checks, ctx, RiskTrigger.TIMER)
 

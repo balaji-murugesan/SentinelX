@@ -33,7 +33,7 @@ from engine.risk.checks.stale import (
     MtmBlind,
 )
 from engine.risk.daybook import DayBook
-from engine.risk.decision import ALLOW, ContinuousCheck, Decision
+from engine.risk.decision import ALLOW, ContinuousCheck, Decision, RiskContext, RiskTrigger
 from engine.risk.floor import floor_of
 from engine.risk.limits_service import LimitsService, LimitsStatus
 from engine.risk.monitor import REFERENCE_MISSING, RiskMonitor, mark_key, previous_weekday
@@ -856,7 +856,7 @@ async def test_next_day_the_counters_reset_and_a_standing_halt_clears() -> None:
     env = await Env(positions=[carried()]).ready()
     await stepped(env)
     for _ in range(3):
-        await env.daybook.entry_allowed()
+        await env.daybook.entry_allowed(1, False)
     await stepped(env, 20)  # a feed-down halt is standing
     assert env.monitor.entry_halt() is not None
 
@@ -1080,3 +1080,33 @@ async def test_a_pending_lock_makes_the_monitor_ask_for_the_flatten_on_an_unlock
     await stepped(env)
 
     assert env.flat_calls == ["day locked"] and env.daybook.day().halt_level is HaltLevel.NONE
+
+
+# ---- what the continuous checks see (add-risk-guards task 4.2) --------------------------------
+
+
+class _Seeing:
+    """A continuous check that records the context it was given and allows."""
+
+    name = "seeing"
+
+    def __init__(self) -> None:
+        self.seen: list[RiskContext] = []
+
+    def continuous(self, ctx: RiskContext, event: RiskTrigger) -> Decision:
+        self.seen.append(ctx)
+        return ALLOW
+
+
+async def test_the_continuous_checks_see_the_recent_entries_from_the_day_book() -> None:
+    seeing = _Seeing()
+    env = await Env(checks=(seeing,)).ready()
+    assert await env.daybook.entry_allowed(1, False) is None
+    env.clock.advance(10)
+
+    await stepped(env)
+
+    ctx = seeing.seen[-1]
+    assert ctx.recent_entries == (NOW,)
+    assert (ctx.broker_rejections, ctx.target_confirmations, ctx.ban_list) == ((), 0, None)
+    assert ctx.spot_key("NIFTY") is None

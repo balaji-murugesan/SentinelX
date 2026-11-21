@@ -258,7 +258,8 @@ class RiskRuntime:
         return RiskStatus(
             mtm_day=self.monitor.mtm_day(), floor=day.floor, peak=day.peak,
             halt_level=day.halt_level, halt_reason=day.halt_reason,
-            entries_today=day.entries_today, loss_streak=day.loss_streak,
+            entries_today=day.entries_today, entry_lots_today=day.entry_lots_today,
+            loss_streak=day.loss_streak,
             cooldown_until=day.cooldown_until,
             unprotected=[PositionRef(key=k, product=prod) for _, k, prod in unprotected],
         )  # fmt: skip

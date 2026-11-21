@@ -85,7 +85,9 @@ class StubState:
         self.halt = entry_halt
         self.quotes = dict(quotes or {})
         self.entries_counted = 0  # how many times the gate asked to count an allowed entry
+        self.counted: list[tuple[int, bool]] = []  # the (lots, expiring) of each counted entry
         self.count_fails: str | None = None  # a reason: make the count fail like a database error
+        self.recent: tuple[datetime, ...] = ()  # what ``recent_entries`` returns
 
     def unavailable(self, now: datetime) -> str | None:
         return self.unavailable_reason
@@ -102,10 +104,14 @@ class StubState:
     def entry_halt(self) -> Decision | None:
         return self.halt
 
-    async def entry_allowed(self) -> str | None:
+    def recent_entries(self, now: datetime) -> tuple[datetime, ...]:
+        return self.recent
+
+    async def entry_allowed(self, lots: int, expiring: bool) -> str | None:
         if self.count_fails is not None:
             return self.count_fails
         self.entries_counted += 1
+        self.counted.append((lots, expiring))
         return None
 
 

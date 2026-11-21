@@ -119,7 +119,7 @@ async def test_next_day_the_counters_are_fresh() -> None:
     """Spec "Next day": the first evaluation on the next IST date has no row, so counters reset."""
     daybook, repo, clock = await loaded()
     for _ in range(3):
-        assert await daybook.entry_allowed() is None
+        assert await daybook.entry_allowed(1, False) is None
     clock.at = NOW + timedelta(days=1)
 
     assert daybook.unavailable(clock.at) == STALE_DATE  # until the rollover has run
@@ -140,7 +140,7 @@ async def test_each_allowed_entry_is_counted_and_persisted_before_it_returns() -
     daybook, repo, _ = await loaded()
 
     for n in (1, 2, 3):
-        assert await daybook.entry_allowed() is None
+        assert await daybook.entry_allowed(1, False) is None
         assert (await repo.load_day("main", TODAY)).entries_today == n  # type: ignore[union-attr]
 
     assert daybook.day().entries_today == 3
@@ -152,7 +152,7 @@ async def test_count_after_a_crash_seven_entries_leave_three_of_ten() -> None:
     active = limits(max_trades_per_day=10)
     first, repo, _ = await loaded(active=active)
     for _ in range(7):
-        await first.entry_allowed()
+        await first.entry_allowed(1, False)
     restarted, *_ = book(repo, active=active)  # first is gone: only the repository remains
     await restarted.load()
 
@@ -161,7 +161,7 @@ async def test_count_after_a_crash_seven_entries_leave_three_of_ten() -> None:
         ctx = context(limits=active, day=restarted.day())
         if MaxTrades().pre_trade(ctx, order(BUY, 65)).code == MAX_TRADES:
             break
-        assert await restarted.entry_allowed() is None
+        assert await restarted.entry_allowed(1, False) is None
         allowed += 1
 
     assert allowed == 3 and restarted.day().entries_today == 10
@@ -178,15 +178,15 @@ async def test_an_entry_whose_count_cannot_be_saved_is_refused_and_not_counted()
 
     repo = SaveDown()
     daybook, *_ = await loaded(repo=repo)
-    assert await daybook.entry_allowed() is None
+    assert await daybook.entry_allowed(1, False) is None
     repo.down = True
 
-    reason = await daybook.entry_allowed()
+    reason = await daybook.entry_allowed(1, False)
 
     assert reason is not None and "could not be saved" in reason
     assert daybook.day().entries_today == 1  # the refused entry is not counted
     repo.down = False
-    assert await daybook.entry_allowed() is None and daybook.day().entries_today == 2
+    assert await daybook.entry_allowed(1, False) is None and daybook.day().entries_today == 2
 
 
 async def test_a_write_that_committed_and_then_failed_leaves_the_higher_count_safe() -> None:
@@ -206,8 +206,10 @@ async def test_a_write_that_committed_and_then_failed_leaves_the_higher_count_sa
     repo = CommitThenError()
     daybook, *_ = await loaded(repo=repo)
 
-    assert await daybook.entry_allowed() is not None  # refused, memory back at 0, store holds 1
-    assert await daybook.entry_allowed() is None  # next: memory 1, written over a stored 1
+    assert (
+        await daybook.entry_allowed(1, False) is not None
+    )  # refused, memory back at 0, store holds 1
+    assert await daybook.entry_allowed(1, False) is None  # next: memory 1, written over a stored 1
 
     assert (await repo.load_day("main", TODAY)).entries_today == 1  # type: ignore[union-attr]
     assert daybook.day().entries_today == 1
@@ -216,7 +218,162 @@ async def test_a_write_that_committed_and_then_failed_leaves_the_higher_count_sa
 async def test_an_unloaded_book_refuses_the_count() -> None:
     daybook, *_ = book()
 
-    assert await daybook.entry_allowed() == NOT_LOADED
+    assert await daybook.entry_allowed(1, False) == NOT_LOADED
+
+
+# ---- lots, the last entry time and expiry exposure (add-risk-guards task 4.1) -----------------
+
+
+class SaveSwitch(MemoryRiskRepository):
+    """A repository whose writes can be switched off like a lost database."""
+
+    down = False
+
+    async def save_day(self, state: DayState) -> DayState:
+        if self.down:
+            raise PersistenceError("db down")
+        return await super().save_day(state)
+
+
+async def test_one_write_counts_the_entry_its_lots_its_time_and_the_expiry_exposure() -> None:
+    daybook, repo, clock = await loaded()
+
+    assert await daybook.entry_allowed(2, False) is None
+    clock.at = NOW + timedelta(seconds=30)
+    assert await daybook.entry_allowed(3, True) is None
+
+    stored = await repo.load_day("main", TODAY)
+    for state in (daybook.day(), stored):
+        assert state is not None
+        assert (state.entries_today, state.entry_lots_today) == (2, 5)
+        assert state.last_entry_at == NOW + timedelta(seconds=30)
+        assert state.expiry_exposure is True
+
+
+async def test_expiry_exposure_stays_on_after_a_non_expiring_entry() -> None:
+    daybook, *_ = await loaded()
+
+    await daybook.entry_allowed(1, True)
+    await daybook.entry_allowed(1, False)
+
+    assert daybook.day().expiry_exposure is True
+
+
+async def test_a_failed_save_raises_nothing_undoes_the_count_and_keeps_the_expiry_flag() -> None:
+    """Spec lot-caps "Count cannot be saved": refused with RISK_STATE_UNAVAILABLE (the gate adds
+    the code to this reason) and the count is not raised; nor are the lots or the time. The
+    one-way expiry flag stays on: the tight side (expiry-day-profile)."""
+    repo = SaveSwitch()
+    daybook, _, clock = await loaded(repo=repo)
+    assert await daybook.entry_allowed(2, False) is None
+    before = daybook.day()
+    repo.down = True
+    clock.at = NOW + timedelta(seconds=30)
+
+    reason = await daybook.entry_allowed(4, True)
+
+    assert reason is not None and "could not be saved" in reason
+    after = daybook.day()
+    assert (after.entries_today, after.entry_lots_today) == (1, 2)
+    assert after.last_entry_at == before.last_entry_at == NOW
+    assert after.expiry_exposure is True
+    assert daybook.recent_entries(clock.at) == (NOW,)  # the refused entry is not in the window
+
+
+class SlowDown(MemoryRiskRepository):
+    """A repository whose ``save_day`` waits until released, then fails."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def save_day(self, state: DayState) -> DayState:
+        self.started.set()
+        await self.release.wait()
+        raise PersistenceError("db down")
+
+
+async def test_a_failed_save_keeps_a_peak_raised_while_the_write_was_in_flight() -> None:
+    """The undo touches only the entry's count, lots and time: a ratchet that landed during the
+    write stays."""
+    repo = SlowDown()
+    daybook, *_ = await loaded(repo=repo)
+    counting = asyncio.create_task(daybook.entry_allowed(1, True))
+    await repo.started.wait()
+
+    daybook.ratchet(D("500"), D("-2000"))
+    repo.release.set()
+
+    assert await counting is not None
+    assert daybook.day().peak == D("500") and daybook.day().floor == D("-2000")
+    assert daybook.day().entries_today == 0
+
+
+async def test_a_failed_save_keeps_the_expiry_flag_switched_on_while_the_write_was_in_flight() -> (
+    None
+):
+    """The monitor (task 8.2) may switch ``expiry_exposure`` on during a non-expiring entry's
+    write. The write then fails: the flag is one-way within a day, so it stays on."""
+    repo = SlowDown()
+    daybook, *_ = await loaded(repo=repo)
+    counting = asyncio.create_task(daybook.entry_allowed(1, False))
+    await repo.started.wait()
+
+    daybook._day = replace(daybook.day(), expiry_exposure=True)  # what the monitor would do
+    repo.release.set()
+
+    assert await counting is not None
+    assert daybook.day().entries_today == 0 and daybook.day().expiry_exposure is True
+
+
+async def test_a_failed_save_across_the_date_change_leaves_the_new_days_counters_alone() -> None:
+    """A write in flight when the IST date changes: the rollover starts fresh counters, then the
+    write fails. The undo must not take the old day's entry off the new day (no negative counts)."""
+    repo = SlowDown()
+    daybook, _, clock = await loaded(repo=repo)
+    counting = asyncio.create_task(daybook.entry_allowed(2, False))
+    await repo.started.wait()
+
+    clock.at = NOW + timedelta(days=1)
+    assert await daybook.roll_over_if_new_day() is True
+    repo.release.set()
+
+    assert await counting is not None
+    day = daybook.day()
+    assert day.trade_date == TODAY + timedelta(days=1)
+    assert (day.entries_today, day.entry_lots_today, day.last_entry_at) == (0, 0, None)
+
+
+async def test_the_lots_the_time_and_the_expiry_flag_survive_a_restart() -> None:
+    """Spec lot-caps "Count survives a restart" and order-flow-guards "Gap survives a restart"."""
+    first, repo, clock = await loaded()
+    for lots in (5, 4, 3):
+        await first.entry_allowed(lots, lots == 4)
+        clock.at += timedelta(seconds=20)
+
+    restarted, *_ = book(repo, clock)
+    assert await restarted.load()
+
+    day = restarted.day()
+    assert (day.entries_today, day.entry_lots_today) == (3, 12)
+    assert day.last_entry_at == NOW + timedelta(seconds=40)
+    assert day.expiry_exposure is True
+    assert restarted.recent_entries(clock.at) == ()  # the window is in memory only (design)
+
+
+async def test_recent_entries_holds_the_last_60_seconds_of_allowed_entries() -> None:
+    daybook, _, clock = await loaded()
+    times = [NOW, NOW + timedelta(seconds=25), NOW + timedelta(seconds=45)]
+    for at in times:
+        clock.at = at
+        await daybook.entry_allowed(1, False)
+
+    assert daybook.recent_entries(NOW + timedelta(seconds=50)) == tuple(times)
+    # Exactly 60 s old is still returned (the pacing rule decides the edge); older is dropped.
+    assert daybook.recent_entries(NOW + timedelta(seconds=60)) == tuple(times)
+    assert daybook.recent_entries(NOW + timedelta(seconds=61)) == tuple(times[1:])
+    assert daybook.recent_entries(NOW + timedelta(seconds=200)) == ()
 
 
 # ---- the losing streak and the cooldown ------------------------------------------------------
@@ -374,8 +531,8 @@ async def test_writes_never_overlap_and_the_later_one_carries_the_newer_state() 
     feed = Positions(daybook)
 
     await asyncio.gather(
-        daybook.entry_allowed(),
-        daybook.entry_allowed(),
+        daybook.entry_allowed(1, False),
+        daybook.entry_allowed(1, False),
         feed.round_trip("100", "99"),  # the fill listener flushes when a cooldown starts
         daybook.flush(),
     )
@@ -416,7 +573,7 @@ async def test_the_book_adopts_a_higher_stored_count() -> None:
     daybook, repo, _ = await loaded()
     await repo.save_day(DayState("main", TODAY, NOW, entries_today=6))
 
-    assert await daybook.entry_allowed() is None  # memory 1, stored 6: the merge keeps 6
+    assert await daybook.entry_allowed(1, False) is None  # memory 1, stored 6: the merge keeps 6
 
     assert daybook.day().entries_today == 6
 

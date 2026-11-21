@@ -119,6 +119,11 @@ class Quote:
     age: timedelta
 
 
+def no_spot(symbol: str) -> InstrumentKey | None:
+    """``RiskContext.spot_key``'s default: no underlying has a known spot instrument."""
+    return None
+
+
 @dataclass(frozen=True)
 class RiskContext:
     """An immutable view of everything a check may read, built fresh for each evaluation. Checks
@@ -136,6 +141,14 @@ class RiskContext:
     subscribed, and ``unpriced_for`` is, for each held instrument that has never been priced, how
     long the engine has been waiting for its first tick. ``unprotected`` is the set of open
     positions with no catastrophic stop resting (``engine.risk.stops``).
+
+    The fields after ``unprotected`` feed the add-risk-guards rules and also have safe defaults
+    (design §2): ``recent_entries`` are the times of the entries the gate allowed in the last 60 s
+    (entry pacing), ``broker_rejections`` the times of broker rejections in the last 300 s (the
+    rejection breaker), ``target_confirmations`` how many consecutive monitor passes saw the
+    day's MTM at or above the profit target, ``ban_list`` today's F&O ban list (None: not
+    loaded, which the instrument policy treats as fail closed), and ``spot_key`` the lookup from
+    an underlying symbol ("NIFTY") to its spot instrument (None: no such instrument).
     """
 
     account_id: str
@@ -151,6 +164,11 @@ class RiskContext:
     feed_subscribed: bool = False
     unpriced_for: Mapping[InstrumentKey, timedelta] = field(default_factory=dict)
     unprotected: frozenset[PositionId] = frozenset()
+    recent_entries: tuple[datetime, ...] = ()
+    broker_rejections: tuple[datetime, ...] = ()
+    target_confirmations: int = 0
+    ban_list: frozenset[str] | None = None
+    spot_key: Callable[[str], InstrumentKey | None] = field(default=no_spot)
 
 
 class PreTradeCheck(Protocol):

@@ -3,9 +3,11 @@
 
 ``DayBook`` owns the account's ``DayState`` for the current IST trading day: entries allowed today,
 the losing streak, the cooldown end, and (from the monitor, task 7.1) the peak, the floor and the
-halt level. The in-memory copy is authoritative while the engine runs and is written to Postgres
-through ``RiskRepository.save_day``, which merges with ``GREATEST`` so a late or repeated write can
-never lower a count, a floor or a halt.
+halt level. add-risk-guards (task 4.1) adds the day's gross entry lots, the time of the last
+allowed entry and the expiry-exposure flag, all written with the entry count. The in-memory copy
+is authoritative while the engine runs and is written to Postgres through
+``RiskRepository.save_day``, which merges with ``GREATEST`` so a late or repeated write can never
+lower a count, a floor or a halt.
 
 One writer: every write goes through ``_save`` under a single ``asyncio.Lock`` and writes the
 state as it is *at that moment*. The fill listener and the monitor's timer both mark the book
@@ -30,6 +32,7 @@ replaying the whole fill history (see ``seed``).
 
 import asyncio
 import time
+from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -51,6 +54,7 @@ log = structlog.get_logger("engine.risk.daybook")
 
 NOT_LOADED: Final = "today's risk state has not been loaded"
 STALE_DATE: Final = "the risk state is for an earlier trading day"
+ENTRY_WINDOW: Final = timedelta(seconds=60)  # how far back ``recent_entries`` looks (pacing)
 
 
 class DayBook:
@@ -75,6 +79,10 @@ class DayBook:
         self._write_lock = asyncio.Lock()  # the one writer (see the module docstring)
         self._version = 0  # bumped on every change; a flush marks clean only if it is unchanged
         self._saved_version = 0
+        # The times of recently allowed entries, oldest first (pacing). A ``deque`` is a
+        # double-ended queue (like C#'s ``LinkedList<T>`` used as a queue): appending on the right
+        # and dropping from the left are both O(1).
+        self._recent: deque[datetime] = deque()
 
     # ---- reading ---------------------------------------------------------------------------
 
@@ -208,30 +216,70 @@ class DayBook:
 
     # ---- the entry counter -----------------------------------------------------------------
 
-    async def entry_allowed(self) -> str | None:
-        """Count one allowed entry, and persist the count **before** the entry is sent (spec
-        "Maximum trades per day"). None on success; otherwise the reason it could not be
-        persisted, and the entry must be refused (fail closed). The count is taken back when the
-        write fails, so a refused entry is not counted: the stored value can only be higher (a
-        write that committed and then reported an error), which is the safe side, and ``GREATEST``
-        keeps it.
+    async def entry_allowed(self, lots: int, expiring: bool) -> str | None:
+        """Count one allowed entry of ``lots`` lots, and persist it **before** the entry is sent
+        (spec "Maximum trades per day"; lot-caps "Gross entry lots per day are capped";
+        order-flow-guards "Entries keep a minimum gap"). ``expiring`` says the order's contract
+        expires today (expiry-day-profile: the day's floor then uses the expiry giveback).
 
-        This increments without checking the maximum: the cap is atomic only because the gate
-        runs inside ``OrderService``'s lock, so the ``MaxTrades`` check and this count see one
-        snapshot. A caller of the gate outside that lock could let two entries pass on the same
-        count."""
+        One write carries all four changes: the entry count +1, the day's gross lots +``lots``,
+        ``last_entry_at`` = now, and ``expiry_exposure`` switched on when ``expiring``. None on
+        success; otherwise the reason it could not be persisted, and the entry must be refused
+        (fail closed). The count, the lots and the time are taken back in memory when the write
+        fails, so a refused entry is not counted; the one-way expiry flag stays on (the tight
+        side). The stored values can only be higher (a write that committed and then reported an
+        error), which is the safe side, and ``GREATEST`` keeps them.
+
+        Only an entry whose write succeeded joins the 60-second window that ``recent_entries``
+        returns (entry pacing). The window lives in memory only: a restart forgets it, while the
+        minimum gap (``last_entry_at``) is persisted (design, Risks).
+
+        This increments without checking any maximum: the caps are atomic only because the gate
+        runs inside ``OrderService``'s lock, so the checks and this count see one snapshot. A
+        caller of the gate outside that lock could let two entries pass on the same count."""
         if (why := self.unavailable(self._now())) is not None:
             return why
         async with self._write_lock:
-            state = self.day()
-            self._day = replace(state, entries_today=state.entries_today + 1)
+            before = self.day()
+            at = self._now()
+            self._day = replace(
+                before,
+                entries_today=before.entries_today + 1,
+                entry_lots_today=before.entry_lots_today + lots,
+                last_entry_at=at,
+                expiry_exposure=before.expiry_exposure or expiring,
+            )
             self._version += 1
             try:
                 await self._save_locked()
             except PersistenceError as error:
-                self._day = replace(self.day(), entries_today=self.day().entries_today - 1)
+                # Undo only the count, the lots and the time: the monitor may have raised the peak
+                # or floor while the write was in flight (it does not take the write lock), and
+                # that must stay. ``expiry_exposure`` is not undone either: it is one-way within a
+                # day (expiry-day-profile; safety rule 15) and the monitor may have switched it on
+                # mid-write. Leaving it on for a refused expiring entry is the tight side, as for
+                # an entry the broker rejects (design). The undo applies only while it is still
+                # the same trading day: a rollover during the write already started fresh
+                # counters, and taking this entry off them would push them below zero.
+                now_state = self.day()
+                if now_state.trade_date == before.trade_date:
+                    self._day = replace(
+                        now_state,
+                        entries_today=now_state.entries_today - 1,
+                        entry_lots_today=now_state.entry_lots_today - lots,
+                        last_entry_at=before.last_entry_at,
+                    )
                 return f"the entry count could not be saved: {error}"
+            self._recent.append(at)
         return None
+
+    def recent_entries(self, now: datetime) -> tuple[datetime, ...]:
+        """The times of the entries allowed (and persisted) within ``ENTRY_WINDOW`` of ``now``,
+        oldest first. An entry exactly ``ENTRY_WINDOW`` old is still returned: where the edge
+        falls is the pacing rule's decision, not the book's. Older times are dropped here."""
+        while self._recent and now - self._recent[0] > ENTRY_WINDOW:
+            self._recent.popleft()
+        return tuple(self._recent)
 
     # ---- the fill listener -----------------------------------------------------------------
 

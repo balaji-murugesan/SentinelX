@@ -46,18 +46,18 @@
 
 ## 4. Day counters and context
 
-- [ ] 4.1 Change `DayBook.entry_allowed` to `entry_allowed(lots, expiring)`. One persisted write counts the entry, adds the lots, stamps `last_entry_at` and switches on `expiry_exposure`; a failed write undoes all four. Keep the 60-second window of allowed-entry times in memory. Update the `RiskState` Protocol, the gate's call and the test fakes. Verify with day-book tests: a failed save raises nothing and refuses the entry with `RISK_STATE_UNAVAILABLE`, and the counters survive a reload.
-- [ ] 4.2 Add `recent_entries`, `broker_rejections`, `target_confirmations`, `ban_list` and `spot_key` to `RiskContext` with defaults, and fill them in the gate's and the monitor's context builders. Report `entry_lots_today` in the snapshot risk block. Verify the existing risk tests pass unchanged, and a snapshot round-trip test shows the gross-lot count.
+- [x] 4.1 Change `DayBook.entry_allowed` to `entry_allowed(lots, expiring)`. One persisted write counts the entry, adds the lots, stamps `last_entry_at` and switches on `expiry_exposure`; a failed write undoes the count, the lots and the time (only while still the same IST date), and the one-way expiry flag stays on. Keep the 60-second window of allowed-entry times in memory. Update the `RiskState` Protocol, the gate's call and the test fakes. Verify with day-book tests: a failed save raises nothing and refuses the entry with `RISK_STATE_UNAVAILABLE`, and the counters survive a reload.
+- [x] 4.2 Add `recent_entries`, `broker_rejections`, `target_confirmations`, `ban_list` and `spot_key` to `RiskContext` with defaults. Fill `recent_entries` in both the gate's and the monitor's context builders now; `broker_rejections`, `target_confirmations`, `ban_list` and `spot_key` keep their safe defaults until tasks 6.2, 9.1, 7.2 and 7.4/7.1 feed them. Report `entry_lots_today` in the snapshot risk block. Verify the existing risk tests pass unchanged, and a snapshot round-trip test shows the gross-lot count.
 
 ## 5. Lot caps and entry pacing
 
-- [ ] 5.1 Implement `LotCaps` (`checks/lots.py`, design §5): per-underlying, total and daily gross caps, pending entries reserved until final, an unknown master record refused, and the expiry caps for an order whose contract expires today (using `engine/risk/expiry.py`, created here with `expires_today` and the effective-value helpers). Append it to `default_checks()`. Verify every `lot-caps` scenario and the expiry-cap scenario as unit tests, plus a `hypothesis` property: over random place, fill, reject and cancel sequences, open plus pending lots never exceed a cap.
+- [ ] 5.1 Implement `LotCaps` (`checks/lots.py`, design §5): per-underlying, total and daily gross caps, pending entries reserved until final, an unknown master record refused, and the expiry caps for an order whose contract expires today (using `engine/risk/expiry.py`, created here with `expires_today` and the effective-value helpers). Append it to `default_checks()`. Switch the inline expiry test in the gate's entry counting to `expires_today`. Verify every `lot-caps` scenario and the expiry-cap scenario as unit tests, plus a `hypothesis` property: over random place, fill, reject and cancel sequences, open plus pending lots never exceed a cap. Add a test that, with `lot_caps` in shadow mode, an unknown-instrument entry is still refused (fail closed), and record which code wins.
 - [ ] 5.2 Implement `EntryPacing` (`checks/flow.py`): `max_entries_per_minute` over `recent_entries`, and `min_entry_gap_s` from `day.last_entry_at`. Append it to the registry. Verify the `order-flow-guards` pacing scenarios as unit tests, with window edges at exactly 60 s and the gap boundary, and that an exit is never refused.
 
 ## 6. Rejection breaker
 
 - [ ] 6.1 Add `OrderService.add_rejection_listener`, called inside the lock when the adapter raises `BrokerRejected` and when a broker `Rejected` update is applied. Make the rate limiter raise a new `RateLimited(BrokerRejected)` subclass, and do not report it to listeners. Verify with order-service tests: the listener fires for both broker paths, and not for gate refusals, `RateLimited`, `settle_in_flight` or `reconcile_unknown`. Existing rejection behaviour is unchanged.
-- [ ] 6.2 Implement `RejectionWindow` (`engine/risk/rejections.py`, 300 s, pruned on read) and `RejectBreaker`, both pre-trade and continuous. Register the window as a rejection listener in `RiskRuntime`, add the check to both registries, and report `broker_rejections_5m` in the snapshot. Verify the `order-flow-guards` breaker scenarios as unit tests (trip, clear at the window edge, exits accepted), and a monitor test that the critical log is written once per trip.
+- [ ] 6.2 Implement `RejectionWindow` (`engine/risk/rejections.py`, 300 s, pruned on read) and `RejectBreaker`, both pre-trade and continuous. Register the window as a rejection listener in `RiskRuntime`, fill `RiskContext.broker_rejections` in both the gate's and the monitor's context builders, add the check to both registries, and report `broker_rejections_5m` in the snapshot. Verify the `order-flow-guards` breaker scenarios as unit tests (trip, clear at the window edge, exits accepted), and a monitor test that the critical log is written once per trip.
 
 ## 7. Instrument policy and the ban list
 
@@ -68,9 +68,9 @@
   - the `SetBanList` handler (date not in the past; today during market hours must keep every stored symbol, else `TIGHTEN_ONLY`; an empty list accepted);
   - a `risk_event` per load.
 
-  Route the command in `CommandConsumer` and wire it in `RiskRuntime`. Verify every ban-list scenario in `instrument-policy` as unit tests, including the repeated-key and storage-down cases.
+  Route the command in `CommandConsumer`, wire it in `RiskRuntime`, and fill `RiskContext.ban_list` in both the gate's and the monitor's context builders. Verify every ban-list scenario in `instrument-policy` as unit tests, including the repeated-key and storage-down cases.
 - [ ] 7.3 Add CLI `risk set-ban-list --file PATH [--date YYYY-MM-DD]`: one symbol per line, `#` comments and blank lines ignored, upper-cased, date defaulting to today in IST. Report `ban_list_loaded` in the snapshot and in `risk status`. Add a short morning-checklist note to the README. Verify `--help` lists the command, the CLI round trip against `TEST_REDIS_URL`, and that the file parser rejects an empty symbol.
-- [ ] 7.4 Implement `InstrumentPolicy` (`checks/policy.py`, design §7): deny → allow → ban list (F&O segments) → minimum premium, including the expiry minimum → strike distance from a fresh spot price. Use `applies_to_exits = False`, and append it to the registry. Verify every `instrument-policy` entry scenario and the expiry minimum-premium scenario as unit tests, plus a test that no part of the policy refuses an exit, a missing ban list included.
+- [ ] 7.4 Implement `InstrumentPolicy` (`checks/policy.py`, design §7): deny → allow → ban list (F&O segments) → minimum premium, including the expiry minimum → strike distance from a fresh spot price. Use `applies_to_exits = False`, and append it to the registry. Fill `RiskContext.spot_key` (via `InstrumentMaster.spot_of` from 7.1) in both the gate's and the monitor's context builders. Verify every `instrument-policy` entry scenario and the expiry minimum-premium scenario as unit tests, plus a test that no part of the policy refuses an exit, a missing ban list included.
 
 ## 8. Expiry-day profile
 
@@ -80,7 +80,7 @@
 
 ## 9. Profit target
 
-- [ ] 9.1 Implement the monitor's `target_confirmations` counter (reset on a dip, on unknown MTM, or with no target set) and `ProfitTarget` (`checks/target.py`, continuous, `Severity.TARGET_HALT`, `RISK_TARGET_HALT`), and append it to `continuous_checks()`. Verify the `profit-target` confirmation scenarios as unit tests.
+- [ ] 9.1 Implement the monitor's `target_confirmations` counter (reset on a dip, on unknown MTM, or with no target set) and `ProfitTarget` (`checks/target.py`, continuous, `Severity.TARGET_HALT`, `RISK_TARGET_HALT`), and append it to `continuous_checks()`. Fill `RiskContext.target_confirmations` in the monitor's context builder only: the target is continuous, so the gate keeps the default. Verify the `profit-target` confirmation scenarios as unit tests.
 - [ ] 9.2 Add a `TARGET_HALT` branch to `Monitor._act`, after the KILL branch: `raise_halt(HaltLevel.TARGET_HALT)`, `flush()` before acting, then the existing flatten. Verify with monitor tests:
   - "Target flattens the book";
   - "A kill outranks the target" and "A breach and the target together";
