@@ -37,6 +37,7 @@ from engine.broker.adapter import (
     BrokerUpdate,
     Cancelled,
     Filled,
+    Rejected,
 )
 from engine.market_data.provider import Tick
 from engine.orders.recovery import resume_recovery
@@ -640,6 +641,27 @@ async def test_a_kill_cancels_pending_entries_and_leaves_exits_alone() -> None:
 
     assert entry.order_id in w.broker.cancel_asked
     assert resting_exit.order_id not in w.broker.cancel_asked  # an exit is not an entry
+
+
+async def test_a_kill_does_not_cancel_an_entry_the_broker_rejected_after_its_ack() -> None:
+    """handle-late-broker-rejections task 1.3: an acknowledged entry (``Open``) the broker then
+    rejects on its update stream is final, so the kill has nothing to cancel there; the entry
+    still resting is cancelled as before."""
+    w = await world()
+    w.confirms_on = False
+    w.market[OPTION] = D("90")
+    rejected = await w.service.place(command("late", side=BUY, quantity=65, limit="85.00"))
+    resting = await w.service.place(command("resting", side=BUY, quantity=65, limit="85.00"))
+    late = w.service.orders[rejected.order_id or ""]
+    assert late.state is OrderState.OPEN and late.broker_order_id  # acknowledged the normal way
+    await w.service.on_update(
+        Rejected(late.broker_order_id, "RMS: insufficient margin", w.clock.at)
+    )
+    assert w.service.orders[late.order_id].state is OrderState.REJECTED
+
+    await w.kill.trigger("test", "cli")
+
+    assert w.broker.cancel_asked == [resting.order_id]
 
 
 async def test_a_second_kill_places_and_cancels_nothing() -> None:

@@ -17,6 +17,7 @@ import pytest
 
 from contracts.market import Instrument, InstrumentKey
 from contracts.orders import Order, OrderSide, OrderState, OrderType, Position, ProductType
+from engine.broker.adapter import Rejected
 from engine.risk.checks.counters import COOLDOWN, MAX_TRADES, Cooldown, MaxTrades
 from engine.risk.checks.exposure import (
     ENTRY_CUTOFF,
@@ -42,6 +43,9 @@ from tests.engine.risk_builders import (
     order,
     position,
 )
+from tests.engine.test_order_service import build, command
+from tests.engine.test_risk_gate import harness
+from tests.engine.test_risk_limits import BASE
 
 D = Decimal
 BUY, SELL = OrderSide.BUY, OrderSide.SELL
@@ -173,6 +177,27 @@ def test_resting_exits_and_finished_orders_do_not_count() -> None:
     )  # fmt: skip
 
     assert OpenPositions().pre_trade(ctx, order(BUY, 65, key=new.key)).code is None
+
+
+async def test_an_entry_the_broker_rejected_after_its_ack_no_longer_counts() -> None:
+    """handle-late-broker-rejections task 1.3, through the real gate inside the real service: with
+    room for one position, an acknowledged (``Open``) option entry blocks an entry in another
+    instrument until the broker rejects it on the update stream."""
+    h = await harness(
+        bind=False, checks=[OpenPositions()],
+        limits_values={**BASE, "max_open_total": 1, "max_open_per_underlying": 1},
+    )  # fmt: skip
+    service, _, _ = build(gate=h.gate)
+    h.gate.bind(service)
+    first = await service.place(command("e1"))
+    acked = service.orders[first.order_id or ""]
+    assert acked.state is OrderState.OPEN and acked.broker_order_id  # acknowledged the normal way
+    blocked = await service.place(command("e2", instrument=STOCK, quantity=1))
+    assert (blocked.reason or "").split(":")[0] == OPEN_POSITIONS  # the resting entry counts
+
+    await service.on_update(Rejected(acked.broker_order_id, "RMS: insufficient margin", NOW))
+
+    assert (await service.place(command("e3", instrument=STOCK, quantity=1))).accepted
 
 
 def test_adding_to_a_position_already_held_is_not_a_new_position() -> None:

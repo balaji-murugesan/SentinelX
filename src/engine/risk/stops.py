@@ -32,6 +32,8 @@ only queues the position; ``process_queue`` (called by ``run``) does the work. `
 missing or the wrong size. That one mechanism covers a carried position at each market open (the
 stops expired at yesterday's close; ``CNC`` and ``MARGIN`` included), the pass after startup
 reconciliation, a stop the broker lost, and a placement that failed and is retried with backoff.
+A stop the broker rejects *after* accepting it is reported by ``on_rejected`` (the service's
+rejection listener, also inside the lock), which only sets when the sweep may place the next one.
 
 **Unprotected** is computed from the book, not remembered: ``unprotected()`` is every open
 position, in market hours, that has no resting stop of the right side, size and trigger. The
@@ -103,6 +105,10 @@ class CatastrophicStops:
         self._queue: asyncio.Queue[PositionId] = asyncio.Queue()
         self._retry_at: dict[PositionId, datetime] = {}
         self._delay: dict[PositionId, float] = {}
+        # How many times in a row the broker rejected an accepted stop of each position
+        # (``on_rejected``). Kept apart from ``_delay`` on purpose: ``_forget`` clears ``_delay``
+        # after every successful placement, and this count must survive that (design §4).
+        self._late_rejections: dict[PositionId, int] = {}
         self._next_sweep = now()
 
     # ---- what drives it --------------------------------------------------------------------
@@ -112,7 +118,49 @@ class CatastrophicStops:
         A fill changes what the stop should be, so any backoff from an earlier failure ends."""
         pid = position_id(position)
         self._forget(pid)
+        self._late_rejections.pop(pid, None)  # the position changed: the next delay starts at 1 s
         self._queue.put_nowait(pid)
+
+    def on_rejected(self, order: Order) -> None:
+        """The order service's rejection listener (handle-late-broker-rejections design §4): the
+        broker rejected one of this manager's stops *after* accepting it (the update stream). The
+        position is unprotected from now on (``unprotected`` reads the book, where the stop is now
+        ``Rejected``), so new entries are refused; this only decides *when* the next stop goes out.
+
+        A plain ``def``, not ``async def``: the service calls it inside its lock, so it may only
+        touch this manager's dicts and log. It never awaits (``place`` would wait on that same lock
+        for ever); the sweep queues the position and ``_sync`` places once ``_retry_at`` is due.
+
+        The n-th such rejection in a row waits ``RETRY_MIN_S * 2**(n-1)`` seconds, capped at
+        ``RETRY_MAX_S`` (1, 2, 4, 8, 16, 30, 30 ...). Only a fill (``on_fill``) or a flat position
+        (``_sync``) resets the count, never a successful placement: a broker that accepts and then
+        rejects every stop would otherwise be sent a new one about every second for ever."""
+        # A stop refused *at placement* never got a broker order id. ``_sync`` already backs that
+        # one off (``_place`` returned None), so it must not be counted a second time here.
+        if order.source != SOURCE or order.order_type is not STOP_ORDER_TYPE:
+            return
+        if not order.broker_order_id:
+            return
+        pid = (order.account_id, order.key, order.product)
+        position = self._service.positions.get(pid)
+        if position is None or position.quantity == 0:
+            return  # flat or gone: nothing to protect, and the sweep cancels anything left
+        if self._current_stops(pid, position):
+            return  # a stale or extra stop: a correct one still rests, so nothing is unprotected
+        n = self._late_rejections.get(pid, 0) + 1
+        self._late_rejections[pid] = n
+        # The exponent is capped too, so a count that runs for days cannot overflow the float
+        # (2**1024); past 2**5 the delay is RETRY_MAX_S either way.
+        delay = min(RETRY_MIN_S * 2 ** min(n - 1, 16), RETRY_MAX_S)
+        self._retry_at[pid] = self._now() + timedelta(seconds=delay)
+        log.critical(
+            "the broker rejected the catastrophic stop: position is unprotected, placing again",
+            key=str(pid[1]),
+            product=pid[2].value,
+            order_id=order.order_id,
+            rejections=n,
+            in_s=delay,
+        )
 
     async def sweep(self) -> None:
         """Queue every position whose stop is missing or wrong, and every position that is flat
@@ -238,6 +286,7 @@ class CatastrophicStops:
             for stop in resting:  # a stop on a flat book is an entry order: cancel it first
                 await self._cancel(stop)
             self._forget(pid)
+            self._late_rejections.pop(pid, None)  # flat: a position opened later starts at 1 s
             return
         if not is_market_hours(self._now()):
             return  # the close expired the stops; they are placed again after the next open
@@ -250,9 +299,14 @@ class CatastrophicStops:
         side, quantity, trigger = wanted
         current = self._current_stops(pid, position)
         if current:
-            for extra in resting:
-                if extra is not current[0]:
-                    await self._cancel(extra)  # a stale one left behind by an earlier resize
+            keep = current[0]
+            extras = [o for o in resting if o is not keep]
+            for extra in extras:
+                await self._cancel(extra)  # a stale one left behind by an earlier resize
+            if extras and await self._refused(keep):
+                # The broker rejected the stop we kept while we awaited a cancel: ``on_rejected``
+                # has set when to place the next one, and forgetting would place it at once.
+                return
             self._forget(pid)
             return
         if self._retry_at.get(pid, self._now()) > self._now():
@@ -263,12 +317,33 @@ class CatastrophicStops:
             # trigger and flip the position, so wait for reconciliation to settle it.
             log.warning("a stop is still in flight: not placing another", key=str(pid[1]))
             return
-        if await self._place(pid, side, quantity, trigger) is None:
+        new = await self._place(pid, side, quantity, trigger)
+        if new is None:
             self._backoff(pid)  # the old stop (if any) stays until a new one is open
             return
         for old in resting:
+            # Only while the new stop has not been refused: the broker may have rejected it since
+            # it was acknowledged. Then the old stops stay (wrong size, but some protection), and
+            # ``on_rejected`` has set when the next one goes out.
+            if await self._refused(new):
+                self._delay.pop(pid, None)  # the placement itself worked: its backoff ends
+                return
             await self._cancel(old)  # only now: the new stop is open, so never unprotected
+        if await self._refused(new):
+            self._delay.pop(pid, None)  # rejected during the last cancel: keep on_rejected's retry
+            return
         self._forget(pid)
+
+    async def _refused(self, stop: Order) -> bool:
+        """Has ``stop`` been rejected or cancelled since it was read, once every update already
+        queued on the service lock (a broker ``Rejected`` among them) has been applied? Reading it
+        straight away could miss one. A stop that has (partly) filled is NOT refused: it did its
+        job, the fill listener has queued the position again, and the old stops must go now (on a
+        flat book a resting stop would open a position). A stop that is gone counts as refused, so
+        the old ones are kept (fail closed)."""
+        await self._service.settled()
+        latest = self._service.orders.get(stop.order_id)
+        return latest is None or latest.state in (OrderState.REJECTED, OrderState.CANCELLED)
 
     async def _place(
         self, pid: PositionId, side: OrderSide, quantity: int, trigger: Decimal

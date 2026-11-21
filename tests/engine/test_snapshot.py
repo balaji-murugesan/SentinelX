@@ -9,6 +9,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 
 from contracts.orders import OrderState, Position, ProductType
 from contracts.snapshot import Snapshot, snapshot_key
+from engine.broker.adapter import Rejected
 from engine.market_data.bus import TickBus
 from engine.market_data.provider import Tick
 from engine.orders.snapshot import SnapshotWriter
@@ -71,6 +72,22 @@ async def test_snapshot_carries_mtm_realized_and_net_pnl_and_round_trips() -> No
     assert [o.order_id for o in loaded.open_orders] == [pending.order_id]
     assert all(not o.state.is_final for o in loaded.open_orders)
     assert loaded.open_orders[0].state is OrderState.OPEN
+
+
+async def test_an_order_the_broker_rejected_after_its_ack_is_no_longer_an_open_order() -> None:
+    """handle-late-broker-rejections task 1.3: the order is acknowledged (``Open``), then the
+    broker rejects it on the update stream; the snapshot's open orders drop it, the other stays."""
+    bus, redis = TickBus(), FakeRedis()
+    snapshot, service = writer(redis, bus)
+    late = await service.place(command("k1", limit="50"))
+    resting = await service.place(command("k2", limit="50"))
+    acked = service.orders[late.order_id or ""]
+    assert acked.state is OrderState.OPEN and acked.broker_order_id
+    assert {o.order_id for o in snapshot.build().open_orders} == {late.order_id, resting.order_id}
+
+    await service.on_update(Rejected(acked.broker_order_id, "RMS: insufficient margin", NOW))
+
+    assert [o.order_id for o in snapshot.build().open_orders] == [resting.order_id]
 
 
 async def test_open_position_without_a_price_shows_none_not_zero() -> None:

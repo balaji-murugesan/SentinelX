@@ -165,6 +165,8 @@ class RiskRuntime:
         service.add_fill_listener(self.stops.on_fill)
         # Every order the broker rejects goes into the window the rejection breaker reads.
         service.add_rejection_listener(self.rejections.record)
+        # A stop the broker rejects after accepting it is placed again after a growing delay.
+        service.add_rejection_listener(self.stops.on_rejected)
 
     # ---- start-up, after recovery ------------------------------------------------------------
 

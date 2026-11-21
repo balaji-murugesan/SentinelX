@@ -129,6 +129,7 @@ stateDiagram-v2
     PartiallyFilled --> Filled: remaining filled
     Open --> Filled: full fill
     Open --> Cancelled: cancel confirmed
+    Open --> Rejected: broker reject after ack
     PartiallyFilled --> Cancelled: remainder cancelled
     Filled --> [*]
     Rejected --> [*]
