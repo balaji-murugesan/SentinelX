@@ -453,3 +453,22 @@ async def test_the_listener_is_called_inside_the_service_lock() -> None:
     await service.place(command("k2"))
 
     assert held == [True, True]  # the update path, then the placement path
+
+
+async def test_settled_returns_only_once_an_update_queued_on_the_lock_is_applied() -> None:
+    """``settled()`` (handle-late-broker-rejections group 3): a broker ``Rejected`` that is waiting
+    on the service lock is applied before ``settled()`` returns, so a re-read after it sees it."""
+    service, _, _ = build()
+    order = await acknowledged(service)
+    lock = service._lock  # type: ignore[attr-defined]
+
+    async with lock:  # something else holds the lock while the update arrives
+        update = asyncio.create_task(
+            service.on_update(Rejected(order.broker_order_id or "", "price band", NOW))
+        )
+        await asyncio.sleep(0)  # the update queues on the lock
+        assert service.orders[order.order_id].state is OrderState.OPEN
+    await service.settled()
+
+    assert service.orders[order.order_id].state is OrderState.REJECTED
+    await update

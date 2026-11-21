@@ -548,6 +548,19 @@ class OrderService:
         lock and would wait on it forever (see ``add_fill_listener``)."""
         self._rejection_listeners.append(listener)
 
+    async def settled(self) -> None:
+        """Return once every command and broker update already waiting on the service lock has
+        been applied. Changes nothing. ``asyncio.Lock`` is first come, first served, so taking and
+        releasing it (``async with``, like ``await sem.WaitAsync()`` ... ``Release()`` in C#)
+        waits behind everything queued before. A caller about to act on an order it read before
+        an ``await`` (the stop manager, before it cancels an old stop) re-reads it after this.
+
+        Never call it from a fill or rejection listener, or from any code that already holds the
+        service lock: ``asyncio.Lock`` is not reentrant (unlike a C# ``lock``/``Monitor``), so it
+        would wait on itself for ever (the same warning as ``add_fill_listener``)."""
+        async with self._lock:
+            pass
+
     def _report_rejection(self, order: Order) -> None:
         for listener in self._rejection_listeners:
             try:

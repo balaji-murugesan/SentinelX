@@ -31,7 +31,7 @@ Start both test containers first (sx-redis-test on 6380, sx-pg-test on 5433). Ru
 
 ## 3. Stops rejected after acceptance
 
-- [ ] 3.1 Add `CatastrophicStops.on_rejected` (design §4). It is a plain, non-`async` function. It reacts only to the manager's own stop-market orders that carry a broker order id; it keeps a per-position late-rejection count; it sets `_retry_at` to `min(RETRY_MIN_S * 2**(n-1), RETRY_MAX_S)`; it logs a critical alert; and it does nothing when the position is flat or gone. The count resets in `on_fill` and when `_sync` finds the position flat, not in `_forget`. Register it in `RiskRuntime` beside `self.rejections.record`. Verify with unit tests on a fake clock:
+- [x] 3.1 Add `CatastrophicStops.on_rejected` (design §4). It is a plain, non-`async` function. It reacts only to the manager's own stop-market orders that carry a broker order id; it keeps a per-position late-rejection count; it sets `_retry_at` to `min(RETRY_MIN_S * 2**(n-1), RETRY_MAX_S)`; it logs a critical alert; and it does nothing when the position is flat or gone. The count resets in `on_fill` and when `_sync` finds the position flat, not in `_forget`. Register it in `RiskRuntime` beside `self.rejections.record`. Verify with unit tests on a fake clock:
   - spec "Stop rejected once": unprotected, entries refused, a new stop no earlier than 1 s later;
   - spec "Broker keeps rejecting the stop": waits of 1, 2, 4, 8, 16, 30, 30 s, with no placement on the sweeps in between;
   - spec "A fill resets the delay";

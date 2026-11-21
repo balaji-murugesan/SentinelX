@@ -192,6 +192,17 @@ async def test_the_gate_and_monitor_are_bound_and_both_fill_listeners_registered
     )
 
 
+def test_both_rejection_listeners_are_registered(env_factory: Callable[..., Env]) -> None:
+    """The breaker's window counts every broker rejection, and the stop manager re-places a stop
+    the broker rejected after accepting it (handle-late-broker-rejections task 3.1)."""
+    env = env_factory()
+
+    assert env.runtime.stops is not None
+    listeners = env.service._rejection_listeners  # type: ignore[attr-defined]
+    assert env.runtime.rejections.record in listeners
+    assert env.runtime.stops.on_rejected in listeners
+
+
 async def test_before_it_has_started_the_engine_refuses_entries_and_accepts_exits(
     env_factory: Callable[..., Env],
 ) -> None:
