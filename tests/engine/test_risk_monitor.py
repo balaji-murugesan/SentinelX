@@ -3,13 +3,15 @@
 Driven with a fake clock, ``on_tick`` and ``step`` (no real tasks, no real time): scenarios "Feed
 goes quiet", "Feed returns", "After the close", "Blind too long", "Next day", "Breach" and
 "Restart after a high peak"; the heartbeat the gate reads; the ratchet and its persistence; the
-previous close; and the fail-closed paths.
+previous close; and the fail-closed paths. add-risk-guards task 8.2: the expiry giveback
+("Entering an expiring contract", "Expiring position closed", "Restart keeps it").
 
 The kill and flatten hooks read the stored day state *at the moment they are called*, which is how
 these tests prove that the ratchet and the day lock are persisted before the engine acts.
 """
 
 import asyncio
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
@@ -17,6 +19,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from contracts.commands import SetRiskLimits
+from contracts.market import Instrument, InstrumentKey
 from contracts.orders import Order, OrderSide, OrderState
 from contracts.snapshot import HaltLevel
 from engine.market_data.bus import TickBus
@@ -43,6 +46,7 @@ from engine.risk.pnl import estimate_exit_cost
 from engine.risk.rejections import RejectionWindow
 from engine.risk.state import DayState
 from tests.engine.risk_builders import (
+    INSTRUMENTS,
     NOW,
     OPTION,
     STOCK,
@@ -89,6 +93,7 @@ class Env:
         checks: tuple[ContinuousCheck, ...] = CHECKS,
         on_kill: bool = True,
         rejections: RejectionWindow | None = None,
+        instruments: Callable[[InstrumentKey], Instrument | None] = instrument_of,
     ) -> None:
         self.clock = Clock(at)
         self.repo = repo or MemoryRiskRepository()
@@ -112,7 +117,7 @@ class Env:
         self.rejections = rejections or RejectionWindow()
         self.monitor = RiskMonitor(
             account_id="main", limits=self.limits, daybook=self.daybook, repository=self.repo,
-            audit=self.audit, instruments=instrument_of, checks=checks,
+            audit=self.audit, instruments=instruments, checks=checks,
             subscribed=lambda: self.subscribed, interval_s=1.0, persist_interval_s=10.0,
             on_kill=self._kill if on_kill else None, ensure_flat=self._ensure_flat,
             unprotected=lambda: self.unprotected, rejections=self.rejections.recent,
@@ -420,6 +425,151 @@ async def test_a_corrupt_first_tick_for_a_held_position_cannot_raise_the_peak() 
     await stepped(env, 1)
 
     assert env.daybook.day().peak == D(0)
+
+
+# ---- the expiry giveback (add-risk-guards task 8.2) --------------------------------------------
+#
+# Limits: BASE's giveback (armed at 2,000, the larger of 1,000 and 30% of the peak) with an expiry
+# giveback of the larger of 500 and 10%. At a peak of about 2,600 the base floor is about 1,600 and
+# the expiry floor about 2,100.
+
+EXPIRING_KEY = InstrumentKey.parse("NSE_FNO:53721")
+EXPIRING = INSTRUMENTS[OPTION].model_copy(
+    update={"key": EXPIRING_KEY, "trading_symbol": "NIFTY-WEEKLY-22600-CE", "expiry": TODAY}
+)
+WITH_EXPIRING = {**INSTRUMENTS, EXPIRING_KEY: EXPIRING}
+EXPIRY_GIVEBACK = {**BASE, "giveback_abs_expiry": "500", "giveback_pct_expiry": "10"}
+
+
+def expiry_env(positions: list, repo: MemoryRiskRepository | None = None) -> Env:  # type: ignore[type-arg]
+    return Env(
+        positions=positions, limits=EXPIRY_GIVEBACK, instruments=WITH_EXPIRING.get, repo=repo
+    )
+
+
+def floors_at(env: Env, peak: Decimal) -> tuple[Decimal, Decimal]:
+    """(base floor, expiry floor) the limits in force give at ``peak``."""
+    limits = env.limits.current
+    assert limits is not None
+    return floor_of(limits.floor_params(), peak), floor_of(limits.floor_params(expiry=True), peak)
+
+
+async def climb(env: Env, key: InstrumentKey, *prices: str) -> None:
+    for price in prices:  # each within the outlier band of the last accepted price
+        env.tick(price, key)
+        await stepped(env, 1)
+
+
+async def test_an_expiring_position_switches_the_expiry_giveback_on_and_it_is_written_at_once() -> (
+    None
+):
+    """Spec "The expiry giveback applies once the account has expiring exposure": an open position
+    in a contract expiring today. Persisted on that very pass, not at the next throttled write
+    (every 10 s here), so a restart right after cannot forget it."""
+    env = await expiry_env([position(EXPIRING_KEY, 65)]).ready()
+
+    await stepped(env)
+
+    assert env.daybook.day().expiry_exposure is True
+    stored = await env.repo.load_day("main", TODAY)
+    assert stored is not None and stored.expiry_exposure is True
+
+
+async def test_a_position_the_master_does_not_know_leaves_the_flag_off() -> None:
+    """Only the master expiry date counts. The lookup returns None until the master has loaded
+    (concurrently at start-up), so a restart must not switch the stricter giveback on for a whole
+    non-expiry day."""
+    env = await Env(
+        positions=[position(EXPIRING_KEY, 65)], limits=EXPIRY_GIVEBACK, instruments=lambda k: None
+    ).ready()
+
+    await stepped(env)
+
+    assert env.daybook.day().expiry_exposure is False
+
+
+async def test_a_flat_row_in_an_expiring_contract_does_not_switch_the_flag_on() -> None:
+    env = await expiry_env([position(EXPIRING_KEY, 0)]).ready()
+
+    await stepped(env)
+
+    assert env.daybook.day().expiry_exposure is False
+
+
+async def test_positions_that_do_not_expire_today_leave_the_base_giveback() -> None:
+    env = await expiry_env([carried()]).ready()
+    await stepped(env)
+
+    await climb(env, OPTION, "110", "125", "140")
+
+    peak = env.daybook.day().peak
+    base, expiry = floors_at(env, peak)
+    assert env.daybook.day().expiry_exposure is False
+    assert env.daybook.day().floor == base < expiry
+
+
+async def test_holding_an_expiring_contract_ratchets_the_floor_with_the_expiry_giveback() -> None:
+    env = await expiry_env([position(EXPIRING_KEY, 65)]).ready()
+    await stepped(env)
+
+    await climb(env, EXPIRING_KEY, "110", "125", "140")
+
+    peak = env.daybook.day().peak
+    base, expiry = floors_at(env, peak)
+    assert peak > D(2000) and base < expiry  # armed, and the expiry floor is the higher one
+    assert env.daybook.day().floor == expiry
+
+
+async def test_entering_an_expiring_contract_applies_the_expiry_giveback() -> None:
+    """Spec "Entering an expiring contract": the gate allowed an entry in a contract expiring
+    today (the day book switched the flag on), and the day's peak then reaches its arming level:
+    the floor allows at most the expiry giveback."""
+    env = await expiry_env([carried()]).ready()
+    await stepped(env)
+    assert await env.daybook.entry_allowed(1, True) is None
+
+    await climb(env, OPTION, "110", "125", "140")
+
+    peak = env.daybook.day().peak
+    assert env.daybook.day().floor == floors_at(env, peak)[1]
+    assert peak - env.daybook.day().floor == D(500)  # the larger of 500 and 10% of ~2,600
+
+
+async def test_expiring_position_closed_the_expiry_giveback_still_applies() -> None:
+    """Spec "Expiring position closed": the expiry giveback has applied since the morning, then
+    the expiring position is closed. The flag stays on and the floor does not fall; as the day's
+    peak climbs further on another position, the floor still follows the expiry giveback."""
+    env = await expiry_env([position(EXPIRING_KEY, 65), carried()]).ready()
+    await stepped(env)
+    env.tick("100", EXPIRING_KEY)
+    await climb(env, OPTION, "110", "125", "140")
+    before = env.daybook.day().floor
+    assert before == floors_at(env, env.daybook.day().peak)[1]
+
+    closed = position(EXPIRING_KEY, 0)
+    env.trading.positions[position_id(closed)] = closed  # the expiring position is now flat
+    await climb(env, OPTION, "150")
+
+    day = env.daybook.day()
+    base, expiry = floors_at(env, day.peak)
+    assert day.expiry_exposure is True
+    assert day.floor == expiry > base and day.floor > before
+
+
+async def test_a_restart_keeps_the_expiry_giveback() -> None:
+    """Spec "Restart keeps it": the expiring position was closed before the restart, and the
+    restarted engine still ratchets with the expiry giveback (the flag is read back from the
+    stored day)."""
+    first = await expiry_env([position(EXPIRING_KEY, 65)]).ready()
+    await stepped(first)  # switched on and written; first is gone, only the repository remains
+
+    restarted = await expiry_env([carried()], repo=first.repo).ready()
+    await stepped(restarted)
+    await climb(restarted, OPTION, "110", "125", "140")
+
+    day = restarted.daybook.day()
+    assert day.expiry_exposure is True
+    assert day.floor == floors_at(restarted, day.peak)[1]
 
 
 # ---- the floor breach ------------------------------------------------------------------------

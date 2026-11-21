@@ -20,7 +20,7 @@ from engine.risk.checks.stale import (
     FloorBreach,
     MtmBlind,
 )
-from engine.risk.decision import RiskTrigger, Severity, most_severe, run_continuous
+from engine.risk.decision import Decision, RiskTrigger, Severity, most_severe, run_continuous
 from engine.risk.floor import LockMode
 from engine.risk.limits import RiskLimits
 from tests.engine.risk_builders import LIMITS, OPTION, STOCK, context, day_state, position
@@ -250,6 +250,20 @@ def test_a_fall_after_a_peak_breaches_the_floor_set_at_the_peak() -> None:
 
     assert FloorBreach().continuous(fell_back, TIMER).severity is Severity.ALLOW
     assert FloorBreach().continuous(at_floor, TIMER).code == FLOOR_BREACH
+
+
+def test_with_expiring_exposure_the_breach_is_judged_against_the_expiry_floor() -> None:
+    """add-risk-guards task 8.2: the same floor the monitor ratchets. Peak 5,000, a base giveback
+    of 2,000 (floor 3,000) and an expiry giveback of 1,500 (floor 3,500): MTM_day 3,400 breaches
+    only once the day has had expiring exposure."""
+    limits = floors(giveback_arm=D(2000), giveback_abs=D(2000), giveback_abs_expiry=D(1500))
+
+    def judged(exposure: bool) -> Decision:
+        state = day_state(peak=D(5000), expiry_exposure=exposure)
+        return FloorBreach().continuous(context(limits=limits, day=state, mtm_day=D(3400)), TIMER)
+
+    assert judged(True).severity is Severity.KILL
+    assert judged(False).severity is Severity.ALLOW
 
 
 def test_an_unknown_mtm_is_not_a_breach() -> None:

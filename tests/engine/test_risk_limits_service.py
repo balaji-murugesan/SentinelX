@@ -210,6 +210,28 @@ async def test_the_floor_replay_uses_the_engine_figures() -> None:
     assert not result.accepted and "lower today's floor" in (result.reason or "")
 
 
+async def test_the_floor_replay_uses_the_engines_expiry_exposure_flag() -> None:
+    """add-risk-guards task 8.2: with the day's expiry exposure on, the floor (4,400 at a peak of
+    5,000) is the expiry giveback's, and a tightening of ``lock_at`` leaves it there. Replayed
+    with the base giveback (flag off) the same edit would look like a drop to 4,000."""
+    expiry_abs: dict[str, LimitValue] = {"giveback_pct": None, "giveback_abs_expiry": "600"}
+    results: dict[bool, bool] = {}
+    for exposure in (True, False):
+        clock = Clock(AFTER_CLOSE)
+        limits = LimitsService(
+            account_id="main", repository=MemoryRiskRepository(), results=MemoryRepository(),
+            figures=lambda: (D(5000), D(4400)),
+            expiry_exposure=lambda exposure=exposure: exposure,  # type: ignore[misc]
+            now=clock,
+        )  # fmt: skip
+        assert (await limits.set_limits(command(edit(**expiry_abs), key="first"))).accepted
+        clock.at = MID_DAY
+        result = await limits.set_limits(command(edit(**expiry_abs, lock_at="300"), key="lock"))
+        results[exposure] = result.accepted
+
+    assert results == {True: True, False: False}
+
+
 async def test_a_market_hours_edit_waits_for_the_engine_figures_instead_of_guessing_them() -> None:
     """Figures of None mean today's state is not loaded: the floor cannot be replayed, so the edit
     is refused as unavailable (never judged against zeros) and is not remembered, so the same key

@@ -791,17 +791,19 @@ _FLOOR_KEYS: Final = tuple(key for key, spec in REGISTRY.items() if spec.floor_t
 
 
 def _floor_problems(
-    stored: RiskLimits, new: RiskLimits, peak: Decimal, floor: Decimal | None
+    stored: RiskLimits, new: RiskLimits, peak: Decimal, floor: Decimal | None, expiry: bool
 ) -> list[str]:
     """Spec "A limits edit may not lower the floor": replay today's peak through the new floor
     terms. The floor the engine acts on today is ``next_floor`` (never below its ratchet), so the
     new terms must give at least that. This is the same ``floor_of`` the breach check and the
-    entry headroom check use, so the three cannot disagree."""
+    entry headroom check use, so the three cannot disagree. ``expiry`` is the day's
+    expiry-exposure flag, the one the monitor ratchets the floor with: once it is on, both sides
+    are replayed with the expiry giveback (add-risk-guards task 8.2)."""
     if all(value_of(stored, key) == value_of(new, key) for key in _FLOOR_KEYS):
         return []  # no floor term changed, so there is nothing to replay
     try:
-        current = next_floor(floor, stored.floor_params(), peak)
-        proposed = floor_of(new.floor_params(), peak)
+        current = next_floor(floor, stored.floor_params(expiry=expiry), peak)
+        proposed = floor_of(new.floor_params(expiry=expiry), peak)
     except (ValueError, TypeError, ArithmeticError) as exc:
         # Cannot replay (a bad peak, say): refuse, never wave it through (fail closed).
         return [f"the floor cannot be re-simulated, so floor terms stay as they are: {exc}"]
@@ -817,13 +819,15 @@ def validate_edit(
     now: datetime,
     peak: Decimal,
     floor: Decimal | None,
+    expiry: bool = False,
 ) -> RiskLimits:
     """Decide an edit: return the new limits, or raise ``EditRejected``.
 
     ``stored`` is what is in force (None: nothing set yet), ``raw`` the whole proposed set in the
-    flat form, ``now`` an aware instant from the injected clock, and ``peak`` and ``floor``
-    today's figures, used only to re-simulate the floor. The edit is judged as a whole: nothing
-    is half applied, and every problem is reported at once.
+    flat form, ``now`` an aware instant from the injected clock, and ``peak``, ``floor`` and
+    ``expiry`` (the day's expiry-exposure flag) today's figures, used only to re-simulate the
+    floor. The edit is judged as a whole: nothing is half applied, and every problem is reported
+    at once.
 
       1. It must be valid and consistent (``parse_limits``), at any hour.
       2. The first set is accepted at any hour: there is nothing to loosen.
@@ -846,7 +850,7 @@ def validate_edit(
         f"{key}: {_dump(value_of(stored, key))} -> {_dump(value_of(new, key))} is not a tightening"
         for key in loosened_keys(stored, new)
     ]
-    problems += _floor_problems(stored, new, peak, floor)
+    problems += _floor_problems(stored, new, peak, floor, expiry)
     if problems:
         raise EditRejected(TIGHTEN_ONLY, problems)
     return new

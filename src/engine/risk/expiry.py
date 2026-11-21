@@ -33,6 +33,16 @@ def expires_today(instrument: Instrument, now: datetime) -> bool:
     return instrument.expiry is not None and instrument.expiry == ist_date(now)
 
 
+def treated_as_expiring(instrument: Instrument | None, now: datetime) -> bool:
+    """For the square-off time choice only (``kill.SquareOff``): ``expires_today``, except that a
+    contract with no master record (``None``) counts as expiring, so its intraday position is
+    exited at the earlier time (expiry-day-profile "Intraday positions in expiring contracts are
+    squared off earlier"). Everything else (the entry cutoff, the floor headroom, the monitor's
+    expiry-exposure flag) uses ``expires_today`` on a known instrument: a contract counts as
+    expiring only by its master expiry date."""
+    return instrument is None or expires_today(instrument, now)
+
+
 def effective_cutoff(limits: RiskLimits, expiring: bool) -> time:
     """The entry cutoff (IST) for an entry whose contract expires today (``expiring``) or not."""
     if expiring and limits.entry_cutoff_expiry is not None:

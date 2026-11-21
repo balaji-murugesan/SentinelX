@@ -7,11 +7,13 @@ It does three jobs and is the ``RiskState`` the gate reads:
      side always sees the latest price and the peak only ever sees confirmed, fresh ones. A garbage
      tick (NaN, infinity, zero) is logged as ``RISK_BAD_TICK`` and changes nothing; an outlier is
      logged and audited as ``RISK_OUTLIER_TICK``. This path is arithmetic only.
-  2. **A timer** (``step``, about once a second): rolls the day over, computes ``MTM_day``, raises
-     the peak and the floor (the ratchet), runs the continuous checks (floor breach, silent feed,
-     blind positions) and acts on the most severe decision, then persists on a throttle. Before it
-     acts on a KILL it writes the ratchet (and goes on if that write fails: the breach is acted on
-     either way).
+  2. **A timer** (``step``, about once a second): rolls the day over, computes ``MTM_day``,
+     switches the day's expiry exposure on once an open position's contract expires today
+     (add-risk-guards task 8.2: persisted, one-way, and from then on the floor uses the stricter
+     expiry giveback), raises the peak and the floor (the ratchet), runs the continuous checks
+     (floor breach, silent feed, blind positions) and acts on the most severe decision, then
+     persists on a throttle. Before it acts on a KILL it writes the ratchet (and goes on if that
+     write fails: the breach is acted on either way).
   3. **A heartbeat**: ``step`` stamps the time it finished. The gate refuses entries if that stamp
      is older than three intervals, so a monitor that has died cannot leave the account unwatched;
      ``engine.main._keep_alive`` restarts it.
@@ -68,6 +70,7 @@ from engine.risk.decision import (
     no_spot,
     run_continuous,
 )
+from engine.risk.expiry import expires_today
 from engine.risk.floor import next_floor
 from engine.risk.gate import TradingView
 from engine.risk.limits import STATE_UNAVAILABLE, RiskLimits
@@ -282,6 +285,7 @@ class RiskMonitor:
         # refuses entries): measuring from average prices would raise the peak and floor, and
         # they never come back down.
         self._reading = self._evaluate(tracker, now) if references_ok else None
+        exposure_switched_on = self._note_expiry_exposure(now)  # before the ratchet uses it
         self._ratchet(tracker, limits)
         results = self._judge(limits, trading, now)
         await self._act(results)
@@ -291,7 +295,9 @@ class RiskMonitor:
             # Retried after acting: a hung database must never delay a kill or a flatten (exits
             # come first). Until the lists are read, F&O entries are refused.
             await self._ban_lists.load()
-        await self._persist_if_due(now)
+        # The expiry-exposure flag is written as soon as it switches on (after acting, so it never
+        # delays a kill), not at the next throttled write: a restart in between must not forget it.
+        await self._persist_if_due(now, at_once=exposure_switched_on)
         await self._write_close_marks_if_due(now)
 
     # ---- the day ---------------------------------------------------------------------------
@@ -374,14 +380,41 @@ class RiskMonitor:
             log.error("day P&L cannot be computed", code=MTM_UNKNOWN, exc_info=True)
             return None
 
+    def _note_expiry_exposure(self, now: datetime) -> bool:
+        """Switch the day's ``expiry_exposure`` on when an open position's contract expires today
+        by its master expiry date. One-way within the day: a later pass with no such position,
+        the expiring position closed for instance, leaves it on (expiry-day-profile "Expiring
+        position closed"). True if this pass switched it on.
+
+        A position with no master record does not switch it on (expiry-day-profile "A contract
+        expires today only by its master expiry date"). The lookup returns None until the master
+        has loaded, which happens concurrently at start-up (or never, if that load fails): a
+        restart with an open position must not lock the stricter giveback in for a whole
+        non-expiry day, and a floor KILL from it would lock the day."""
+        if self._daybook.day().expiry_exposure:
+            return False
+
+        def expiring(pid: PositionId, held: Position) -> bool:
+            instrument = self._instruments(pid[1])
+            return held.quantity != 0 and instrument is not None and expires_today(instrument, now)
+
+        found = any(expiring(pid, held) for pid, held in self._positions().items())
+        return found and self._daybook.note_expiry_exposure()
+
     def _ratchet(self, tracker: MtmTracker, limits: RiskLimits) -> None:
         """Raise the day's peak and floor in the day book (they only ever rise). That is also how a
         restart resumes with ``max(stored, recomputed)``: the book holds the stored values and
-        ``ratchet`` keeps the larger of them and what has just been computed."""
+        ``ratchet`` keeps the larger of them and what has just been computed.
+
+        The floor uses the expiry giveback once the day has had expiring exposure (the persisted
+        flag, so a restart keeps it). Switching that term on can only raise the floor: the expiry
+        giveback is never wider than the base one, and the ratchet never lowers the floor."""
         day = self._daybook.day()
         floor = day.floor
         try:
-            floor = next_floor(day.floor, limits.floor_params(), tracker.peak)
+            floor = next_floor(
+                day.floor, limits.floor_params(expiry=day.expiry_exposure), tracker.peak
+            )
         except (ValueError, TypeError, ArithmeticError):
             log.error("floor cannot be computed", exc_info=True)  # the check halts entries
         self._daybook.ratchet(tracker.peak, floor)
@@ -560,8 +593,10 @@ class RiskMonitor:
 
     # ---- persistence and the close ---------------------------------------------------------
 
-    async def _persist_if_due(self, now: datetime) -> None:
-        if now - self._last_persist >= self._persist_every:
+    async def _persist_if_due(self, now: datetime, *, at_once: bool = False) -> None:
+        """Write the day state on the throttle, or now when ``at_once``. (The ``*`` makes
+        ``at_once`` keyword-only, like a C# named argument that must be spelled out.)"""
+        if at_once or now - self._last_persist >= self._persist_every:
             self._last_persist = now
             await self._daybook.flush()
 

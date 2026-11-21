@@ -835,6 +835,27 @@ def test_the_floor_replay_uses_the_engines_ratchet_not_just_the_formula() -> Non
     assert any("from 900 to 300" in p for p in refused.value.problems)
 
 
+EXPIRY_ABS: dict[str, LimitValue] = {"giveback_pct": None, "giveback_abs_expiry": "600"}
+
+
+def test_the_floor_replay_uses_the_expiry_giveback_once_the_day_has_expiring_exposure() -> None:
+    """add-risk-guards task 8.2: the re-simulation uses the flag the monitor ratchets with. At a
+    peak of 5,000 the base giveback (1,000) gives 4,000 and the expiry giveback (600) 4,400, which
+    is today's floor once the account has had expiring exposure. ``lock_at`` 200 -> 300 tightens
+    and leaves that floor where it is; replayed with the base giveback it would look like a drop
+    from 4,400 to 4,000."""
+    stored = limits(**EXPIRY_ABS)
+    tighter = edit(**EXPIRY_ABS, lock_at="300")
+    assert floor_of(stored.floor_params(), D(5000)) == D(4000)
+    assert floor_of(stored.floor_params(expiry=True), D(5000)) == D(4400)
+
+    new = validate_edit(stored, tighter, now=MID_DAY, peak=D(5000), floor=D(4400), expiry=True)
+
+    assert new.lock_at == D(300)
+    with pytest.raises(EditRejected, match="from 4400 to 4000"):
+        validate_edit(stored, tighter, now=MID_DAY, peak=D(5000), floor=D(4400), expiry=False)
+
+
 def test_without_a_floor_term_changing_there_is_nothing_to_replay() -> None:
     assert validate_edit(
         parse_limits(BASE), edit(per_trade_max_risk="500"), now=MID_DAY, peak=D(1500), floor=D(900)

@@ -74,9 +74,9 @@
 
 ## 8. Expiry-day profile
 
-- [ ] 8.1 Teach `EntryCutoff` the expiry cutoff (`RISK_EXPIRY_CUTOFF` for an entry whose contract expires today), and teach `FloorHeadroom` to judge with `floor_params(expiry=day.expiry_exposure or expires_today(order))`. Verify the `expiry-day-profile` cutoff, holiday-moved-expiry and headroom scenarios as unit tests.
-- [ ] 8.2 In the monitor, switch `expiry_exposure` on when an open position's contract expires today (persisted, one-way), and ratchet the floor with `floor_params(expiry=day.expiry_exposure)`. Make the limits edit re-simulation use the same flag. Verify with monitor tests: the giveback scenarios, including "Expiring position closed" (the floor does not fall) and the restart case.
-- [ ] 8.3 Add an optional `positions` filter to the `Flattener` Protocol and `ChaseFlattener.flatten`. Make `SquareOff` exit each intraday position at its effective time: the expiry time for a contract expiring today or with no master record, otherwise the base time. Verify the "Expiry square-off" scenario: only the expiring intraday position is exited at 14:30, and the other at 15:10. The existing square-off and kill tests must pass unchanged.
+- [x] 8.1 Teach `EntryCutoff` the expiry cutoff (`RISK_EXPIRY_CUTOFF` for an entry whose contract expires today), and teach `FloorHeadroom` to judge with `floor_params(expiry=day.expiry_exposure or expires_today(order))`. Verify the `expiry-day-profile` cutoff, holiday-moved-expiry and headroom scenarios as unit tests.
+- [x] 8.2 In the monitor, switch `expiry_exposure` on when an open position's contract expires today (persisted, one-way), and ratchet the floor with `floor_params(expiry=day.expiry_exposure)`. Make the limits edit re-simulation use the same flag. Verify with monitor tests: the giveback scenarios, including "Expiring position closed" (the floor does not fall) and the restart case.
+- [x] 8.3 Add an optional `positions` filter to the `Flattener` Protocol and `ChaseFlattener.flatten`. Make `SquareOff` exit each intraday position at its effective time: the expiry time for a contract expiring today or with no master record, otherwise the base time. Verify the "Expiry square-off" scenario: only the expiring intraday position is exited at 14:30, and the other at 15:10. The existing square-off and kill tests must pass unchanged.
 
 ## 9. Profit target
 

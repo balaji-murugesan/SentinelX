@@ -10,12 +10,13 @@ unconfirmed.
 Scenarios: "Carried delivery position is flattened", "Entry fills during cancel", "Exit not
 filling", "Replacement waits for the cancel", "Not flat in time", "Stop after exit", "Kill twice",
 "Resume does not help", "Next day", "No broker lock", "Floor breach kills without any client",
-"Persistence down at a breach", "Mixed book at square-off" and "Not a halt".
+"Persistence down at a breach", "Mixed book at square-off" and "Not a halt"; and, for
+add-risk-guards task 8.3, the flattener's positions filter and "Expiry square-off".
 """
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -23,6 +24,7 @@ from structlog.testing import capture_logs
 
 from contracts.commands import KillSwitch as KillCommand
 from contracts.commands import PlaceOrder, ResumeRecovery, SetRiskLimits
+from contracts.market import InstrumentKey
 from contracts.orders import CostBreakdown, Order, OrderSide, OrderState, OrderType, ProductType
 from contracts.snapshot import HaltLevel
 from engine.broker.adapter import (
@@ -38,7 +40,7 @@ from engine.broker.adapter import (
 from engine.market_data.provider import Tick
 from engine.orders.recovery import resume_recovery
 from engine.persistence.repository import PersistenceError
-from engine.positions.book import position_id
+from engine.positions.book import PositionId, position_id
 from engine.risk.audit import RiskAudit
 from engine.risk.checks.stale import FLOOR_BREACH, FloorBreach
 from engine.risk.daybook import DayBook
@@ -48,7 +50,15 @@ from engine.risk.limits_service import LimitsService
 from engine.risk.monitor import RiskMonitor
 from engine.risk.stops import SOURCE as STOP_SOURCE
 from engine.risk.stops import CatastrophicStops
-from tests.engine.risk_builders import NOW, OPTION, STOCK, TODAY, instrument_of, position
+from tests.engine.risk_builders import (
+    INSTRUMENTS,
+    NOW,
+    OPTION,
+    STOCK,
+    TODAY,
+    instrument_of,
+    position,
+)
 from tests.engine.risk_fakes import MemoryRiskRepository
 from tests.engine.test_order_service import build, command
 from tests.engine.test_risk_limits import BASE
@@ -1516,3 +1526,200 @@ async def test_an_extra_exit_that_has_ended_is_no_longer_asked_to_cancel() -> No
         await task
 
     assert asks() == 1  # never asked again: there is nothing left to cancel
+
+
+# ---- the positions filter and the expiry square-off (add-risk-guards task 8.3) ----------------
+
+AT_1430 = datetime(2026, 11, 16, 9, 0, tzinfo=UTC)  # 14:30 IST: the expiry square-off time
+AT_1510 = datetime(2026, 11, 16, 9, 40, tzinfo=UTC)  # 15:10 IST: the base square-off time
+EXPIRING_KEY = InstrumentKey.parse("NSE_FNO:53721")
+NEXT_WEEK_KEY = InstrumentKey.parse("NSE_FNO:53722")
+UNKNOWN_KEY = InstrumentKey.parse("NSE_FNO:99999")  # no master record
+KNOWN = {
+    **INSTRUMENTS,
+    EXPIRING_KEY: INSTRUMENTS[OPTION].model_copy(update={"key": EXPIRING_KEY, "expiry": TODAY}),
+    NEXT_WEEK_KEY: INSTRUMENTS[OPTION].model_copy(
+        update={"key": NEXT_WEEK_KEY, "expiry": TODAY + timedelta(days=7)}
+    ),
+}
+EXPIRY_SQUARE_OFF = {
+    **BASE, "square_off_time": "15:10", "square_off_time_expiry": "14:30",
+    "entry_cutoff_expiry": "14:00",
+}  # fmt: skip
+
+
+def pid(key: InstrumentKey, product: ProductType = ProductType.INTRADAY) -> PositionId:
+    return ("main", key, product)
+
+
+class Recorder:
+    """A flattener that records what it was asked to exit and returns when released."""
+
+    def __init__(self) -> None:
+        self.calls: list[frozenset[PositionId] | None] = []
+        self.release = asyncio.Event()
+
+    async def flatten(
+        self,
+        reason: str,
+        products: frozenset[ProductType] | None = None,
+        kind: str = "kill",
+        positions: frozenset[PositionId] | None = None,
+    ) -> None:
+        assert products == frozenset({ProductType.INTRADAY}) and kind == "squareoff"
+        self.calls.append(positions)
+        await self.release.wait()
+
+
+async def expiry_world(at: datetime, limits: dict | None = None) -> World:  # type: ignore[type-arg]
+    """A world whose flattener and prices know the expiring and next week's contracts."""
+    w = World(at)
+    # The order service validates every exit against its own master: teach it the two contracts.
+    w.service._instruments.replace(list(KNOWN.values()), date(2026, 10, 29))  # type: ignore[attr-defined]
+    w.flattener = ChaseFlattener(
+        account_id="main", service=w.service, limits=w.limits, quote=w.quote,
+        instruments=KNOWN.get, now=w.clock, sleep=w.sleep, poll_s=0.5,
+    )  # fmt: skip
+    for key in (EXPIRING_KEY, NEXT_WEEK_KEY):
+        w.prices[key] = w.market[key] = D("100")
+    await w.limits.set_limits(
+        SetRiskLimits(
+            command_id="c", idempotency_key="k", account_id="main", source="t",
+            sent_at=NOW, limits=limits or EXPIRY_SQUARE_OFF,
+        )
+    )  # fmt: skip
+    assert await w.daybook.load()
+    return w
+
+
+async def recorded_square_off(
+    at: datetime,
+    *keys: InstrumentKey,
+    limits: dict | None = None,  # type: ignore[type-arg]
+) -> tuple[World, SquareOff, Recorder]:
+    """A square-off over intraday positions in ``keys`` whose flattener only records."""
+    w = await expiry_world(at, limits)
+    for key in keys:
+        w.hold(key, 65)
+    recorder = Recorder()
+    square = SquareOff(
+        limits=w.limits, service=w.service, flattener=recorder, instruments=KNOWN.get,
+        now=w.clock,
+    )  # fmt: skip
+    return w, square, recorder
+
+
+async def ask(square: SquareOff, at: datetime) -> None:
+    """One pass of the square-off, then a turn of the event loop so that a flatten it started
+    begins (and the recorder sees the call)."""
+    await square.maybe_run(at)
+    await asyncio.sleep(0)
+
+
+async def test_the_flattener_exits_only_the_positions_it_is_given() -> None:
+    w = await world()
+    w.hold(OPTION, 65)
+    w.hold(STOCK, 100)  # intraday too: only the positions filter tells them apart
+
+    await w.flatten(positions=frozenset({pid(OPTION)}), kind="squareoff")
+
+    held = {p.key: p.quantity for p in w.service.positions.values()}
+    assert held == {OPTION: 0, STOCK: 100}
+    assert all(o.order_type is OrderType.LIMIT for o in w.orders())  # never a market order
+
+
+async def test_expiry_square_off() -> None:
+    """Spec "Expiry square-off": square-off 15:10, expiry square-off 14:30. At 14:30 only the
+    intraday position in the contract expiring today is exited; the one in next week's contract
+    stays open until 15:10. Every exit is a limit order from the square-off."""
+    w = await expiry_world(AT_1430 - timedelta(minutes=1))
+    w.hold(EXPIRING_KEY, 65)
+    w.hold(NEXT_WEEK_KEY, 65)
+    square = SquareOff(
+        limits=w.limits, service=w.service, flattener=w.flattener, instruments=KNOWN.get,
+        now=w.clock,
+    )  # fmt: skip
+
+    await square.maybe_run(w.clock.at)
+    assert square.running is None  # 14:29: nothing is due yet
+    w.clock.at = AT_1430
+    await square.maybe_run(w.clock.at)
+    assert square.running is not None
+    await asyncio.wait_for(square.running, timeout=5)
+
+    held = {p.key: p.quantity for p in w.service.positions.values()}
+    assert held == {EXPIRING_KEY: 0, NEXT_WEEK_KEY: 65}
+    w.clock.at = AT_1510 - timedelta(seconds=1)
+    await square.maybe_run(w.clock.at)
+    assert square.running is None and all(o.key == EXPIRING_KEY for o in w.orders())
+
+    w.clock.at = AT_1510
+    await square.maybe_run(w.clock.at)
+    assert square.running is not None
+    await asyncio.wait_for(square.running, timeout=5)
+
+    assert w.flat()
+    assert {o.key for o in w.orders()} == {EXPIRING_KEY, NEXT_WEEK_KEY}
+    assert {o.source for o in w.orders()} == {"risk-squareoff"}
+    assert all(o.order_type is OrderType.LIMIT for o in w.orders())
+
+
+async def test_a_position_with_no_master_record_is_squared_off_at_the_earlier_time() -> None:
+    """Spec: an intraday position whose instrument has no master record is squared off at the
+    earlier of the two times."""
+    _, square, recorder = await recorded_square_off(
+        AT_1430, EXPIRING_KEY, UNKNOWN_KEY, NEXT_WEEK_KEY
+    )
+
+    await ask(square, AT_1430)
+
+    assert recorder.calls == [frozenset({pid(EXPIRING_KEY), pid(UNKNOWN_KEY)})]
+    recorder.release.set()
+
+
+async def test_a_slow_expiry_exit_does_not_hold_up_the_base_square_off() -> None:
+    """The flatten started at 14:30 is still running at 15:10: next week's position gets a flatten
+    of its own then, and no position is asked for twice."""
+    _, square, recorder = await recorded_square_off(AT_1430, EXPIRING_KEY, NEXT_WEEK_KEY)
+
+    await ask(square, AT_1430)
+    await ask(square, AT_1510)
+    await ask(square, AT_1510 + timedelta(seconds=1))
+
+    assert recorder.calls == [frozenset({pid(EXPIRING_KEY)}), frozenset({pid(NEXT_WEEK_KEY)})]
+    recorder.release.set()
+
+
+async def test_without_an_expiry_square_off_every_intraday_position_goes_at_the_base_time() -> None:
+    base_only = {**BASE, "square_off_time": "15:10"}
+    _, square, recorder = await recorded_square_off(
+        AT_1430, EXPIRING_KEY, UNKNOWN_KEY, NEXT_WEEK_KEY, limits=base_only
+    )
+
+    await ask(square, AT_1430)
+    assert recorder.calls == []
+    await ask(square, AT_1510)
+
+    assert recorder.calls == [frozenset({pid(EXPIRING_KEY), pid(UNKNOWN_KEY), pid(NEXT_WEEK_KEY)})]
+    recorder.release.set()
+
+
+async def test_an_expiring_delivery_position_is_left_to_the_owner() -> None:
+    """The square-off is for intraday positions only, expiring or not."""
+    w, square, recorder = await recorded_square_off(AT_1430)
+    w.hold(EXPIRING_KEY, 65, ProductType.CNC)
+
+    await ask(square, AT_1430)
+
+    assert recorder.calls == [] and square.running is None
+
+
+async def test_a_square_off_built_without_the_master_treats_every_position_as_expiring() -> None:
+    """The fail-safe default: with no instrument lookup every position gets the earlier time."""
+    w, _, recorder = await recorded_square_off(AT_1430, EXPIRING_KEY, NEXT_WEEK_KEY)
+    square = SquareOff(limits=w.limits, service=w.service, flattener=recorder, now=w.clock)
+
+    await ask(square, AT_1430)
+
+    assert recorder.calls == [frozenset({pid(EXPIRING_KEY), pid(NEXT_WEEK_KEY)})]
+    recorder.release.set()

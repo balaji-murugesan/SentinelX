@@ -78,17 +78,25 @@ class LimitsService:
         repository: RiskRepository,
         results: TradingRepository,
         figures: Callable[[], tuple[Decimal, Decimal | None] | None],
+        expiry_exposure: Callable[[], bool] = lambda: False,
         now: Callable[[], datetime] = utc_now,
     ) -> None:
         """``figures`` returns today's ``(peak, floor)`` from the engine's own state (floor None
         until there is one), or None while that state is not available (the day is not loaded).
         It has no default on purpose: the floor re-simulation of an edit must use the real
         figures, and a forgotten argument would silently use zero. A market-hours edit is refused
-        while the figures are None, never judged against made-up ones."""
+        while the figures are None, never judged against made-up ones.
+
+        ``expiry_exposure`` returns the day's expiry-exposure flag, read only once ``figures``
+        has answered: the re-simulation then replays the floor with the expiry giveback, as the
+        monitor's ratchet does (add-risk-guards task 8.2). ``RiskRuntime`` wires it to the day
+        book; the default, off, suits a service built without one (the tests that do not
+        exercise the expiry giveback)."""
         self._account_id = account_id
         self._repo = repository
         self._results = results
         self._figures = figures
+        self._expiry_exposure = expiry_exposure
         self._now = now
         self._lock = asyncio.Lock()
         self._status = LimitsStatus.NOT_LOADED
@@ -199,6 +207,7 @@ class LimitsService:
                     )  # fmt: skip
 
         peak, floor = Decimal(0), None  # unused: ``validate_edit`` replays the floor only below
+        expiry = False
         if old is not None and is_market_hours(at):
             figures = self._figures()
             if figures is None:
@@ -211,8 +220,9 @@ class LimitsService:
                     old_values, started,
                 )  # fmt: skip
             peak, floor = figures
+            expiry = self._expiry_exposure()
         try:
-            new = validate_edit(old, command.limits, now=at, peak=peak, floor=floor)
+            new = validate_edit(old, command.limits, now=at, peak=peak, floor=floor, expiry=expiry)
         except EditRejected as rejected:
             return await self._refused(
                 command, rejected.code, rejected.problems, old_values, started

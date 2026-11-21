@@ -4,10 +4,13 @@ floor "Entries must leave headroom above the floor").
 Scenarios: "Limit reached" (max trades), "Third loss in a row" (cooldown, check side),
 "Total reached", "Carried position counts", "Two entries in flight", "After the cutoff" and "Not
 enough headroom", plus add-ons, the per-underlying limit, boundaries and the floor ratchet.
+
+add-risk-guards task 8.1 (expiry-day-profile): "Earlier cutoff on expiry", "Other contracts
+unaffected", "Expiry moved by a holiday" and "Entry that would trip the tighter giveback".
 """
 
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
 
 import pytest
@@ -17,6 +20,7 @@ from contracts.orders import Order, OrderSide, OrderState, OrderType, Position, 
 from engine.risk.checks.counters import COOLDOWN, MAX_TRADES, Cooldown, MaxTrades
 from engine.risk.checks.exposure import (
     ENTRY_CUTOFF,
+    EXPIRY_CUTOFF,
     FLOOR_HEADROOM,
     OPEN_POSITIONS,
     OPEN_POSITIONS_UNDERLYING,
@@ -24,13 +28,14 @@ from engine.risk.checks.exposure import (
     FloorHeadroom,
     OpenPositions,
 )
-from engine.risk.decision import Severity, run_pre_trade
+from engine.risk.decision import Decision, Severity, run_pre_trade
 from engine.risk.floor import LockMode
 from engine.risk.limits import RiskLimits
 from tests.engine.risk_builders import (
     LIMITS,
     NOW,
     STOCK,
+    TODAY,
     context,
     day_state,
     make_instrument,
@@ -381,6 +386,126 @@ def test_these_are_entry_rules(check: object) -> None:
     assert check.name in {  # type: ignore[attr-defined]
         "max_trades", "cooldown", "max_open_positions", "entry_cutoff", "equity_floor"
     }  # fmt: skip
+
+
+# ---- the expiry-day profile (add-risk-guards task 8.1) ---------------------------------------
+#
+# Monday 2026-11-16 is TODAY. A contract expires today only by its master expiry date.
+
+EXPIRING = make_instrument(str(key(200))).model_copy(update={"expiry": TODAY})
+NEXT_WEEK = make_instrument(str(key(201))).model_copy(update={"expiry": TODAY + timedelta(days=7)})
+# Its usual expiry weekday is today, but a holiday moved this week's expiry to tomorrow.
+MOVED = make_instrument(str(key(202))).model_copy(update={"expiry": TODAY + timedelta(days=1)})
+CONTRACTS = [EXPIRING, NEXT_WEEK, MOVED]
+EXPIRY_CUTOFF_AT_14 = replace(LIMITS, entry_cutoff_expiry=time(14, 0))  # base cutoff 15:00
+
+
+def cutoff_decision(
+    instrument: Instrument | InstrumentKey, when: datetime, limits: RiskLimits
+) -> Decision:
+    held = instrument.key if isinstance(instrument, Instrument) else instrument
+    ctx = context(limits=limits, now=when, extra_instruments=CONTRACTS)
+    return EntryCutoff().pre_trade(ctx, order(BUY, 65, key=held))
+
+
+def test_earlier_cutoff_on_expiry() -> None:
+    """Spec "Earlier cutoff on expiry": cutoff 15:00, expiry cutoff 14:00, an entry in a contract
+    expiring today at 14:10 IST."""
+    decision = cutoff_decision(EXPIRING, at_ist(14, 10), EXPIRY_CUTOFF_AT_14)
+
+    assert decision.severity is Severity.REJECT and decision.code == EXPIRY_CUTOFF
+    assert decision.inputs["cutoff"] == "14:00" and decision.inputs["expiring"] is True
+
+
+def test_other_contracts_are_unaffected_by_the_expiry_cutoff() -> None:
+    """Spec "Other contracts unaffected": the same limits, next week's contract at 14:10 IST."""
+    assert cutoff_decision(NEXT_WEEK, at_ist(14, 10), EXPIRY_CUTOFF_AT_14).code is None
+
+
+def test_an_expiry_moved_by_a_holiday_keeps_the_base_cutoff() -> None:
+    """Spec "Expiry moved by a holiday": the master says tomorrow, so it is not expiring today,
+    whatever the weekday."""
+    assert cutoff_decision(MOVED, at_ist(14, 10), EXPIRY_CUTOFF_AT_14).code is None
+    assert cutoff_decision(MOVED, at_ist(15, 0), EXPIRY_CUTOFF_AT_14).code == ENTRY_CUTOFF
+
+
+@pytest.mark.parametrize(
+    ("when", "code"),
+    [
+        (at_ist(13, 59, 59), None),
+        (at_ist(14, 0), EXPIRY_CUTOFF),  # "at or after entry_cutoff_expiry"
+        (at_ist(15, 0), EXPIRY_CUTOFF),  # past both: the expiry cutoff is the one in force
+    ],
+)
+def test_the_expiry_cutoff_boundary(when: datetime, code: str | None) -> None:
+    assert cutoff_decision(EXPIRING, when, EXPIRY_CUTOFF_AT_14).code == code
+
+
+def test_without_an_expiry_cutoff_an_expiring_entry_keeps_the_base_cutoff() -> None:
+    """An unset override means the base value applies."""
+    assert cutoff_decision(EXPIRING, at_ist(14, 10), LIMITS).code is None
+    assert cutoff_decision(EXPIRING, at_ist(15, 0), LIMITS).code == ENTRY_CUTOFF
+
+
+def test_a_contract_with_no_master_record_is_not_expiring_for_the_cutoff() -> None:
+    """Only the master expiry date counts (spec). Such an entry never reaches this check in
+    production: validation refuses it (``test_order_rules``) and so does the gate
+    (``test_risk_checks_lots::test_in_shadow_mode_an_unknown_instrument_entry_is_still_refused``)."""
+    assert cutoff_decision(key(299), at_ist(14, 10), EXPIRY_CUTOFF_AT_14).code is None
+    assert cutoff_decision(key(299), at_ist(15, 0), EXPIRY_CUTOFF_AT_14).code == ENTRY_CUTOFF
+
+
+def gives_back(**changes: object) -> RiskLimits:
+    """Only the starting loss and a giveback of 2,000 once the peak reaches 2,000; the expiry
+    giveback is 1,500."""
+    return floors(
+        giveback_arm=D(2000), giveback_abs=D(2000), giveback_abs_expiry=D(1500), **changes
+    )
+
+
+def risking_100(instrument: Instrument) -> Order:
+    return order(
+        BUY, 25, key=instrument.key, order_type=OrderType.LIMIT, limit_price=D("200.00"),
+        initial_stop=D("196.00"),
+    )  # fmt: skip
+
+
+def headroom(instrument: Instrument, *, exposure: bool) -> str | None:
+    """Peak 5,000 and MTM_day 3,200: the base floor is 3,000, the expiry floor 3,500."""
+    ctx = context(
+        limits=gives_back(), day=day_state(peak=D(5000), expiry_exposure=exposure),
+        mtm_day=D(3200), extra_instruments=CONTRACTS,
+    )  # fmt: skip
+    return FloorHeadroom().pre_trade(ctx, risking_100(instrument)).code
+
+
+def test_an_entry_that_would_trip_the_tighter_giveback_is_refused() -> None:
+    """Spec "Entry that would trip the tighter giveback": peak 5,000, MTM_day 3,200 and
+    ``giveback_abs_expiry`` 1,500. 3,200 - 100 = 3,100 is under the expiry floor of 3,500."""
+    assert headroom(EXPIRING, exposure=False) == FLOOR_HEADROOM
+
+
+def test_a_non_expiring_entry_is_judged_against_the_base_floor() -> None:
+    """3,100 is above the base floor of 3,000, and the account has no expiring exposure."""
+    assert headroom(NEXT_WEEK, exposure=False) is None
+    assert headroom(MOVED, exposure=False) is None
+
+
+def test_once_the_account_has_expiring_exposure_every_entry_meets_the_expiry_floor() -> None:
+    """The expiry giveback applies for the rest of the day, so next week's contract is judged
+    against the expiry floor too."""
+    assert headroom(NEXT_WEEK, exposure=True) == FLOOR_HEADROOM
+
+
+def test_an_unknown_contract_is_judged_against_the_base_floor() -> None:
+    """Only the master expiry date counts; the gate refuses such an entry before this matters."""
+    ctx = context(limits=gives_back(), day=day_state(peak=D(5000)), mtm_day=D(3200))
+    unknown = order(
+        BUY, 25, key=key(299), order_type=OrderType.LIMIT, limit_price=D("200.00"),
+        initial_stop=D("196.00"),
+    )  # fmt: skip
+
+    assert FloorHeadroom().pre_trade(ctx, unknown).code is None
 
 
 def test_an_add_on_to_a_held_position_needs_no_instrument_facts() -> None:

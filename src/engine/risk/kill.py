@@ -71,6 +71,7 @@ from engine.persistence.repository import PersistenceError, TradingRepository
 from engine.positions.book import PositionId
 from engine.risk.daybook import DayBook
 from engine.risk.decision import Quote
+from engine.risk.expiry import effective_square_off, treated_as_expiring
 from engine.risk.limits import RiskLimits
 from engine.risk.limits_service import LimitsService
 
@@ -84,10 +85,18 @@ OWN_SOURCES: Final = frozenset({"risk-kill", "risk-squareoff"})  # who places th
 
 class Flattener(Protocol):
     async def flatten(
-        self, reason: str, products: frozenset[ProductType] | None = None, kind: str = "kill"
+        self,
+        reason: str,
+        products: frozenset[ProductType] | None = None,
+        kind: str = "kill",
+        positions: frozenset[PositionId] | None = None,
     ) -> None:
-        """Exit every open position (only those of ``products`` if given) and return once they
-        are flat. Never sends a market order."""
+        """Exit every open position and return once they are flat. Never sends a market order.
+
+        ``products`` and ``positions`` narrow it: only positions of those products, and only those
+        positions (add-risk-guards task 8.3: the square-off asks for the positions whose own time
+        has come). Both None, which is what the kill passes, means everything. Stage 4's exit
+        manager replaces this flattener and must keep both parameters."""
         ...
 
 
@@ -144,7 +153,11 @@ class ChaseFlattener:
         self._locks: dict[PositionId, asyncio.Lock] = {}
 
     async def flatten(
-        self, reason: str, products: frozenset[ProductType] | None = None, kind: str = "kill"
+        self,
+        reason: str,
+        products: frozenset[ProductType] | None = None,
+        kind: str = "kill",
+        positions: frozenset[PositionId] | None = None,
     ) -> None:
         started = self._now()
         escalated = False
@@ -163,14 +176,14 @@ class ChaseFlattener:
             open_positions = {
                 pid: p
                 for pid, p in self._service.positions.items()
-                if p.quantity != 0 and self._in_scope(pid, products)
+                if p.quantity != 0 and self._in_scope(pid, products, positions)
             }
             # A chase that has finished (its position is flat and its order final) is forgotten, so
             # the next one for that position starts fresh: its own step count and its own keys.
             for pid in [
                 pid
                 for pid, chase in self._chases.items()
-                if self._in_scope(pid, products)
+                if self._in_scope(pid, products, positions)
                 and pid not in open_positions
                 and not self._alive(chase)
             ]:
@@ -178,7 +191,7 @@ class ChaseFlattener:
             working = [
                 pid
                 for pid, chase in self._chases.items()
-                if self._in_scope(pid, products) and self._alive(chase)
+                if self._in_scope(pid, products, positions) and self._alive(chase)
             ]
             if not open_positions and not working:
                 return
@@ -215,8 +228,13 @@ class ChaseFlattener:
     # ---- one position ----------------------------------------------------------------------
 
     @staticmethod
-    def _in_scope(pid: PositionId, products: frozenset[ProductType] | None) -> bool:
-        return products is None or pid[2] in products
+    def _in_scope(
+        pid: PositionId,
+        products: frozenset[ProductType] | None,
+        positions: frozenset[PositionId] | None,
+    ) -> bool:
+        """Is ``pid`` one this flatten works on? No filter (None) lets everything through."""
+        return (products is None or pid[2] in products) and (positions is None or pid in positions)
 
     def _lock(self, pid: PositionId) -> asyncio.Lock:
         return self._locks.setdefault(pid, asyncio.Lock())
@@ -598,9 +616,22 @@ class SquareOff:
 
     It uses the kill switch's flattener but is **not a halt**: the day stays open, no broker lock
     is requested, and positions held under ``CNC`` or ``MARGIN`` (and their stops) are left alone.
-    It is called on every monitor pass; once the time has come it starts a flatten for the
-    intraday positions whenever there are any and none is running (so one that appears later is
-    exited too).
+    It is called on every monitor pass.
+
+    Each intraday position has its own time (add-risk-guards task 8.3; expiry-day-profile
+    "Intraday positions in expiring contracts are squared off earlier"): ``square_off_time_expiry``
+    when its contract expires today, or when it has no master record (its expiry cannot be read,
+    so the earlier time is the fail-safe side), and ``square_off_time`` otherwise
+    (``engine.risk.expiry.effective_square_off``). Once a position's time has come it is handed to
+    the flattener by its id, so an expiring contract is exited at 14:30 while next week's stays
+    open until 15:10. A position whose time has come and that no running flatten covers gets a
+    flatten of its own at once: one that appears later is exited too, and a slow exit of an
+    expiring position cannot hold up the others at the base time. Two flattens never share a
+    position here, and the flattener would let them share one exit if they did.
+
+    Trading terms: square-off - closing intraday (MIS) positions before the broker's own cut-off
+    does it at its own price; expiry day - the date a contract expires, when its premium moves
+    fastest, so the owner may square it off earlier.
     """
 
     def __init__(
@@ -609,36 +640,61 @@ class SquareOff:
         limits: LimitsService,
         service: OrderService,
         flattener: Flattener,
+        instruments: Callable[[InstrumentKey], Instrument | None] = lambda key: None,
         now: Callable[[], datetime] = utc_now,
     ) -> None:
+        """``instruments`` is the instrument master lookup, for each position's expiry date. The
+        default knows none, so every position is treated as expiring: the earlier time, the
+        fail-safe side (``RiskRuntime`` passes the real master)."""
         self._limits = limits
         self._service = service
         self._flattener = flattener
+        self._instruments = instruments
         self._now = now
-        self._task: asyncio.Task[None] | None = None
+        # The flattens started, each with the positions it was asked for (newest last).
+        self._runs: list[tuple[frozenset[PositionId], asyncio.Task[None]]] = []
+
+    def _due(self, limits: RiskLimits, now: datetime) -> frozenset[PositionId]:
+        """The open intraday positions whose own square-off time has come."""
+        local = now.astimezone(IST).time()
+        return frozenset(
+            pid
+            for pid, p in self._service.positions.items()
+            if p.quantity != 0
+            and p.product is ProductType.INTRADAY
+            and local
+            >= effective_square_off(limits, treated_as_expiring(self._instruments(p.key), now))
+        )
 
     async def maybe_run(self, now: datetime) -> None:
         limits = self._limits.current
         if limits is None or not is_market_hours(now):
             return
-        if now.astimezone(IST).time() < limits.square_off_time:
+        self._runs = [(scope, task) for scope, task in self._runs if not self._ended(task)]
+        covered = frozenset(pid for scope, _ in self._runs for pid in scope)
+        new = self._due(limits, now) - covered
+        if not new:
             return
-        if self._task is not None and self._task.done():
-            if not self._task.cancelled() and self._task.exception() is not None:
-                log.error("square-off task failed", exc_info=self._task.exception())
-            self._task = None
-        intraday = any(
-            p.quantity != 0 and p.product is ProductType.INTRADAY
-            for p in self._service.positions.values()
+        log.warning(
+            "square-off time: exiting intraday positions", positions=[str(p[1]) for p in new]
         )
-        if intraday and self._task is None:
-            log.warning("square-off time: exiting intraday positions")
-            self._task = asyncio.create_task(
-                self._flattener.flatten(
-                    "square-off", frozenset({ProductType.INTRADAY}), kind="squareoff"
-                )
+        task = asyncio.create_task(
+            self._flattener.flatten(
+                "square-off", frozenset({ProductType.INTRADAY}), kind="squareoff", positions=new
             )
+        )
+        self._runs.append((new, task))
+
+    @staticmethod
+    def _ended(task: asyncio.Task[None]) -> bool:
+        """True once ``task`` has finished; a failure is logged (the next pass starts again)."""
+        if not task.done():
+            return False
+        if not task.cancelled() and task.exception() is not None:
+            log.error("square-off task failed", exc_info=task.exception())
+        return True
 
     @property
     def running(self) -> asyncio.Task[None] | None:
-        return self._task
+        """The newest flatten started (tests await it), until a later pass sees it finished."""
+        return self._runs[-1][1] if self._runs else None

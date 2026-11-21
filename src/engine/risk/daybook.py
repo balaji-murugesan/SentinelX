@@ -206,6 +206,21 @@ class DayBook:
             self._day = replace(state, halt_level=level, halt_reason=reason)
             self._version += 1
 
+    def note_expiry_exposure(self) -> bool:
+        """Switch ``expiry_exposure`` on: the account holds a contract that expires today
+        (expiry-day-profile "The expiry giveback applies once the account has expiring exposure").
+        One-way: nothing here or anywhere else switches it off within the day; the next IST date
+        starts a fresh row with it off. True if it was off until now (the caller then flushes, so a
+        restart cannot forget it). Like ``ratchet``, it does not take the write lock: an entry's
+        write in flight keeps it, because its undo leaves the flag alone and its save merges with
+        OR (``merge_day_state``)."""
+        state = self.day()
+        if state.expiry_exposure:
+            return False
+        self._day = replace(state, expiry_exposure=True)
+        self._version += 1
+        return True
+
     def set_close_marks(self, marks: dict[str, str]) -> None:
         """Record each open position's last price at the close: tomorrow's reference. The first
         marks written for a day stand (a restart after the close must not replace them)."""

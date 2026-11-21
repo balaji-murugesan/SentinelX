@@ -99,7 +99,7 @@ class RiskRuntime:
         self.rejections = RejectionWindow()
         self.limits = LimitsService(
             account_id=account, repository=risk_repository, results=repository,
-            figures=self._figures, now=now,
+            figures=self._figures, expiry_exposure=self._expiry_exposure, now=now,
         )  # fmt: skip
         self.daybook = DayBook(
             account_id=account, repository=risk_repository, limits=lambda: self.limits.current,
@@ -147,8 +147,9 @@ class RiskRuntime:
             results=self._repository, now=self._now,
         )  # fmt: skip
         self.square_off = SquareOff(
-            limits=self.limits, service=service, flattener=flattener, now=self._now
-        )
+            limits=self.limits, service=service, flattener=flattener,
+            instruments=self._instruments, now=self._now,
+        )  # fmt: skip
         self.stops = CatastrophicStops(
             account_id=account, service=service, limits=self.limits,
             instruments=self._instruments, now=self._now,
@@ -269,6 +270,12 @@ class RiskRuntime:
             return None
         day = self.daybook.day()
         return day.peak, day.floor
+
+    def _expiry_exposure(self) -> bool:
+        """Today's expiry-exposure flag, for the same re-simulation: the floor is replayed with
+        the giveback the monitor ratchets it with. (Read only after ``_figures`` answered, so the
+        day is loaded; if it is not, the edit has already been refused.)"""
+        return self.daybook.unavailable(self._now()) is None and self.daybook.day().expiry_exposure
 
     # ---- the snapshot's risk block -----------------------------------------------------------
 

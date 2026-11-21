@@ -99,7 +99,13 @@ class FloorBreach:
         if ctx.mtm_day is None:
             return ALLOW  # unknown MTM refuses entries (FloorHeadroom); it is not a breach
         try:
-            floor = next_floor(ctx.day.floor, ctx.limits.floor_params(), ctx.day.peak)
+            # The same floor the monitor ratchets: with the expiry giveback once the account has
+            # had expiring exposure today (add-risk-guards task 8.2).
+            floor = next_floor(
+                ctx.day.floor,
+                ctx.limits.floor_params(expiry=ctx.day.expiry_exposure),
+                ctx.day.peak,
+            )
         except (ValueError, TypeError, ArithmeticError) as error:
             # The limits in force cannot make a floor. Fall back to the last good one, so a
             # breach of it is still caught, and stop new entries in any case.

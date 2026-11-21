@@ -842,6 +842,25 @@ async def test_a_limits_edit_is_judged_against_the_days_real_peak_and_floor(
     assert "lower today's floor" in (result.reason or "")
 
 
+@pytest.mark.parametrize("exposure", [True, False])
+async def test_a_limits_edit_is_replayed_with_the_days_expiry_exposure_flag(
+    env_factory: Callable[..., Env], exposure: bool
+) -> None:
+    """add-risk-guards task 8.2, through the assembly: the runtime hands the day book's expiry
+    flag to the re-simulation. At a peak of 5,000 the expiry giveback (600) holds the floor at
+    4,400; tightening ``lock_at`` leaves it there, so the edit passes with the flag on, and would
+    look like a drop to the base giveback's 4,000 with it off."""
+    expiry_abs = edit(giveback_pct=None, giveback_abs_expiry="600")
+    env = await env_factory().ready(expiry_abs)
+    if exposure:
+        env.runtime.daybook.note_expiry_exposure()
+    env.runtime.daybook.ratchet(D(5000), D(4400))
+
+    result = await env.send_limits({**expiry_abs, "lock_at": "300"}, key="lock")
+
+    assert result.accepted is exposure, result.reason
+
+
 async def test_a_floor_breach_through_the_assembly_locks_the_day_and_sends_the_exit(
     env_factory: Callable[..., Env],
 ) -> None:

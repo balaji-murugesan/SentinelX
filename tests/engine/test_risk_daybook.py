@@ -320,11 +320,31 @@ async def test_a_failed_save_keeps_the_expiry_flag_switched_on_while_the_write_w
     counting = asyncio.create_task(daybook.entry_allowed(1, False))
     await repo.started.wait()
 
-    daybook._day = replace(daybook.day(), expiry_exposure=True)  # what the monitor would do
+    assert daybook.note_expiry_exposure() is True  # what the monitor does (task 8.2)
     repo.release.set()
 
     assert await counting is not None
     assert daybook.day().entries_today == 0 and daybook.day().expiry_exposure is True
+
+
+async def test_the_monitors_expiry_flag_is_one_way_written_by_the_flush_and_reset_next_day() -> (
+    None
+):
+    """Task 8.2: ``note_expiry_exposure`` switches the flag on once (True only the first time), the
+    next flush writes it, nothing in the book switches it off, and the next IST date starts with
+    it off."""
+    daybook, repo, clock = await loaded()
+
+    assert daybook.note_expiry_exposure() is True
+    assert daybook.note_expiry_exposure() is False  # already on: no change, no write needed
+    assert daybook.dirty and await daybook.flush()
+    assert (await repo.load_day("main", TODAY)).expiry_exposure is True  # type: ignore[union-attr]
+    await daybook.entry_allowed(1, False)  # a non-expiring entry leaves it on
+    assert daybook.day().expiry_exposure is True
+
+    clock.at = NOW + timedelta(days=1)
+    assert await daybook.roll_over_if_new_day() is True
+    assert daybook.day().expiry_exposure is False
 
 
 async def test_a_failed_save_across_the_date_change_leaves_the_new_days_counters_alone() -> None:
