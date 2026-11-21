@@ -111,6 +111,10 @@ openspec validate <change-id> --strict
 Command-line habits:
 - To view or search files, use the Read and Grep tools, not `sed`/`grep`/`head`/`cat` in Bash.
 - Never prefix commands with `cd "d:/Trading/src/algo2/SentinelX" &&`; the shell already runs in the repo root, and plain commands match the permission allowlist.
+- `TEST_REDIS_URL` is set by the `env` block in `.claude/settings.json`. Never put environment variables in front of a command.
+- Change files with the Edit and Write tools, never with `sed -i`, `cat <<EOF >` or inline `python -` scripts.
+- Run helper scripts (mutation checks, one-off checks) as a file via `uv run python <path>`, doing any backup and restore inside the script. No `cp` backups, `for`/`until` loops, or bare `python`/`bash` calls.
+- Pipe only into `head`, `tail` or `grep`. Any piece of a chained command that isn't on the allowlist prompts the owner.
 
 Definition of done for any task: format, lint, mypy, import-linter, and tests all pass; `openspec validate --strict` passes.
 
