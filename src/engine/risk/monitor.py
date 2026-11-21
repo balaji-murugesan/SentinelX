@@ -93,6 +93,12 @@ BEATS_TOLERATED: Final = 3  # the gate refuses entries after this many intervals
 # Decisions below KILL whose start is still logged as critical (an alert for the owner), once per
 # episode: the rejection breaker tripping (order-flow-guards "Broker rejections trip a breaker").
 CRITICAL_ON_START: Final = frozenset({REJECT_BREAKER})
+# While the stored ban lists are unread, the pass retries the read at most this often (monitor
+# clock). The read is awaited inside the pass, so retrying on every pass would let a hung
+# database (the repository's timeout is 3 s) stretch each pass from about 1 s to about 4 s,
+# delaying the floor, feed and breaker checks and the target confirmation. The trade-off: after
+# the database comes back, F&O entries stay refused for up to this long before the list is read.
+BAN_LIST_RETRY_S: Final = 15
 
 type KillHook = Callable[[Decision], Awaitable[None]]
 type EnsureFlatHook = Callable[[str], Awaitable[None]]
@@ -151,8 +157,9 @@ class RiskMonitor:
         ``unprotected`` returns the open positions that have no catastrophic stop. ``rejections``
         returns the times of the broker rejections within 300 s of the time it is given
         (``RejectionWindow.recent``); the default, none, suits a monitor with no order service.
-        ``ban_lists`` holds the F&O ban lists: the monitor retries its read on every pass while it
-        is unread, and serves today's list to the gate (``ban_list``); without one no list is ever
+        ``ban_lists`` holds the F&O ban lists: while they are unread the monitor retries the read
+        on its first pass and then at most every ``BAN_LIST_RETRY_S`` seconds, and it serves
+        today's list to the gate (``ban_list``); without one no list is ever
         loaded, so F&O entries are refused. ``spot_key`` maps an underlying symbol to its spot
         instrument, for the instrument policy's strike distance (default: none known)."""
         self._account_id = account_id
@@ -174,6 +181,7 @@ class RiskMonitor:
         self._ban_lists = ban_lists
         self._spot_key = spot_key
         self._now = now
+        self._ban_list_tried_at: datetime | None = None  # the last retry of an unread ban list
         self._trading: TradingView | None = None
         self._tracker: MtmTracker | None = None
         self._applied: RiskLimits | None = None  # the limits the tracker was last configured with
@@ -306,14 +314,21 @@ class RiskMonitor:
         await self._act(results)
         await self._keep_flattening()
         await self._record(results, now)  # after acting: a slow audit must not delay a flatten
-        if self._ban_lists is not None and not self._ban_lists.read:
+        if self._ban_lists is not None and not self._ban_lists.read and self._ban_list_due(now):
             # Retried after acting: a hung database must never delay a kill or a flatten (exits
             # come first). Until the lists are read, F&O entries are refused.
+            self._ban_list_tried_at = now
             await self._ban_lists.load()
         # The expiry-exposure flag is written as soon as it switches on (after acting, so it never
         # delays a kill), not at the next throttled write: a restart in between must not forget it.
         await self._persist_if_due(now, at_once=exposure_switched_on)
         await self._write_close_marks_if_due(now)
+
+    def _ban_list_due(self, now: datetime) -> bool:
+        """Is a retry of the unread ban lists due? On the first pass, then once every
+        ``BAN_LIST_RETRY_S`` seconds (see the constant for why it is rate-limited)."""
+        tried = self._ban_list_tried_at
+        return tried is None or now - tried >= timedelta(seconds=BAN_LIST_RETRY_S)
 
     # ---- the day ---------------------------------------------------------------------------
 

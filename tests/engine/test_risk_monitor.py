@@ -30,6 +30,7 @@ from engine.market_data.provider import Tick
 from engine.persistence.repository import PersistenceError
 from engine.positions.book import position_id
 from engine.risk.audit import RiskAudit
+from engine.risk.banlist import BanListService
 from engine.risk.checks.flow import REJECT_BREAKER, RejectBreaker
 from engine.risk.checks.stale import (
     FEED_DOWN,
@@ -53,9 +54,16 @@ from engine.risk.decision import (
 from engine.risk.floor import floor_of
 from engine.risk.limits import MODE_PREFIX
 from engine.risk.limits_service import LimitsService, LimitsStatus
-from engine.risk.monitor import REFERENCE_MISSING, RiskMonitor, mark_key, previous_weekday
+from engine.risk.monitor import (
+    BAN_LIST_RETRY_S,
+    REFERENCE_MISSING,
+    RiskMonitor,
+    mark_key,
+    previous_weekday,
+)
 from engine.risk.pnl import estimate_exit_cost
 from engine.risk.rejections import RejectionWindow
+from engine.risk.repository import StoredBanList
 from engine.risk.state import DayState
 from tests.engine.risk_builders import (
     INSTRUMENTS,
@@ -1367,51 +1375,112 @@ class SeeContext:
         return ALLOW
 
 
-async def test_the_monitor_retries_the_ban_list_read_and_fills_the_context() -> None:
-    """The monitor serves today's ban list (to its own checks and to the gate through
-    ``ban_list``) and the spot lookup; while the stored lists cannot be read, it retries on every
-    pass, and the list is None (F&O entries refused) until a read succeeds."""
-    from contracts.market import InstrumentKey
-    from engine.risk.banlist import BanListService
-    from engine.risk.repository import StoredBanList
+class BanListsDown(MemoryRiskRepository):
+    """Counts ban-list reads, and fails them while ``down`` (a database that is unavailable)."""
 
-    class Down(MemoryRiskRepository):
-        down = True
-        reads = 0
+    down = True
+    reads = 0
 
-        async def load_ban_list(self, account_id: str, from_date: date) -> list[StoredBanList]:
-            self.reads += 1
-            if self.down:
-                raise PersistenceError("database unavailable")
-            return await super().load_ban_list(account_id, from_date)
+    async def load_ban_list(self, account_id: str, from_date: date) -> list[StoredBanList]:
+        self.reads += 1
+        if self.down:
+            raise PersistenceError("database unavailable")
+        return await super().load_ban_list(account_id, from_date)
 
-    repo = Down()
+
+async def ban_list_monitor(
+    spot_key: Callable[[str], InstrumentKey | None] = lambda symbol: None,
+) -> tuple[BanListsDown, SeeContext, "Env", RiskMonitor]:
+    """A monitor whose ban lists are unread (the start-up read failed) and stored as {XYZ}."""
+    repo = BanListsDown()
     repo.ban_lists[("main", TODAY)] = StoredBanList(TODAY, frozenset({"XYZ"}), NOW)
     spy = SeeContext()
     env = await Env(repo=repo, checks=(spy,)).ready()
-    nifty = InstrumentKey.parse("IDX_I:13")
     ban_lists = BanListService(
         account_id="main", repository=repo, results=MemoryRepository(), now=env.clock
     )
     monitor = RiskMonitor(
         account_id="main", limits=env.limits, daybook=env.daybook, repository=repo,
         audit=env.audit, instruments=instrument_of, checks=(spy,), subscribed=lambda: True,
-        interval_s=1.0, persist_interval_s=10.0, ban_lists=ban_lists,
-        spot_key={"NIFTY": nifty}.get, now=env.clock,
+        interval_s=1.0, persist_interval_s=10.0, ban_lists=ban_lists, spot_key=spot_key,
+        now=env.clock,
     )  # fmt: skip
     monitor.bind(env.trading)
+    return repo, spy, env, monitor
+
+
+async def test_the_monitor_retries_the_ban_list_read_and_fills_the_context() -> None:
+    """The monitor serves today's ban list (to its own checks and to the gate through
+    ``ban_list``) and the spot lookup; while the stored lists cannot be read, it retries (on its
+    first pass, then once each ``BAN_LIST_RETRY_S``), and the list is None (F&O entries refused)
+    until a read succeeds."""
+    nifty = InstrumentKey.parse("IDX_I:13")
+    repo, spy, env, monitor = await ban_list_monitor({"NIFTY": nifty}.get)
 
     await monitor.step()
+    assert repo.reads == 1  # the first pass retries at once
+    env.clock.advance(BAN_LIST_RETRY_S)
     await monitor.step()
-    assert repo.reads == 2  # retried on each pass while unread
+    assert repo.reads == 2  # and again once the window has passed
     assert spy.seen[-1].ban_list is None and monitor.ban_list(env.clock.at) is None
 
     repo.down = False
+    env.clock.advance(BAN_LIST_RETRY_S)
     await monitor.step()
+    env.clock.advance(BAN_LIST_RETRY_S)
     await monitor.step()
-    assert repo.reads == 3  # read once, then not again
+    assert repo.reads == 3  # read once, then not again (although a retry would be due)
     assert spy.seen[-1].ban_list == {"XYZ"} and monitor.ban_list(env.clock.at) == {"XYZ"}
     assert spy.seen[-1].spot_key("NIFTY") == nifty and spy.seen[-1].spot_key("XYZ") is None
+
+
+async def test_an_unread_ban_list_is_retried_at_most_once_per_window() -> None:
+    """A hung or failing database must not slow every pass: within ``BAN_LIST_RETRY_S`` of a retry,
+    passes make no further read; exactly that long after it, the next pass reads again."""
+    repo, _, env, monitor = await ban_list_monitor()
+    await monitor.step()
+    assert repo.reads == 1
+
+    for _ in range(BAN_LIST_RETRY_S - 1):  # a pass a second, up to one second short of the window
+        env.clock.advance(1)
+        await monitor.step()
+    assert repo.reads == 1
+    assert monitor.ban_list(env.clock.at) is None  # still unread: F&O entries still refused
+
+    env.clock.advance(1)  # exactly BAN_LIST_RETRY_S after the last retry
+    await monitor.step()
+    assert repo.reads == 2
+    await monitor.step()
+    assert repo.reads == 2  # and the window starts again
+
+
+async def test_a_retry_that_fails_unexpectedly_still_starts_the_window() -> None:
+    """The retry time is stamped before the read, so a read that fails with an unexpected error
+    (not the ``PersistenceError`` the service absorbs) is rate-limited all the same."""
+
+    class Broken(BanListsDown):
+        async def load_ban_list(self, account_id: str, from_date: date) -> list[StoredBanList]:
+            self.reads += 1
+            raise RuntimeError("driver fault")
+
+    repo = Broken()
+    spy = SeeContext()
+    env = await Env(repo=repo, checks=(spy,)).ready()
+    ban_lists = BanListService(
+        account_id="main", repository=repo, results=MemoryRepository(), now=env.clock
+    )
+    monitor = RiskMonitor(
+        account_id="main", limits=env.limits, daybook=env.daybook, repository=repo,
+        audit=env.audit, instruments=instrument_of, checks=(spy,), subscribed=lambda: True,
+        interval_s=1.0, persist_interval_s=10.0, ban_lists=ban_lists, now=env.clock,
+    )  # fmt: skip
+    monitor.bind(env.trading)
+
+    await monitor.step()  # the read raises; the pass fails and is logged, the monitor carries on
+    env.clock.advance(1)
+    await monitor.step()
+
+    assert repo.reads == 1
 
 
 async def test_a_hung_ban_list_read_never_delays_the_flatten_of_a_locked_day() -> None:

@@ -91,7 +91,7 @@
 
 ## 10. Integration
 
-- [ ] 10.1 Run the integration suite against Redis and Postgres:
+- [x] 10.1 Run the integration suite against Redis and Postgres:
   - the day-state columns persist and merge one-way across a `kill -9` and restart;
   - a target halt survives a restart;
   - the ban list fails closed with Postgres unreachable and recovers when it returns;

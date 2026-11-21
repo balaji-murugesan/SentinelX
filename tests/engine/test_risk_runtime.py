@@ -36,6 +36,7 @@ from engine.risk.checks.registry import continuous_checks, default_checks
 from engine.risk.decision import Decision, RiskContext, kill
 from engine.risk.kill import OWN_SOURCES
 from engine.risk.limits import RULES, TIGHTEN_ONLY
+from engine.risk.monitor import BAN_LIST_RETRY_S
 from engine.risk.repository import StoredBanList
 from engine.risk.runtime import RiskRuntime
 from tests.engine.risk_builders import NOW, OPTION, TODAY, fill, instrument_of, position
@@ -560,6 +561,10 @@ async def test_ban_lists_unreadable_at_start_refuse_fno_entries_until_the_monito
     assert not env.runtime.ban_lists.read
 
     repo.down = False
+    await env.runtime.monitor.step()
+    assert not env.runtime.ban_lists.read  # the retry is rate-limited: not due yet
+    env.clock.at += timedelta(seconds=BAN_LIST_RETRY_S)
+    env.tick()  # the feed is alive meanwhile
     await env.runtime.monitor.step()  # the retry
     assert env.runtime.ban_lists.read
     env.tick()
