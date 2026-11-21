@@ -15,11 +15,14 @@ from typing import Any
 import pytest
 from structlog.testing import capture_logs
 
-from contracts.commands import CommandResult, KillSwitch, PlaceOrder, SetRiskLimits
+from contracts.commands import CommandResult, KillSwitch, PlaceOrder, SetBanList, SetRiskLimits
+from contracts.market import Instrument, InstrumentKey
 from contracts.orders import Order, OrderSide, OrderType, ProductType
 from contracts.settings import load_settings
 from contracts.snapshot import HaltLevel, Snapshot
+from engine.broker.adapter import BrokerRejected
 from engine.config import EngineSettings
+from engine.market_data.clock import ist_date
 from engine.market_data.provider import Tick
 from engine.orders.commands import CommandConsumer
 from engine.orders.intent import PROTECTIVE_STOP_SOURCE, RESERVED_SOURCES
@@ -27,11 +30,14 @@ from engine.orders.snapshot import SnapshotWriter
 from engine.persistence.repository import PersistenceError
 from engine.positions.book import position_id
 from engine.risk import runtime as runtime_module
+from engine.risk.checks.flow import REJECT_BREAKER
 from engine.risk.checks.protection import UNPROTECTED
 from engine.risk.checks.registry import continuous_checks, default_checks
 from engine.risk.decision import Decision, RiskContext, kill
 from engine.risk.kill import OWN_SOURCES
 from engine.risk.limits import RULES, TIGHTEN_ONLY
+from engine.risk.monitor import BAN_LIST_RETRY_S
+from engine.risk.repository import StoredBanList
 from engine.risk.runtime import RiskRuntime
 from tests.engine.risk_builders import NOW, OPTION, TODAY, fill, instrument_of, position
 from tests.engine.risk_fakes import MemoryRiskRepository
@@ -62,14 +68,23 @@ class Env:
         *,
         risk_repo: MemoryRiskRepository | None = None,
         at: datetime = NOW,
+        ban_list: frozenset[str] | None = frozenset(),
+        spot_of: Callable[[str], Instrument | None] | None = None,
     ) -> None:
         self.clock = Clock(at)
         self.settings = settings_for(monkeypatch, tmp_path)
         self.trading_repo = MemoryRepository()
         self.risk_repo = risk_repo or MemoryRiskRepository()
+        # Today's F&O ban list, stored and empty unless a test says otherwise (None: none stored):
+        # without one every F&O entry is refused by the instrument policy (fail closed).
+        if ban_list is not None:
+            self.risk_repo.ban_lists[("main", ist_date(at))] = StoredBanList(
+                ist_date(at), ban_list, at
+            )
         self.runtime = RiskRuntime(
             settings=self.settings, repository=self.trading_repo, risk_repository=self.risk_repo,
             instruments=instrument_of, subscribed=lambda: True, now=self.clock,
+            **({} if spot_of is None else {"spot_of": spot_of}),
         )  # fmt: skip
         self.adapter = StopAdapter()
         self.service, _, _ = build(
@@ -154,7 +169,8 @@ def test_the_engine_registers_every_check_once() -> None:
 
     assert max(Counter(type(c) for c in default_checks()).values()) == 1
     assert Counter(c.name for c in continuous_checks()) == {
-        "equity_floor": 1, "stale_data": 2, "catastrophic_stop": 1,
+        "equity_floor": 1, "stale_data": 2, "catastrophic_stop": 1, "reject_breaker": 1,
+        "profit_target": 1,
     }  # fmt: skip
     assert max(Counter(type(c) for c in continuous_checks()).values()) == 1
 
@@ -438,9 +454,350 @@ async def test_the_snapshot_carries_the_risk_block_and_it_round_trips(
     assert Snapshot.model_validate_json(snapshot.model_dump_json()) == snapshot
 
 
+async def test_the_snapshot_shows_the_days_gross_entry_lots_and_it_round_trips(
+    env_factory: Callable[..., Env],
+) -> None:
+    """Spec lot-caps "Snapshot shows the count": 6 lots allowed today (in 3 entries), then one
+    more 1-lot entry through the gate, shows 7 gross lots and 4 entries."""
+    from engine.risk.state import DayState
+
+    repo = MemoryRiskRepository()
+    await repo.save_day(DayState("main", TODAY, NOW, entries_today=3, entry_lots_today=6))
+    env = await env_factory(risk_repo=repo).ready()
+    assert (await env.entry()).accepted  # 65 units of the test option: one lot
+    writer = SnapshotWriter(
+        None,  # type: ignore[arg-type]
+        env.service,
+        _Subscription(),  # type: ignore[arg-type]
+        account_id="main",
+        interval_s=1,
+        now=env.clock,
+        risk=env.runtime.status,
+    )
+
+    snapshot = Snapshot.model_validate_json(writer.build().model_dump_json())
+
+    assert snapshot.risk is not None
+    assert (snapshot.risk.entry_lots_today, snapshot.risk.entries_today) == (7, 4)
+
+
 class _Subscription:
     def get_nowait(self) -> None:
         return None
+
+
+# ---- the F&O ban list and the instrument policy (add-risk-guards group 7) ---------------------
+
+
+async def test_without_todays_ban_list_fno_entries_wait_for_one_and_exits_never_do(
+    env_factory: Callable[..., Env],
+) -> None:
+    """Instrument-policy "Morning without a list" through the assembly, then the list is loaded
+    with the ``SetBanList`` command: the snapshot shows it, and the next entry goes through."""
+    env = await env_factory(ban_list=None).ready()
+    held = position(OPTION, 65, "200.00")
+
+    refused = await env.entry()
+    status = env.runtime.status()
+    assert not refused.accepted and (refused.reason or "").startswith("RISK_BAN_LIST_MISSING")
+    assert status is not None and not status.ban_list_loaded
+
+    env.service.positions[position_id(held)] = held
+    exit_ = await env.service.place(
+        PlaceOrder(
+            command_id="x", idempotency_key="x", account_id="main", source="cli", sent_at=NOW,
+            key=OPTION, side=OrderSide.SELL, quantity=65, product=ProductType.INTRADAY,
+            order_type=OrderType.LIMIT, limit_price=D("199.00"),
+        )
+    )  # fmt: skip
+    assert exit_.accepted  # a missing ban list never refuses an exit
+    del env.service.positions[position_id(held)]
+
+    loaded = await env.runtime.ban_lists.set_ban_list(
+        SetBanList(
+            command_id="b", idempotency_key="b", account_id="main", source="cli", sent_at=NOW,
+            trade_date=TODAY, symbols=[],
+        )
+    )  # fmt: skip
+    status = env.runtime.status()
+    assert loaded.accepted and status is not None and status.ban_list_loaded
+    assert Snapshot.model_validate_json(
+        Snapshot(
+            account_id="main", taken_at=NOW, open_orders=[], positions=[], risk=status
+        ).model_dump_json()
+    ).risk == status  # fmt: skip
+    assert (await env.entry()).accepted
+
+
+async def test_a_banned_underlying_is_refused_through_the_assembly(
+    env_factory: Callable[..., Env],
+) -> None:
+    env = await env_factory(ban_list=frozenset({"NIFTY"})).ready()
+
+    refused = await env.entry()
+
+    assert not refused.accepted and (refused.reason or "").startswith("RISK_FNO_BAN")
+
+
+async def test_ban_lists_unreadable_at_start_refuse_fno_entries_until_the_monitor_reads_them(
+    env_factory: Callable[..., Env],
+) -> None:
+    """Instrument-policy "Storage down at start": the start does not wait for the ban lists, F&O
+    entries are refused meanwhile, and the monitor's pass reads them once storage is back."""
+
+    class BanListDown(MemoryRiskRepository):
+        down = True
+
+        async def load_ban_list(self, account_id: str, from_date: Any) -> Any:
+            if self.down:
+                raise PersistenceError("database unavailable")
+            return await super().load_ban_list(account_id, from_date)
+
+    repo = BanListDown()
+    env = await env_factory(risk_repo=repo).ready()  # the empty list for today is stored
+
+    refused = await env.entry()
+    assert not refused.accepted and (refused.reason or "").startswith("RISK_BAN_LIST_MISSING")
+    assert not env.runtime.ban_lists.read
+
+    repo.down = False
+    await env.runtime.monitor.step()
+    assert not env.runtime.ban_lists.read  # the retry is rate-limited: not due yet
+    env.clock.at += timedelta(seconds=BAN_LIST_RETRY_S)
+    env.tick()  # the feed is alive meanwhile
+    await env.runtime.monitor.step()  # the retry
+    assert env.runtime.ban_lists.read
+    env.tick()
+    assert (await env.entry()).accepted
+
+
+def test_the_spot_lookup_reaches_the_gate_and_the_monitor(
+    env_factory: Callable[..., Env],
+) -> None:
+    """The runtime turns ``InstrumentMaster.spot_of`` into the context's ``spot_key`` for both
+    context builders; without it no spot is known (strike distance fails closed)."""
+    nifty = Instrument(
+        key=InstrumentKey.parse("IDX_I:13"), trading_symbol="NIFTY", display_name="Nifty 50",
+        underlying_symbol="NIFTY", instrument_type="INDEX", lot_size=1, tick_size=D("0.05"),
+    )  # fmt: skip
+    wired = env_factory(spot_of={"NIFTY": nifty}.get).runtime
+    bare = env_factory().runtime
+
+    assert wired.gate._spot_key("NIFTY") == nifty.key  # type: ignore[attr-defined]
+    assert wired.monitor._spot_key("NIFTY") == nifty.key  # type: ignore[attr-defined]
+    assert wired.gate._spot_key("XYZ") is None  # type: ignore[attr-defined]
+    assert bare.gate._spot_key("NIFTY") is None  # type: ignore[attr-defined]
+
+
+async def test_broker_rejections_trip_the_breaker_through_the_assembly(
+    env_factory: Callable[..., Env],
+) -> None:
+    """Spec "Margin rejection storm" end to end: the real order service reports each broker refusal
+    to the runtime's window; the entry right after the third is refused by the gate's breaker at
+    once, the monitor's next pass holds the halt and logs one critical alert, an exit is still
+    accepted (and its rejection counts), the snapshot shows the count, and five minutes later
+    the breaker has cleared by itself."""
+    env = await env_factory().ready({**BASE, "reject_breaker_n": 3, "min_entry_gap_s": 1})
+    sent: list[Order] = []
+
+    async def margin_shortfall(order: Order) -> Any:
+        sent.append(order)
+        raise BrokerRejected("RMS: insufficient margin")
+
+    env.adapter.place = margin_shortfall  # type: ignore[method-assign]
+    for _ in range(3):
+        env.clock.at += timedelta(seconds=2)
+        await env.runtime.monitor.step()
+        env.tick()
+        assert (await env.entry()).accepted  # sent; the broker refused it
+    assert len(env.runtime.rejections.recent(env.clock.at)) == 3
+
+    env.clock.at += timedelta(seconds=2)
+    env.tick()
+    refused = await env.entry()  # before the monitor's next pass: the pre-trade breaker
+    assert not refused.accepted and (refused.reason or "").startswith(REJECT_BREAKER)
+    assert len(sent) == 3  # the refused entry never reached the broker
+
+    with capture_logs() as logs:
+        await env.runtime.monitor.step()
+        await env.runtime.monitor.step()
+    trips = [e for e in logs if e.get("code") == REJECT_BREAKER]
+    assert [e["log_level"] for e in trips] == ["critical"]  # once, though two passes saw it
+
+    held = position(OPTION, 65, "200.00")
+    env.service.positions[position_id(held)] = held
+    exit_ = await env.service.place(
+        PlaceOrder(
+            command_id="x", idempotency_key="x", account_id="main", source="cli", sent_at=NOW,
+            key=OPTION, side=OrderSide.SELL, quantity=65, product=ProductType.INTRADAY,
+            order_type=OrderType.LIMIT, limit_price=D("199.00"),
+        )
+    )  # fmt: skip
+    assert exit_.accepted  # spec "Exit while tripped"; the broker refused it, which counts too
+    writer = SnapshotWriter(
+        None,  # type: ignore[arg-type]
+        env.service,
+        _Subscription(),  # type: ignore[arg-type]
+        account_id="main",
+        interval_s=1,
+        now=env.clock,
+        risk=env.runtime.status,
+    )
+    snapshot = Snapshot.model_validate_json(writer.build().model_dump_json())
+    assert snapshot.risk is not None and snapshot.risk.broker_rejections_5m == 4
+
+    env.clock.at += timedelta(minutes=5, seconds=1)  # every rejection is now over 300 s old
+    risk = env.runtime.status()
+    assert risk is not None and risk.broker_rejections_5m == 0
+    # Cleared by itself: the next pass drops the standing halt and an entry goes through. (The held
+    # position is taken away first: without its stop, its own halt would refuse the entry.)
+    del env.service.positions[position_id(held)]
+    env.tick()  # a live feed: five silent minutes would halt entries for their own reason
+    await env.runtime.monitor.step()
+    assert env.runtime.monitor.entry_halt() is None
+    after = await env.entry()
+    assert not (after.reason or "").startswith(REJECT_BREAKER)
+    assert after.accepted, after.reason  # sent again (and this broker still refuses it)
+    assert len(sent) == 5  # the three entries, the exit, and this one
+
+
+# ---- the profit target (add-risk-guards task 9.2) ---------------------------------------------
+
+# A target of 500 confirmed on 2 consecutive passes. The test position is 65 units bought at 200:
+# at 210 its MTM_day is 650 less the exit charge, above the target.
+TARGET = {**BASE, "daily_profit_target": "500", "target_confirm_ticks": 2}
+
+
+async def reach_the_target(env: Env) -> CommandResult:
+    """From a ready engine: a resting entry, then an open position whose MTM_day stays above the
+    target for two monitor passes. Returns the entry's result."""
+    entry = await env.entry()  # acknowledged, and nothing fills it: a pending entry
+    assert entry.accepted, entry.reason
+    held = position(OPTION, 65, "200.00", realized_pnl=D("0"))
+    env.service.positions[position_id(held)] = held
+    env.trading_repo.positions[(held.account_id, str(held.key), held.product.value)] = held
+    for _ in range(2):
+        env.clock.at += timedelta(seconds=1)
+        env.tick("210")
+        await env.runtime.monitor.step()
+    return entry
+
+
+async def test_a_confirmed_target_flattens_the_book_through_the_assembly(
+    env_factory: Callable[..., Env],
+) -> None:
+    """Spec "Target flattens the book" through the real assembly: the halt is stored, the pending
+    entry is cancelled and the position is exited by the kill switch's flattener; spec "Snapshot
+    after a target halt": the risk block shows TARGET_HALT with its reason."""
+    env = await env_factory().ready(TARGET)
+
+    entry = await reach_the_target(env)
+
+    day = env.runtime.daybook.day()
+    assert day.halt_level is HaltLevel.TARGET_HALT
+    assert (day.halt_reason or "").startswith("RISK_TARGET_HALT")
+    stored = await env.risk_repo.load_day("main", TODAY)
+    assert stored is not None and stored.halt_level is HaltLevel.TARGET_HALT
+    assert ("cancel", entry.order_id) in env.adapter.events
+    await until(
+        lambda: any(
+            o.source == "risk-kill" and o.side is OrderSide.SELL for o in env.adapter.placed
+        )
+    )
+    status = env.runtime.status()
+    assert status is not None
+    snapshot = Snapshot.model_validate_json(
+        Snapshot(
+            account_id="main", taken_at=NOW, open_orders=[], positions=[], risk=status
+        ).model_dump_json()
+    )  # fmt: skip
+    assert snapshot.risk is not None and snapshot.risk.halt_level is HaltLevel.TARGET_HALT
+    assert (snapshot.risk.halt_reason or "").startswith("RISK_TARGET_HALT")
+    await env.abandon_flatten()
+
+
+async def test_after_a_target_halt_entries_are_refused_when_mtm_falls_back(
+    env_factory: Callable[..., Env],
+) -> None:
+    """Spec "MTM falls back": MTM_day falls well below the target (a loss of about 325), and an
+    entry is refused with RISK_HALTED_DAY."""
+    env = await env_factory().ready(TARGET)
+    await reach_the_target(env)
+
+    env.clock.at += timedelta(seconds=1)
+    env.tick("195")
+    await env.runtime.monitor.step()
+    refused = await env.entry()
+
+    mtm = env.runtime.monitor.mtm_day()
+    assert mtm is not None and mtm < 0
+    assert not refused.accepted and (refused.reason or "").startswith("RISK_HALTED_DAY")
+    assert env.runtime.daybook.day().halt_level is HaltLevel.TARGET_HALT
+    await env.abandon_flatten()
+
+
+async def test_a_blind_locked_day_moves_up_to_the_target_halt_when_the_target_is_confirmed(
+    env_factory: Callable[..., Env],
+) -> None:
+    """TARGET_HALT ranks above MTM_BLIND (profit-target "Reaching the target locks the day at
+    TARGET_HALT"): a day already locked by a blind book, whose target is then confirmed, moves up
+    to TARGET_HALT. The snapshot's risk block and the audit carry the target's reason."""
+    from engine.risk.state import DayState
+
+    repo = MemoryRiskRepository()
+    await repo.save_day(
+        DayState("main", TODAY, NOW, halt_level=HaltLevel.MTM_BLIND, halt_reason="book is blind")
+    )
+    env = env_factory(risk_repo=repo)
+    held = position(OPTION, 65, "200.00", realized_pnl=D("0"))
+    env.service.positions[position_id(held)] = held
+    env.trading_repo.positions[(held.account_id, str(held.key), held.product.value)] = held
+    await env.ready(TARGET)  # the price is 200; the blind lock's flatten is under way
+
+    for _ in range(2):
+        env.clock.at += timedelta(seconds=1)
+        env.tick("210")  # 650 less the exit charge: above the target of 500
+        await env.runtime.monitor.step()
+    await env.runtime.audit.drain()
+
+    status = env.runtime.status()
+    assert status is not None and status.halt_level is HaltLevel.TARGET_HALT
+    assert (status.halt_reason or "").startswith("RISK_TARGET_HALT")
+    stored = await repo.load_day("main", TODAY)
+    assert stored is not None and stored.halt_level is HaltLevel.TARGET_HALT
+    assert any(e.reason_code == "RISK_TARGET_HALT" for e in repo.events)
+    await env.abandon_flatten()
+
+
+async def test_a_restart_keeps_the_target_halt_and_resumes_the_flatten(
+    env_factory: Callable[..., Env],
+) -> None:
+    """Spec "Restart keeps the halt": a new engine on the same database, the position still open
+    after reconciliation. Entries are refused and the flatten starts again on its first pass,
+    even with MTM_day back below the target. (That the confirmation count itself does not survive
+    a restart is a monitor test: test_risk_monitor.py.)"""
+    first = await env_factory().ready(TARGET)
+    await reach_the_target(first)
+    await first.abandon_flatten()  # the process dies mid-flatten
+
+    second = env_factory(risk_repo=first.risk_repo)  # the same database
+    held = position(OPTION, 65, "200.00", realized_pnl=D("0"))
+    second.service.positions[position_id(held)] = held
+    second.trading_repo.positions[(held.account_id, str(held.key), held.product.value)] = held
+    await second.runtime.start(second.stop)
+    await second.runtime.monitor.step()  # the first pass: it asks for the flatten at once
+    second.tick("195")  # the price fell: MTM_day is a loss, far below the target now
+    await second.runtime.monitor.step()
+
+    assert second.runtime.daybook.day().halt_level is HaltLevel.TARGET_HALT
+    await until(
+        lambda: any(
+            o.source == "risk-kill" and o.side is OrderSide.SELL for o in second.adapter.placed
+        )
+    )
+    refused = await second.entry()
+    assert not refused.accepted and (refused.reason or "").startswith("RISK_HALTED_DAY")
+    await second.abandon_flatten()
 
 
 # ---- the command consumer's kill hook --------------------------------------------------------
@@ -626,6 +983,25 @@ async def test_a_limits_edit_is_judged_against_the_days_real_peak_and_floor(
 
     assert not result.accepted and (result.reason or "").startswith(TIGHTEN_ONLY)
     assert "lower today's floor" in (result.reason or "")
+
+
+@pytest.mark.parametrize("exposure", [True, False])
+async def test_a_limits_edit_is_replayed_with_the_days_expiry_exposure_flag(
+    env_factory: Callable[..., Env], exposure: bool
+) -> None:
+    """add-risk-guards task 8.2, through the assembly: the runtime hands the day book's expiry
+    flag to the re-simulation. At a peak of 5,000 the expiry giveback (600) holds the floor at
+    4,400; tightening ``lock_at`` leaves it there, so the edit passes with the flag on, and would
+    look like a drop to the base giveback's 4,000 with it off."""
+    expiry_abs = edit(giveback_pct=None, giveback_abs_expiry="600")
+    env = await env_factory().ready(expiry_abs)
+    if exposure:
+        env.runtime.daybook.note_expiry_exposure()
+    env.runtime.daybook.ratchet(D(5000), D(4400))
+
+    result = await env.send_limits({**expiry_abs, "lock_at": "300"}, key="lock")
+
+    assert result.accepted is exposure, result.reason
 
 
 async def test_a_floor_breach_through_the_assembly_locks_the_day_and_sends_the_exit(

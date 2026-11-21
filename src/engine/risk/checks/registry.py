@@ -10,10 +10,14 @@ nothing else, and a test pins that their names match the rule table in ``engine.
 
 from engine.risk.checks.counters import Cooldown, MaxTrades
 from engine.risk.checks.exposure import EntryCutoff, FloorHeadroom, OpenPositions
+from engine.risk.checks.flow import EntryPacing, RejectBreaker
+from engine.risk.checks.lots import LotCaps
+from engine.risk.checks.policy import InstrumentPolicy
 from engine.risk.checks.prices import PriceSanity, StaleQuote
 from engine.risk.checks.protection import Unprotected
 from engine.risk.checks.stale import FeedDown, FloorBreach, MtmBlind
 from engine.risk.checks.stops import InitialStop, PerTradeRisk, StopDistance
+from engine.risk.checks.target import ProfitTarget
 from engine.risk.decision import ContinuousCheck, PreTradeCheck
 
 
@@ -29,11 +33,17 @@ def default_checks() -> list[PreTradeCheck]:
         OpenPositions(),
         EntryCutoff(),
         FloorHeadroom(),
+        # add-risk-guards, appended (so the rules above keep their tie-break order):
+        LotCaps(),
+        EntryPacing(),
+        RejectBreaker(),
+        InstrumentPolicy(),
     ]
 
 
 def continuous_checks() -> list[ContinuousCheck]:
     """The checks the monitor runs on its timer, in the order they break a tie: the floor first
-    (a KILL outranks everything anyway), then a silent feed, a blind book and an unprotected
-    position."""
-    return [FloorBreach(), FeedDown(), MtmBlind(), Unprotected()]
+    (a KILL outranks everything anyway), then a silent feed, a blind book, an unprotected
+    position and (add-risk-guards, appended) the rejection breaker and the profit target. The
+    profit target is continuous only: no order can reach it, so it is not in ``default_checks``."""
+    return [FloorBreach(), FeedDown(), MtmBlind(), Unprotected(), RejectBreaker(), ProfitTarget()]

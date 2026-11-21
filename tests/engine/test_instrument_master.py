@@ -84,6 +84,95 @@ def test_search_ranking(master: InstrumentMaster) -> None:
     ]
 
 
+# ---- the spot instrument of an underlying (add-risk-guards task 7.1) ----------------------
+
+
+@pytest.mark.parametrize(("underlying", "spot"), [("NIFTY", "IDX_I:13"), ("BANKNIFTY", "IDX_I:25")])
+def test_each_index_options_underlying_maps_to_exactly_one_index_row(
+    master: InstrumentMaster, underlying: str, spot: str
+) -> None:
+    """Against the recorded Dhan master: every option on the underlying names it with the same
+    text as exactly one index row (BANKNIFTY, not the display name "Nifty Bank"), so no alias
+    table is needed."""
+    options = [i for i in INSTRUMENTS if i.option_type is not None]
+    on_it = [o for o in options if o.underlying_symbol == underlying]
+    rows = [
+        i
+        for i in INSTRUMENTS
+        if i.key.segment.value == "IDX_I" and i.underlying_symbol == underlying
+    ]
+
+    assert on_it  # the fixture has options on it
+    assert len(rows) == 1
+    found = master.spot_of(underlying)
+    assert found is not None and str(found.key) == spot
+    assert all(master.spot_of(o.underlying_symbol) == found for o in on_it)
+
+
+# Rows copied unchanged from Dhan's api-scrip-master-detailed.csv downloaded on 2026-11-21. They are
+# kept apart from the main fixture so its search-ranking and row-count tests do not move. In that
+# full download exactly one IDX_I row carries the underlying symbol FINNIFTY (security 27); the
+# other financial-services indices have their own symbols, and one of them (469) is included here
+# as a decoy, so the lookup must match the symbol exactly, not by a name that merely looks alike.
+FINNIFTY_FIXTURE = FIXTURE.with_name("instruments_finnifty.csv")
+
+
+def test_finnifty_options_map_to_the_finnifty_index_row() -> None:
+    rows = parse_instrument_file(FINNIFTY_FIXTURE).instruments
+    m = InstrumentMaster()
+    m.replace([*INSTRUMENTS, *rows], AS_OF)
+    option = m.get(InstrumentKey.parse("NSE_FNO:57153"))  # FINNIFTY 26550 CE
+    assert option is not None and option.underlying_symbol == "FINNIFTY"
+
+    spot = m.spot_of(option.underlying_symbol)
+
+    assert spot is not None and str(spot.key) == "IDX_I:27"
+    assert m.spot_of("FINNIFTY") == spot
+
+
+def test_a_stock_options_spot_is_its_equity_row(master: InstrumentMaster) -> None:
+    option = master.get(InstrumentKey.parse("NSE_FNO:106474"))  # RELIANCE 720 CE
+    assert option is not None
+
+    spot = master.spot_of(option.underlying_symbol)
+
+    assert spot is not None and str(spot.key) == "NSE_EQ:2885"
+
+
+def test_spot_lookup_is_case_insensitive_and_misses_are_none(master: InstrumentMaster) -> None:
+    found = master.spot_of("nifty")
+    assert found is not None and str(found.key) == "IDX_I:13"
+    assert master.spot_of("NOSUCH") is None
+    assert InstrumentMaster().spot_of("NIFTY") is None  # nothing loaded
+
+
+def test_an_index_row_wins_over_an_equity_row_of_the_same_name() -> None:
+    index = Instrument(
+        key=InstrumentKey.parse("IDX_I:99"), trading_symbol="ABC", display_name="ABC Index",
+        underlying_symbol="ABC", instrument_type="INDEX", lot_size=1, tick_size=Decimal("0.05"),
+    )  # fmt: skip
+    stock = index.model_copy(update={"key": InstrumentKey.parse("NSE_EQ:98")})
+    m = InstrumentMaster()
+    m.replace([stock, index], AS_OF)
+
+    assert m.spot_of("ABC") == index
+
+
+def test_two_index_rows_with_one_name_are_ambiguous_and_never_guessed() -> None:
+    """Fail closed: with two candidates the lookup answers None, and it does not fall back to an
+    equity row of that name either."""
+    first = Instrument(
+        key=InstrumentKey.parse("IDX_I:91"), trading_symbol="ABC", display_name="ABC 1",
+        underlying_symbol="ABC", instrument_type="INDEX", lot_size=1, tick_size=Decimal("0.05"),
+    )  # fmt: skip
+    second = first.model_copy(update={"key": InstrumentKey.parse("IDX_I:92")})
+    stock = first.model_copy(update={"key": InstrumentKey.parse("NSE_EQ:93")})
+    m = InstrumentMaster()
+    m.replace([first, second, stock], AS_OF)
+
+    assert m.spot_of("ABC") is None
+
+
 @pytest.mark.parametrize(("text", "limit"), [("", 5), ("   ", 5), ("nifty", 0)])
 def test_search_empty(master: InstrumentMaster, text: str, limit: int) -> None:
     assert master.search(text, limit) == []

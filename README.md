@@ -164,10 +164,26 @@ docker compose exec engine python -m cli risk status        # today's P&L, floor
 docker compose exec engine python -m cli risk size NSE_FNO:53720 BUY --entry 100 --stop 90
 ```
 
-- [`docs/risk-limits.example.json`](docs/risk-limits.example.json) is a complete file with **example values, not a recommendation**. Copy it and edit your copy. Money and percentages are strings (`"3000"`), counts and seconds are numbers, and keys starting with `_` are comments.
+- [`docs/risk-limits.example.json`](docs/risk-limits.example.json) is a complete file with **example values, not a recommendation**. Copy it and edit your copy. Money and percentages are strings (`"3000"`), counts, seconds and lots are numbers, symbol lists are lists of strings (`["NIFTY"]`), `null` leaves an optional limit unset, and keys starting with `_` are comments.
+- **Required since the risk guards (S3):** `max_open_lots_per_underlying`, `max_open_lots_total`, `max_gross_lots_per_day` (in contract lots of every segment, F&O and commodity alike; only cash equity holdings and orders do not count), `max_entries_per_minute`, `min_entry_gap_s` and `reject_breaker_n`. The profit target (`daily_profit_target`, which needs `target_confirm_ticks` with it), the instrument policy (`min_premium`, `max_strike_distance_pct`, `allowed_underlyings`, `denied_underlyings`) and the `..._expiry` overrides for contracts expiring today are optional; an override must be at least as strict as its base value.
+- **Upgrading to the risk guards:** limits stored before them lack the new required keys, so the engine treats them as unusable and refuses every entry (`RISK_LIMITS_INVALID`; exits still work). A broken stored file can only be replaced outside market hours, so deploy after the close and send a new limits file with the new keys before the next open.
+- `max_strike_distance_pct` needs a fresh price for the option's underlying: list its index (or stock) in `FEED_INSTRUMENTS`, or every option entry is refused while the limit is set.
 - **While the market is open (09:15-15:30 IST) an edit may only tighten** (a lower loss limit, an earlier cut-off, fewer trades); loosening is refused with `TIGHTEN_ONLY`, and the answer names the keys. Outside market hours any valid edit is accepted. An edit is applied whole or not at all.
 - An entry needs `--stop PRICE` (where the trade is wrong): the engine sizes the risk from it and places a wide catastrophic stop at the broker once the entry fills.
 - **`kill --yes`** cancels pending entries and exits every position, and refuses entries until the next trading day. There is no intraday undo, and `recovery resume` does not clear it.
+
+### Morning checklist: today's F&O ban list
+
+Without a ban list loaded for today, **every NSE/BSE F&O entry is refused** (`RISK_BAN_LIST_MISSING`); exits, cash equity and commodity entries are not affected. Before 09:15 IST (or the evening before, with `--date`), put the exchange's list in a text file, one underlying per line (blank lines and lines starting with `#` are ignored; an empty file means "no bans today"), and load it:
+
+```bash
+docker compose cp ban.txt engine:/tmp/ban.txt
+docker compose exec engine python -m cli risk set-ban-list --file /tmp/ban.txt   # today (IST)
+docker compose exec engine python -m cli risk set-ban-list --file /tmp/ban.txt --date 2026-11-24
+docker compose exec engine python -m cli risk status        # shows whether today's list is loaded
+```
+
+During market hours today's list may only grow (a list that drops a name is refused with `TIGHTEN_ONLY`). A past date is refused.
 
 ## Each morning: fresh Dhan token
 

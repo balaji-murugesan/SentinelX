@@ -8,7 +8,8 @@ needs the service's orders and positions. So ``RiskRuntime(...)`` builds everyth
 need the service (limits, day book, audit, monitor, gate), the caller builds the service with
 ``runtime.gate``, and ``attach(service)`` then builds what needs the service (stops, flattener,
 kill switch, square-off, sizing), binds the gate and monitor to it and registers the two fill
-listeners. Think of it as constructor injection where one dependency is supplied afterwards.
+listeners and the rejection listener. Think of it as constructor injection where one dependency
+is supplied afterwards.
 
 What runs, and what happens if it crashes (``engine.main`` supervises each with ``_keep_alive``):
   * ``start()``           once, after recovery: loads the limits and the day, seeds the day book
@@ -47,6 +48,7 @@ from engine.orders.service import OrderService
 from engine.persistence.repository import PersistenceError, TradingRepository
 from engine.positions.book import PositionId
 from engine.risk.audit import RiskAudit
+from engine.risk.banlist import BanListService
 from engine.risk.checks.registry import continuous_checks, default_checks
 from engine.risk.daybook import DayBook
 from engine.risk.decision import Decision
@@ -54,6 +56,7 @@ from engine.risk.gate import RiskEngine
 from engine.risk.kill import ChaseFlattener, KillSwitch, SquareOff
 from engine.risk.limits_service import LimitsService
 from engine.risk.monitor import RiskMonitor
+from engine.risk.rejections import RejectionWindow
 from engine.risk.repository import RiskRepository
 from engine.risk.sizing import SizingService
 from engine.risk.stops import CatastrophicStops
@@ -74,8 +77,12 @@ class RiskRuntime:
         risk_repository: RiskRepository,
         instruments: Callable[[InstrumentKey], Instrument | None],
         subscribed: Callable[[], bool],
+        spot_of: Callable[[str], Instrument | None] = lambda symbol: None,
         now: Callable[[], datetime] = utc_now,
     ) -> None:
+        """``spot_of`` is ``InstrumentMaster.spot_of``: an underlying's index or equity row, whose
+        fresh price the instrument policy measures an option's strike distance from. The default
+        knows none, which refuses option entries while a strike distance is set (fail closed)."""
         account = settings.account_id
         self._account_id = account
         self._repository = repository
@@ -87,14 +94,27 @@ class RiskRuntime:
         self.sizing: SizingService | None = None
 
         self.audit = RiskAudit(risk_repository)
+        # The broker rejections of the last 5 minutes: fed by the order service (``attach``), read
+        # by the rejection breaker in the gate and the monitor, and counted in the snapshot.
+        self.rejections = RejectionWindow()
         self.limits = LimitsService(
             account_id=account, repository=risk_repository, results=repository,
-            figures=self._figures, now=now,
+            figures=self._figures, expiry_exposure=self._expiry_exposure, now=now,
         )  # fmt: skip
         self.daybook = DayBook(
             account_id=account, repository=risk_repository, limits=lambda: self.limits.current,
             now=now,
         )  # fmt: skip
+        # The exchange's F&O ban lists: loaded at start, retried by the monitor while unread, set
+        # by the ``SetBanList`` command, read by the instrument policy through the monitor.
+        self.ban_lists = BanListService(
+            account_id=account, repository=risk_repository, results=repository, now=now
+        )
+
+        def spot_key(symbol: str) -> InstrumentKey | None:
+            spot = spot_of(symbol)
+            return None if spot is None else spot.key
+
         self.monitor = RiskMonitor(
             account_id=account, limits=self.limits, daybook=self.daybook,
             repository=risk_repository, audit=self.audit, instruments=instruments,
@@ -102,13 +122,13 @@ class RiskRuntime:
             interval_s=settings.risk_monitor_interval_s,
             persist_interval_s=settings.risk_persist_interval_s,
             on_kill=self._on_kill, ensure_flat=self._ensure_flat, lock_pending=self._lock_pending,
-            unprotected=self._unprotected,
-            now=now,
+            unprotected=self._unprotected, rejections=self.rejections.recent,
+            ban_lists=self.ban_lists, spot_key=spot_key, now=now,
         )  # fmt: skip
         self.gate = RiskEngine(
             account_id=account, mode=settings.mode, limits=self.limits, state=self.monitor,
             audit=self.audit, instruments=instruments, checks=default_checks(),
-            on_kill=self._request_kill, now=now,
+            on_kill=self._request_kill, spot_key=spot_key, now=now,
         )  # fmt: skip
         self._started = asyncio.Event()
 
@@ -127,8 +147,9 @@ class RiskRuntime:
             results=self._repository, now=self._now,
         )  # fmt: skip
         self.square_off = SquareOff(
-            limits=self.limits, service=service, flattener=flattener, now=self._now
-        )
+            limits=self.limits, service=service, flattener=flattener,
+            instruments=self._instruments, now=self._now,
+        )  # fmt: skip
         self.stops = CatastrophicStops(
             account_id=account, service=service, limits=self.limits,
             instruments=self._instruments, now=self._now,
@@ -142,6 +163,8 @@ class RiskRuntime:
         # fill (the listener runs inside the service's lock). Both run for every fill.
         service.add_fill_listener(self.daybook.on_fill)
         service.add_fill_listener(self.stops.on_fill)
+        # Every order the broker rejects goes into the window the rejection breaker reads.
+        service.add_rejection_listener(self.rejections.record)
 
     # ---- start-up, after recovery ------------------------------------------------------------
 
@@ -170,6 +193,9 @@ class RiskRuntime:
     async def _try_start(self) -> bool:
         if not await self.limits.load() or not await self.daybook.load():
             return False
+        # The ban lists do not hold up the start: while they are unread only F&O entries are
+        # refused (instrument-policy "Storage down at start"), and the monitor retries the read.
+        await self.ban_lists.load()
         # The stored book is read last, right before it is seeded, with no await in between: a fill
         # that lands while the awaits above run is already in the day book (``attach`` registered
         # its listener) and would be wiped by the seed if the book had been read before them.
@@ -245,6 +271,12 @@ class RiskRuntime:
         day = self.daybook.day()
         return day.peak, day.floor
 
+    def _expiry_exposure(self) -> bool:
+        """Today's expiry-exposure flag, for the same re-simulation: the floor is replayed with
+        the giveback the monitor ratchets it with. (Read only after ``_figures`` answered, so the
+        day is loaded; if it is not, the edit has already been refused.)"""
+        return self.daybook.unavailable(self._now()) is None and self.daybook.day().expiry_exposure
+
     # ---- the snapshot's risk block -----------------------------------------------------------
 
     def status(self) -> RiskStatus | None:
@@ -258,7 +290,10 @@ class RiskRuntime:
         return RiskStatus(
             mtm_day=self.monitor.mtm_day(), floor=day.floor, peak=day.peak,
             halt_level=day.halt_level, halt_reason=day.halt_reason,
-            entries_today=day.entries_today, loss_streak=day.loss_streak,
+            entries_today=day.entries_today, entry_lots_today=day.entry_lots_today,
+            loss_streak=day.loss_streak,
             cooldown_until=day.cooldown_until,
+            broker_rejections_5m=len(self.rejections.recent(self._now())),
+            ban_list_loaded=self.ban_lists.for_now(self._now()) is not None,
             unprotected=[PositionRef(key=k, product=prod) for _, k, prod in unprotected],
         )  # fmt: skip

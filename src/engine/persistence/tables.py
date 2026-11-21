@@ -12,6 +12,7 @@ Every table carries ``account_id`` (D-020); times are ``timestamptz`` (stored UT
 """
 
 import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import JSONB
 
 metadata = sa.MetaData()
 
@@ -144,7 +145,8 @@ risk_limits = sa.Table(
 # start fresh: that is the "post-close reset" (design §6). The columns that may only move one way
 # are written with GREATEST (see ``PostgresRiskRepository.save_day``), so a stale or out-of-order
 # write can never lower them. ``floor`` is NULL until limits exist; GREATEST ignores NULLs.
-# ``halt_level`` has no CHECK constraint on purpose: 20 is reserved for a level a later change adds.
+# ``halt_level`` has no CHECK constraint on purpose: a later change may add a level between the
+# existing ones (add-risk-guards added TARGET_HALT = 20 that way).
 risk_day_state = sa.Table(
     "risk_day_state",
     metadata,
@@ -160,6 +162,25 @@ risk_day_state = sa.Table(
     # SQL NULL (not JSON null) when unset, so COALESCE can keep the first value written.
     sa.Column("close_marks", sa.JSON(none_as_null=True)),
     sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    # Added by migration 0005 (add-risk-guards), all written with GREATEST. The server defaults
+    # fill rows stored before the migration. For a boolean GREATEST is OR (false < true).
+    sa.Column("entry_lots_today", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("last_entry_at", sa.DateTime(timezone=True)),
+    sa.Column("expiry_exposure", sa.Boolean, nullable=False, server_default=sa.false()),
+)
+
+# ---- risk guards (add-risk-guards, migration 0005) ------------------------------------------
+
+# The exchange's F&O ban list as the owner loaded it, one row per account and IST trading day.
+# ``symbols`` is a sorted JSON list of underlying names; an empty list means "no bans that day".
+# A missing row means "not loaded", which refuses every F&O entry for that day.
+risk_ban_list = sa.Table(
+    "risk_ban_list",
+    metadata,
+    sa.Column("account_id", sa.Text, primary_key=True),
+    sa.Column("trade_date", sa.Date, primary_key=True),
+    sa.Column("symbols", JSONB, nullable=False),
+    sa.Column("loaded_at", sa.DateTime(timezone=True), nullable=False),
 )
 
 # Append-only audit of every risk decision (risk-gate spec "Every risk decision is audited").

@@ -6,11 +6,14 @@
 fake with the same behaviour. Every failure surfaces as ``PersistenceError`` (reused from the
 trading repository), so callers have one thing to catch to fail closed.
 
-Three kinds of data live here:
+Four kinds of data live here:
   * limits   - the owner's risk limits, one document per account, versioned;
   * day state - peak, floor, halt and counters per account and day (see ``engine.risk.state``);
   * events   - the append-only audit of risk decisions. The database role used by the engine
-               can add events but never update or delete one.
+               can add events but never update or delete one;
+  * ban lists - the exchange's F&O ban list per account and IST trading day, as the owner loaded
+               it (add-risk-guards). Underlyings on it may not be entered in futures or options
+               that day, because the exchange lets traders only reduce positions in them.
 """
 
 from dataclasses import dataclass, field
@@ -66,6 +69,19 @@ class RiskEvent:
                 )
 
 
+@dataclass(frozen=True)
+class StoredBanList:
+    """One day's F&O ban list. An empty ``symbols`` means "no bans that day", which is different
+    from no stored list at all (that refuses every F&O entry)."""
+
+    trade_date: date  # the IST trading day it applies to
+    symbols: frozenset[str]  # underlying names, e.g. "XYZ"; a frozenset is an immutable set
+    loaded_at: datetime
+
+    def __post_init__(self) -> None:
+        require_aware("loaded_at", self.loaded_at)
+
+
 class RiskRepository(Protocol):
     async def load_limits(self, account_id: str) -> StoredLimits | None:
         """The stored limits, or None while the owner has not set any."""
@@ -97,4 +113,18 @@ class RiskRepository(Protocol):
 
     async def append_event(self, event: RiskEvent) -> None:
         """Add one audit record. There is deliberately no way to change or remove one."""
+        ...
+
+    async def load_ban_list(self, account_id: str, from_date: date) -> list[StoredBanList]:
+        """Every stored ban list dated ``from_date`` or later, earliest date first: today's list
+        and any loaded ahead for later days (a list is often loaded the evening before)."""
+        ...
+
+    async def save_ban_list(
+        self, account_id: str, trade_date: date, symbols: frozenset[str], at: datetime
+    ) -> StoredBanList:
+        """Store the list for that date, replacing any stored before, and return what is stored.
+
+        The repository only stores: whether a replacement is allowed (not a past date; during
+        market hours today's list may only grow) is the ban-list service's decision."""
         ...

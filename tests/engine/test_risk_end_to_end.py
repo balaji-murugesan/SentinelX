@@ -17,12 +17,14 @@ from engine.market_data.provider import Tick
 from engine.orders.service import OrderService
 from engine.positions.book import position_id
 from engine.risk.audit import RiskAudit
+from engine.risk.banlist import BanListService
 from engine.risk.checks.registry import default_checks
 from engine.risk.checks.stale import FeedDown, FloorBreach, MtmBlind
 from engine.risk.daybook import DayBook
 from engine.risk.gate import RiskEngine
 from engine.risk.limits_service import LimitsService
 from engine.risk.monitor import RiskMonitor
+from engine.risk.repository import StoredBanList
 from tests.engine.risk_builders import NOW, OPTION, TODAY, instrument_of, position
 from tests.engine.risk_fakes import MemoryRiskRepository
 from tests.engine.test_order_service import build
@@ -54,6 +56,7 @@ class Engine:
         risk_repo: MemoryRiskRepository | None = None,
         trading_repo: MemoryRepository | None = None,
         key_prefix: str = "k",
+        ban_list: frozenset[str] | None = frozenset(),
     ) -> None:
         self.clock = Clock()
         self.risk_repo = risk_repo or MemoryRiskRepository()  # the "database": pass it to restart
@@ -71,11 +74,20 @@ class Engine:
             now=self.clock,
         )  # fmt: skip
         self.audit = RiskAudit(self.risk_repo)
+        # Today's F&O ban list, loaded and empty unless a test says otherwise: without one every
+        # F&O entry is refused (add-risk-guards instrument policy), which is not what most of
+        # these tests are about.
+        if ban_list is not None:
+            self.risk_repo.ban_lists[("main", TODAY)] = StoredBanList(TODAY, ban_list, NOW)
+        self.ban_lists = BanListService(
+            account_id="main", repository=self.risk_repo, results=self.trading_repo,
+            now=self.clock,
+        )  # fmt: skip
         self.monitor = RiskMonitor(
             account_id="main", limits=self.limits, daybook=self.daybook,
             repository=self.risk_repo, audit=self.audit, instruments=instrument_of,
             checks=[FeedDown(), MtmBlind(), FloorBreach()], subscribed=lambda: True,
-            interval_s=1.0, persist_interval_s=10.0, now=self.clock,
+            interval_s=1.0, persist_interval_s=10.0, ban_lists=self.ban_lists, now=self.clock,
         )  # fmt: skip
         self.gate = RiskEngine(
             account_id="main", mode=TradingMode.PAPER, limits=self.limits, state=self.monitor,
@@ -107,6 +119,12 @@ class Engine:
     async def step(self, seconds: float = 0) -> None:
         self.clock.advance(seconds)
         await self.monitor.step()
+
+    async def pace(self) -> None:
+        """Let ``min_entry_gap_s`` pass, with a monitor pass and a fresh tick, so the next entry
+        is not refused by entry pacing (order-flow-guards "Entries keep a minimum gap")."""
+        await self.step(int(self.limit_values["min_entry_gap_s"]))
+        self.tick()
 
     def tick(self, price: str = "200") -> None:
         self.monitor.on_tick(
@@ -162,7 +180,10 @@ async def test_limit_reached_the_next_entry_is_refused_and_exits_still_go() -> N
     """Spec "Limit reached", end to end: the maximum is 2 and two entries were allowed."""
     engine = await Engine({**BASE, "max_trades_per_day": 2}).start()
     engine.tick()
-    first, second = await engine.entry(), await engine.entry()
+    first = await engine.entry()
+    await engine.pace()  # entries keep a minimum gap (add-risk-guards)
+    second = await engine.entry()
+    await engine.pace()
 
     third = await engine.entry()
 
@@ -185,11 +206,55 @@ async def test_the_count_survives_a_restart() -> None:
         key_prefix="r",
     )
     await reborn.start(set_limits=False)
-    reborn.tick()
+    await reborn.pace()  # the persisted last entry time still spaces entries after a restart
 
     assert reborn.daybook.day().entries_today == 1  # not 0: one of the two is used
     assert getattr(await reborn.entry(), "accepted", False)
+    await reborn.pace()
     assert reason(await reborn.entry()).startswith("RISK_MAX_TRADES")
+
+
+async def test_the_days_gross_lots_survive_a_restart() -> None:
+    """lot-caps "Count survives a restart", end to end: the daily gross cap is 2 lots and one
+    1-lot entry was allowed before the restart."""
+    limits = {**BASE, "max_gross_lots_per_day": 2}
+    engine = await Engine(limits).start()
+    engine.tick()
+    await engine.entry()  # 65 units of a 65-unit lot: 1 lot
+
+    reborn = Engine(
+        limits, risk_repo=engine.risk_repo, trading_repo=engine.trading_repo, key_prefix="r"
+    )
+    await reborn.start(set_limits=False)
+    await reborn.pace()
+
+    assert reborn.daybook.day().entry_lots_today == 1
+    assert getattr(await reborn.entry(), "accepted", False)
+    await reborn.pace()
+    assert reason(await reborn.entry()).startswith("RISK_LOTS_DAY")
+
+
+async def test_the_minimum_gap_survives_a_restart() -> None:
+    """order-flow-guards "Gap survives a restart": the gap is 20 s, an entry is allowed at 10:30:00
+    and the engine restarts; an entry at 10:30:15 is refused, one at 10:30:20 is not."""
+    limits = {**BASE, "min_entry_gap_s": 20}
+    engine = await Engine(limits).start()
+    engine.tick()
+    assert getattr(await engine.entry(), "accepted", False)
+
+    reborn = Engine(
+        limits, risk_repo=engine.risk_repo, trading_repo=engine.trading_repo, key_prefix="r"
+    )
+    await reborn.start(set_limits=False)
+    for seconds in (10, 5):  # 15 s in two passes, ticking, so the feed never looks silent
+        reborn.tick()
+        await reborn.step(seconds)
+    reborn.tick()
+
+    assert reason(await reborn.entry()).startswith("RISK_ENTRY_GAP")
+    await reborn.step(5)
+    reborn.tick()
+    assert getattr(await reborn.entry(), "accepted", False)
 
 
 async def test_feed_silent_fails_closed_then_clears_when_ticks_return() -> None:

@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator
 
 from contracts.commands import CancelOrder
 from contracts.orders import Order, OrderState
-from engine.broker.adapter import BrokerAck, BrokerOrder, BrokerRejected, BrokerUpdate
+from engine.broker.adapter import BrokerAck, BrokerOrder, BrokerUpdate, RateLimited
 from engine.risk.ratelimit import RATE_LIMITED
 from tests.engine.test_order_service import NOW, build, command
 
@@ -34,7 +34,7 @@ class AdmittingAdapter:
     async def admit_place(self, order: Order) -> None:
         self.log.append(("admit_place", order.order_id))
         if self.refuse_entries:
-            raise BrokerRejected(f"{RATE_LIMITED}: too many orders just now")
+            raise RateLimited(f"{RATE_LIMITED}: too many orders just now")  # as the real limiter
         await asyncio.sleep(self.admit_wait_s)
 
     async def admit_cancel(self, order: Order) -> None:

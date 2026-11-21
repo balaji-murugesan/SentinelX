@@ -5,7 +5,7 @@ price on a market order" at model level.
 """
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
@@ -17,6 +17,7 @@ from contracts.commands import (
     KillSwitch,
     PlaceOrder,
     ResumeRecovery,
+    SetBanList,
     SetRiskLimits,
     SizeOrder,
     parse_command,
@@ -329,6 +330,87 @@ def test_size_order_round_trips() -> None:
 def test_size_order_needs_positive_prices(field: str) -> None:
     with pytest.raises(ValidationError):
         size_order(**{field: Decimal("0")})
+
+
+# ---- add-risk-guards task 2.1: symbol-list limits and the ban-list command --------------------
+
+
+def test_a_symbol_list_limit_round_trips() -> None:
+    command = SetRiskLimits(
+        command_id="c7", idempotency_key="k7", account_id="main", source="cli", sent_at=NOW,
+        limits={"allowed_underlyings": ["BANKNIFTY", "NIFTY"], "denied_underlyings": None,
+                "max_open_lots_total": 4},
+    )  # fmt: skip
+    parsed = parse_command(command.model_dump_json())
+    assert parsed == command
+    assert isinstance(parsed, SetRiskLimits)
+    assert parsed.limits["allowed_underlyings"] == ["BANKNIFTY", "NIFTY"]
+
+
+def test_a_symbol_list_limit_with_a_non_text_item_is_refused() -> None:
+    raw = (
+        '{"command":"set_risk_limits","command_id":"c7","idempotency_key":"k7",'
+        '"account_id":"main","source":"cli","sent_at":"2026-10-29T04:00:00Z",'
+        '"limits":{"allowed_underlyings":["NIFTY",1.5]}}'
+    )
+    with pytest.raises(ValidationError):
+        parse_command(raw)
+
+
+def ban_list(**overrides: object) -> SetBanList:
+    values: dict[str, object] = {
+        "command_id": "c8",
+        "idempotency_key": "k8",
+        "account_id": "main",
+        "source": "cli",
+        "sent_at": NOW,
+        "trade_date": date(2026, 10, 30),
+        "symbols": ["ABC", "XYZ"],
+    }
+    return SetBanList(**{**values, **overrides})  # type: ignore[arg-type]
+
+
+def test_the_ban_list_command_round_trips_through_the_union() -> None:
+    command = ban_list()
+    parsed = parse_command(command.model_dump_json())
+    assert parsed == command
+    assert isinstance(parsed, SetBanList) and parsed.trade_date == date(2026, 10, 30)
+    payload = json.loads(command.model_dump_json())
+    assert payload["command"] == "set_ban_list" and payload["trade_date"] == "2026-10-30"
+
+
+def test_an_empty_ban_list_is_a_valid_command() -> None:
+    """Spec "An empty list SHALL be accepted as 'no bans that day'"."""
+    command = ban_list(symbols=[])
+    assert parse_command(command.model_dump_json()) == command
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"symbols": ["ABC", ""]},  # an empty symbol
+        {"trade_date": "2026-10-30T09:30:00Z"},  # a moment, not a date
+        {"trade_date": "2026-10-30T00:00:00"},  # midnight is still a moment
+        {"trade_date": 1793318400},  # a Unix timestamp of midnight UTC on 2026-10-30
+        {"idempotency_key": ""},  # every command carries a key
+    ],
+)
+def test_a_malformed_ban_list_command_is_refused(overrides: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        ban_list(**overrides)
+
+
+@pytest.mark.parametrize(
+    "trade_date", ['"2026-10-30T00:00:00"', '"2026-10-30T00:00:00Z"', "1793318400"]
+)
+def test_the_ban_list_date_from_the_stream_must_be_a_plain_iso_date(trade_date: str) -> None:
+    """The command arrives as JSON: only "YYYY-MM-DD" is a date (the round-trip test above
+    shows that form is accepted), never a midnight datetime or timestamp coerced into one."""
+    payload = json.loads(ban_list().model_dump_json())
+    payload["trade_date"] = "PLACEHOLDER"
+    raw = json.dumps(payload).replace('"PLACEHOLDER"', trade_date)
+    with pytest.raises(ValidationError):
+        parse_command(raw)
 
 
 def test_the_sizing_answer_round_trips() -> None:

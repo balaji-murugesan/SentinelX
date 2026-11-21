@@ -1,5 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
+   "env": {
+    "TEST_REDIS_URL": "redis://localhost:6380/15"
+  },
   "permissions": {
     "allow": [
       "Read",
@@ -20,6 +23,11 @@
       "Bash(git commit *)",
       "Bash(grep *)",
       "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(ls)",
+      "Bash(ls *)",
+      "Bash(echo *)",
+      "Bash(TEST_REDIS_URL=redis://localhost:6380/15 uv run pytest *)",
       "Bash(docker compose ps *)",
       "Bash(docker compose logs *)",
       "Bash(docker start sx-*)",
@@ -27,18 +35,20 @@
       "Bash(gh pr list *)",
       "Bash(gh pr view *)",
       "Bash(gh pr checks *)",
+      "Bash(gh pr create *)",
       "Bash(gh run list *)",
       "Bash(gh run view *)",
       "Bash(gh run watch *)",
-      "Bash(gh auth status)"
-    ],
-    "ask": [
-      "Bash(git checkout -- *)",
-      "Bash(git stash *)",
-      "Bash(git worktree *)",
-      "Bash(gh pr create *)",
-      "Bash(gh pr merge *)",
-      "Bash(docker kill *)"
+      "Bash(gh auth status)",
+      "Bash(uv run *)",
+      "Bash(docker compose *)",
+      "Bash(git fetch *)",
+      "Bash(git branch *)",
+      "Bash(git ls-tree *)",
+      "Bash(git merge *)",
+      "Bash(git switch *)",
+      "Skill(openspec-apply-change)",
+      "Skill(openspec-apply-change:*)"
     ],
     "deny": [
       "Read(./.env)",
@@ -64,8 +74,15 @@
       "Bash(*cli order place*)",
       "Bash(*cli order cancel*)",
       "Bash(*cli recovery resume*)",
-      "Bash(git push)",
-      "Bash(git push *)",
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(git push * --force*)",
+      "Bash(git push * -f*)",
+      "Bash(git push *+*)",
+      "Bash(git push * main)",
+      "Bash(git push *:main)",
+      "Bash(git push * --delete *)",
+      "Bash(git push * -d *)",
       "Bash(git reset --hard *)",
       "Bash(git clean *)",
       "Bash(git branch -D *)",
@@ -78,6 +95,16 @@
       "Bash(rm -r *)",
       "Bash(rm -fr *)",
       "Bash(Remove-Item * -Recurse*)"
+    ],
+    "ask": [
+      "Bash(git checkout -- *)",
+      "Bash(git stash *)",
+      "Bash(git worktree *)",
+      "Bash(git push)",
+      "Bash(git push *)",
+      "Bash(gh pr merge *)",
+      "Bash(docker kill *)"
     ]
   }
+  
 }

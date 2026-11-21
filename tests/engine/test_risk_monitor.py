@@ -3,13 +3,18 @@
 Driven with a fake clock, ``on_tick`` and ``step`` (no real tasks, no real time): scenarios "Feed
 goes quiet", "Feed returns", "After the close", "Blind too long", "Next day", "Breach" and
 "Restart after a high peak"; the heartbeat the gate reads; the ratchet and its persistence; the
-previous close; and the fail-closed paths.
+previous close; and the fail-closed paths. add-risk-guards task 8.2: the expiry giveback
+("Entering an expiring contract", "Expiring position closed", "Restart keeps it"). Tasks 9.1 and
+9.2: the profit target's confirmation count and its day lock ("Confirmed target", "A dip resets
+the count", "Unknown MTM resets the count", "No target set", "A breach and the target together",
+"MTM falls back" and "Restart keeps the halt").
 
 The kill and flatten hooks read the stored day state *at the moment they are called*, which is how
 these tests prove that the ratchet and the day lock are persisted before the engine acts.
 """
 
 import asyncio
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
@@ -17,13 +22,16 @@ import pytest
 from structlog.testing import capture_logs
 
 from contracts.commands import SetRiskLimits
-from contracts.orders import OrderSide
+from contracts.market import Instrument, InstrumentKey
+from contracts.orders import Order, OrderSide, OrderState
 from contracts.snapshot import HaltLevel
 from engine.market_data.bus import TickBus
 from engine.market_data.provider import Tick
 from engine.persistence.repository import PersistenceError
 from engine.positions.book import position_id
 from engine.risk.audit import RiskAudit
+from engine.risk.banlist import BanListService
+from engine.risk.checks.flow import REJECT_BREAKER, RejectBreaker
 from engine.risk.checks.stale import (
     FEED_DOWN,
     FLOOR_BREACH,
@@ -32,20 +40,40 @@ from engine.risk.checks.stale import (
     FloorBreach,
     MtmBlind,
 )
+from engine.risk.checks.target import TARGET_HALT, ProfitTarget
 from engine.risk.daybook import DayBook
-from engine.risk.decision import ALLOW, ContinuousCheck, Decision
+from engine.risk.decision import (
+    ALLOW,
+    ContinuousCheck,
+    Decision,
+    RiskContext,
+    RiskTrigger,
+    Severity,
+    kill,
+)
 from engine.risk.floor import floor_of
+from engine.risk.limits import MODE_PREFIX
 from engine.risk.limits_service import LimitsService, LimitsStatus
-from engine.risk.monitor import REFERENCE_MISSING, RiskMonitor, mark_key, previous_weekday
+from engine.risk.monitor import (
+    BAN_LIST_RETRY_S,
+    REFERENCE_MISSING,
+    RiskMonitor,
+    mark_key,
+    previous_weekday,
+)
 from engine.risk.pnl import estimate_exit_cost
+from engine.risk.rejections import RejectionWindow
+from engine.risk.repository import StoredBanList
 from engine.risk.state import DayState
 from tests.engine.risk_builders import (
+    INSTRUMENTS,
     NOW,
     OPTION,
     STOCK,
     TODAY,
     fill,
     instrument_of,
+    order,
     position,
 )
 from tests.engine.risk_fakes import MemoryRiskRepository, StubTrading
@@ -84,6 +112,8 @@ class Env:
         at: datetime = NOW,
         checks: tuple[ContinuousCheck, ...] = CHECKS,
         on_kill: bool = True,
+        rejections: RejectionWindow | None = None,
+        instruments: Callable[[InstrumentKey], Instrument | None] = instrument_of,
     ) -> None:
         self.clock = Clock(at)
         self.repo = repo or MemoryRiskRepository()
@@ -104,12 +134,14 @@ class Env:
             figures=self._figures, now=self.clock,
         )  # fmt: skip
         self.audit = RiskAudit(self.repo)
+        self.rejections = rejections or RejectionWindow()
         self.monitor = RiskMonitor(
             account_id="main", limits=self.limits, daybook=self.daybook, repository=self.repo,
-            audit=self.audit, instruments=instrument_of, checks=checks,
+            audit=self.audit, instruments=instruments, checks=checks,
             subscribed=lambda: self.subscribed, interval_s=1.0, persist_interval_s=10.0,
             on_kill=self._kill if on_kill else None, ensure_flat=self._ensure_flat,
-            unprotected=lambda: self.unprotected, now=self.clock,
+            unprotected=lambda: self.unprotected, rejections=self.rejections.recent,
+            now=self.clock,
         )  # fmt: skip
         self.monitor.bind(self.trading)
 
@@ -413,6 +445,151 @@ async def test_a_corrupt_first_tick_for_a_held_position_cannot_raise_the_peak() 
     await stepped(env, 1)
 
     assert env.daybook.day().peak == D(0)
+
+
+# ---- the expiry giveback (add-risk-guards task 8.2) --------------------------------------------
+#
+# Limits: BASE's giveback (armed at 2,000, the larger of 1,000 and 30% of the peak) with an expiry
+# giveback of the larger of 500 and 10%. At a peak of about 2,600 the base floor is about 1,600 and
+# the expiry floor about 2,100.
+
+EXPIRING_KEY = InstrumentKey.parse("NSE_FNO:53721")
+EXPIRING = INSTRUMENTS[OPTION].model_copy(
+    update={"key": EXPIRING_KEY, "trading_symbol": "NIFTY-WEEKLY-22600-CE", "expiry": TODAY}
+)
+WITH_EXPIRING = {**INSTRUMENTS, EXPIRING_KEY: EXPIRING}
+EXPIRY_GIVEBACK = {**BASE, "giveback_abs_expiry": "500", "giveback_pct_expiry": "10"}
+
+
+def expiry_env(positions: list, repo: MemoryRiskRepository | None = None) -> Env:  # type: ignore[type-arg]
+    return Env(
+        positions=positions, limits=EXPIRY_GIVEBACK, instruments=WITH_EXPIRING.get, repo=repo
+    )
+
+
+def floors_at(env: Env, peak: Decimal) -> tuple[Decimal, Decimal]:
+    """(base floor, expiry floor) the limits in force give at ``peak``."""
+    limits = env.limits.current
+    assert limits is not None
+    return floor_of(limits.floor_params(), peak), floor_of(limits.floor_params(expiry=True), peak)
+
+
+async def climb(env: Env, key: InstrumentKey, *prices: str) -> None:
+    for price in prices:  # each within the outlier band of the last accepted price
+        env.tick(price, key)
+        await stepped(env, 1)
+
+
+async def test_an_expiring_position_switches_the_expiry_giveback_on_and_it_is_written_at_once() -> (
+    None
+):
+    """Spec "The expiry giveback applies once the account has expiring exposure": an open position
+    in a contract expiring today. Persisted on that very pass, not at the next throttled write
+    (every 10 s here), so a restart right after cannot forget it."""
+    env = await expiry_env([position(EXPIRING_KEY, 65)]).ready()
+
+    await stepped(env)
+
+    assert env.daybook.day().expiry_exposure is True
+    stored = await env.repo.load_day("main", TODAY)
+    assert stored is not None and stored.expiry_exposure is True
+
+
+async def test_a_position_the_master_does_not_know_leaves_the_flag_off() -> None:
+    """Only the master expiry date counts. The lookup returns None until the master has loaded
+    (concurrently at start-up), so a restart must not switch the stricter giveback on for a whole
+    non-expiry day."""
+    env = await Env(
+        positions=[position(EXPIRING_KEY, 65)], limits=EXPIRY_GIVEBACK, instruments=lambda k: None
+    ).ready()
+
+    await stepped(env)
+
+    assert env.daybook.day().expiry_exposure is False
+
+
+async def test_a_flat_row_in_an_expiring_contract_does_not_switch_the_flag_on() -> None:
+    env = await expiry_env([position(EXPIRING_KEY, 0)]).ready()
+
+    await stepped(env)
+
+    assert env.daybook.day().expiry_exposure is False
+
+
+async def test_positions_that_do_not_expire_today_leave_the_base_giveback() -> None:
+    env = await expiry_env([carried()]).ready()
+    await stepped(env)
+
+    await climb(env, OPTION, "110", "125", "140")
+
+    peak = env.daybook.day().peak
+    base, expiry = floors_at(env, peak)
+    assert env.daybook.day().expiry_exposure is False
+    assert env.daybook.day().floor == base < expiry
+
+
+async def test_holding_an_expiring_contract_ratchets_the_floor_with_the_expiry_giveback() -> None:
+    env = await expiry_env([position(EXPIRING_KEY, 65)]).ready()
+    await stepped(env)
+
+    await climb(env, EXPIRING_KEY, "110", "125", "140")
+
+    peak = env.daybook.day().peak
+    base, expiry = floors_at(env, peak)
+    assert peak > D(2000) and base < expiry  # armed, and the expiry floor is the higher one
+    assert env.daybook.day().floor == expiry
+
+
+async def test_entering_an_expiring_contract_applies_the_expiry_giveback() -> None:
+    """Spec "Entering an expiring contract": the gate allowed an entry in a contract expiring
+    today (the day book switched the flag on), and the day's peak then reaches its arming level:
+    the floor allows at most the expiry giveback."""
+    env = await expiry_env([carried()]).ready()
+    await stepped(env)
+    assert await env.daybook.entry_allowed(1, True) is None
+
+    await climb(env, OPTION, "110", "125", "140")
+
+    peak = env.daybook.day().peak
+    assert env.daybook.day().floor == floors_at(env, peak)[1]
+    assert peak - env.daybook.day().floor == D(500)  # the larger of 500 and 10% of ~2,600
+
+
+async def test_expiring_position_closed_the_expiry_giveback_still_applies() -> None:
+    """Spec "Expiring position closed": the expiry giveback has applied since the morning, then
+    the expiring position is closed. The flag stays on and the floor does not fall; as the day's
+    peak climbs further on another position, the floor still follows the expiry giveback."""
+    env = await expiry_env([position(EXPIRING_KEY, 65), carried()]).ready()
+    await stepped(env)
+    env.tick("100", EXPIRING_KEY)
+    await climb(env, OPTION, "110", "125", "140")
+    before = env.daybook.day().floor
+    assert before == floors_at(env, env.daybook.day().peak)[1]
+
+    closed = position(EXPIRING_KEY, 0)
+    env.trading.positions[position_id(closed)] = closed  # the expiring position is now flat
+    await climb(env, OPTION, "150")
+
+    day = env.daybook.day()
+    base, expiry = floors_at(env, day.peak)
+    assert day.expiry_exposure is True
+    assert day.floor == expiry > base and day.floor > before
+
+
+async def test_a_restart_keeps_the_expiry_giveback() -> None:
+    """Spec "Restart keeps it": the expiring position was closed before the restart, and the
+    restarted engine still ratchets with the expiry giveback (the flag is read back from the
+    stored day)."""
+    first = await expiry_env([position(EXPIRING_KEY, 65)]).ready()
+    await stepped(first)  # switched on and written; first is gone, only the repository remains
+
+    restarted = await expiry_env([carried()], repo=first.repo).ready()
+    await stepped(restarted)
+    await climb(restarted, OPTION, "110", "125", "140")
+
+    day = restarted.daybook.day()
+    assert day.expiry_exposure is True
+    assert day.floor == floors_at(restarted, day.peak)[1]
 
 
 # ---- the floor breach ------------------------------------------------------------------------
@@ -856,7 +1033,7 @@ async def test_next_day_the_counters_reset_and_a_standing_halt_clears() -> None:
     env = await Env(positions=[carried()]).ready()
     await stepped(env)
     for _ in range(3):
-        await env.daybook.entry_allowed()
+        await env.daybook.entry_allowed(1, False)
     await stepped(env, 20)  # a feed-down halt is standing
     assert env.monitor.entry_halt() is not None
 
@@ -1080,3 +1257,550 @@ async def test_a_pending_lock_makes_the_monitor_ask_for_the_flatten_on_an_unlock
     await stepped(env)
 
     assert env.flat_calls == ["day locked"] and env.daybook.day().halt_level is HaltLevel.NONE
+
+
+# ---- what the continuous checks see (add-risk-guards task 4.2) --------------------------------
+
+
+class _Seeing:
+    """A continuous check that records the context it was given and allows."""
+
+    name = "seeing"
+
+    def __init__(self) -> None:
+        self.seen: list[RiskContext] = []
+
+    def continuous(self, ctx: RiskContext, event: RiskTrigger) -> Decision:
+        self.seen.append(ctx)
+        return ALLOW
+
+
+async def test_the_continuous_checks_see_the_recent_entries_from_the_day_book() -> None:
+    seeing = _Seeing()
+    env = await Env(checks=(seeing,)).ready()
+    assert await env.daybook.entry_allowed(1, False) is None
+    env.clock.advance(10)
+
+    await stepped(env)
+
+    ctx = seeing.seen[-1]
+    assert ctx.recent_entries == (NOW,)
+    assert (ctx.broker_rejections, ctx.target_confirmations, ctx.ban_list) == ((), 0, None)
+    assert ctx.spot_key("NIFTY") is None
+
+
+# ---- the rejection breaker (add-risk-guards task 6.2) -----------------------------------------
+
+
+def rejected_at(at: datetime) -> Order:
+    return order(OrderSide.BUY, 65, updated_at=at, state=OrderState.REJECTED)
+
+
+async def test_the_continuous_checks_see_the_broker_rejections_of_the_last_5_minutes() -> None:
+    seeing = _Seeing()
+    env = await Env(checks=(seeing,)).ready()
+    env.rejections.record(rejected_at(NOW - timedelta(seconds=301)))  # out of the window
+    env.rejections.record(rejected_at(NOW - timedelta(seconds=10)))
+
+    await stepped(env)
+
+    assert seeing.seen[-1].broker_rejections == (NOW - timedelta(seconds=10),)
+    assert env.monitor.broker_rejections(NOW) == (NOW - timedelta(seconds=10),)  # the gate's view
+
+
+def breaker_trips(logs: list[dict]) -> list[dict]:  # type: ignore[type-arg]
+    return [
+        e for e in logs if e["event"] == "risk decision started" and e["code"] == REJECT_BREAKER
+    ]
+
+
+async def test_the_breaker_logs_one_critical_alert_per_trip_not_one_per_pass() -> None:
+    """Spec "Margin rejection storm" (the monitor's half): three rejections trip the breaker; the
+    critical alert and the audit row are written once while it holds, through many passes. Once
+    it has cleared (spec "Breaker clears") a new storm trips it again, with a new alert."""
+    env = await Env(checks=(RejectBreaker(),)).ready()  # BASE: reject_breaker_n = 3
+    for seconds in (0, 60, 120):
+        env.rejections.record(rejected_at(NOW + timedelta(seconds=seconds)))
+    env.clock.advance(120)
+
+    with capture_logs() as logs:
+        for _ in range(5):
+            await stepped(env, 1)
+    halt = env.monitor.entry_halt()
+    assert halt is not None and halt.code == REJECT_BREAKER  # a standing halt of new entries
+    trips = breaker_trips(logs)
+    assert len(trips) == 1 and trips[0]["log_level"] == "critical"
+    assert len(env.rows(REJECT_BREAKER)) == 1
+
+    env.clock.at = NOW + timedelta(minutes=5, seconds=30)  # 10:35:30: the first is 330 s old
+    await stepped(env)
+    assert env.monitor.entry_halt() is None  # cleared by itself
+
+    for seconds in (0, 1, 2):
+        env.rejections.record(rejected_at(env.clock.at + timedelta(seconds=seconds)))
+    with capture_logs() as again:
+        await stepped(env, 3)
+        await stepped(env, 1)
+    assert [e["log_level"] for e in breaker_trips(again)] == ["critical"]  # one for the new trip
+    assert len(env.rows(REJECT_BREAKER)) == 2
+
+
+async def test_a_breaker_in_shadow_mode_logs_a_warning_and_halts_nothing() -> None:
+    env = await Env(
+        checks=(RejectBreaker(),), limits={**BASE, MODE_PREFIX + "reject_breaker": "shadow"}
+    ).ready()
+    for seconds in (0, 1, 2):
+        env.rejections.record(rejected_at(NOW + timedelta(seconds=seconds)))
+
+    with capture_logs() as logs:
+        await stepped(env, 3)
+
+    assert env.monitor.entry_halt() is None  # tried out, not enforced
+    assert [e["log_level"] for e in breaker_trips(logs)] == ["warning"]
+
+
+# ---- the F&O ban list and the spot lookup (add-risk-guards tasks 7.2 and 7.4) -----------------
+
+
+class SeeContext:
+    """A continuous check that only records the contexts it is given."""
+
+    name = "equity_floor"
+
+    def __init__(self) -> None:
+        self.seen: list[RiskContext] = []
+
+    def continuous(self, ctx: RiskContext, event: RiskTrigger) -> Decision:
+        self.seen.append(ctx)
+        return ALLOW
+
+
+class BanListsDown(MemoryRiskRepository):
+    """Counts ban-list reads, and fails them while ``down`` (a database that is unavailable)."""
+
+    down = True
+    reads = 0
+
+    async def load_ban_list(self, account_id: str, from_date: date) -> list[StoredBanList]:
+        self.reads += 1
+        if self.down:
+            raise PersistenceError("database unavailable")
+        return await super().load_ban_list(account_id, from_date)
+
+
+async def ban_list_monitor(
+    spot_key: Callable[[str], InstrumentKey | None] = lambda symbol: None,
+) -> tuple[BanListsDown, SeeContext, "Env", RiskMonitor]:
+    """A monitor whose ban lists are unread (the start-up read failed) and stored as {XYZ}."""
+    repo = BanListsDown()
+    repo.ban_lists[("main", TODAY)] = StoredBanList(TODAY, frozenset({"XYZ"}), NOW)
+    spy = SeeContext()
+    env = await Env(repo=repo, checks=(spy,)).ready()
+    ban_lists = BanListService(
+        account_id="main", repository=repo, results=MemoryRepository(), now=env.clock
+    )
+    monitor = RiskMonitor(
+        account_id="main", limits=env.limits, daybook=env.daybook, repository=repo,
+        audit=env.audit, instruments=instrument_of, checks=(spy,), subscribed=lambda: True,
+        interval_s=1.0, persist_interval_s=10.0, ban_lists=ban_lists, spot_key=spot_key,
+        now=env.clock,
+    )  # fmt: skip
+    monitor.bind(env.trading)
+    return repo, spy, env, monitor
+
+
+async def test_the_monitor_retries_the_ban_list_read_and_fills_the_context() -> None:
+    """The monitor serves today's ban list (to its own checks and to the gate through
+    ``ban_list``) and the spot lookup; while the stored lists cannot be read, it retries (on its
+    first pass, then once each ``BAN_LIST_RETRY_S``), and the list is None (F&O entries refused)
+    until a read succeeds."""
+    nifty = InstrumentKey.parse("IDX_I:13")
+    repo, spy, env, monitor = await ban_list_monitor({"NIFTY": nifty}.get)
+
+    await monitor.step()
+    assert repo.reads == 1  # the first pass retries at once
+    env.clock.advance(BAN_LIST_RETRY_S)
+    await monitor.step()
+    assert repo.reads == 2  # and again once the window has passed
+    assert spy.seen[-1].ban_list is None and monitor.ban_list(env.clock.at) is None
+
+    repo.down = False
+    env.clock.advance(BAN_LIST_RETRY_S)
+    await monitor.step()
+    env.clock.advance(BAN_LIST_RETRY_S)
+    await monitor.step()
+    assert repo.reads == 3  # read once, then not again (although a retry would be due)
+    assert spy.seen[-1].ban_list == {"XYZ"} and monitor.ban_list(env.clock.at) == {"XYZ"}
+    assert spy.seen[-1].spot_key("NIFTY") == nifty and spy.seen[-1].spot_key("XYZ") is None
+
+
+async def test_an_unread_ban_list_is_retried_at_most_once_per_window() -> None:
+    """A hung or failing database must not slow every pass: within ``BAN_LIST_RETRY_S`` of a retry,
+    passes make no further read; exactly that long after it, the next pass reads again."""
+    repo, _, env, monitor = await ban_list_monitor()
+    await monitor.step()
+    assert repo.reads == 1
+
+    for _ in range(BAN_LIST_RETRY_S - 1):  # a pass a second, up to one second short of the window
+        env.clock.advance(1)
+        await monitor.step()
+    assert repo.reads == 1
+    assert monitor.ban_list(env.clock.at) is None  # still unread: F&O entries still refused
+
+    env.clock.advance(1)  # exactly BAN_LIST_RETRY_S after the last retry
+    await monitor.step()
+    assert repo.reads == 2
+    await monitor.step()
+    assert repo.reads == 2  # and the window starts again
+
+
+async def test_a_retry_that_fails_unexpectedly_still_starts_the_window() -> None:
+    """The retry time is stamped before the read, so a read that fails with an unexpected error
+    (not the ``PersistenceError`` the service absorbs) is rate-limited all the same."""
+
+    class Broken(BanListsDown):
+        async def load_ban_list(self, account_id: str, from_date: date) -> list[StoredBanList]:
+            self.reads += 1
+            raise RuntimeError("driver fault")
+
+    repo = Broken()
+    spy = SeeContext()
+    env = await Env(repo=repo, checks=(spy,)).ready()
+    ban_lists = BanListService(
+        account_id="main", repository=repo, results=MemoryRepository(), now=env.clock
+    )
+    monitor = RiskMonitor(
+        account_id="main", limits=env.limits, daybook=env.daybook, repository=repo,
+        audit=env.audit, instruments=instrument_of, checks=(spy,), subscribed=lambda: True,
+        interval_s=1.0, persist_interval_s=10.0, ban_lists=ban_lists, now=env.clock,
+    )  # fmt: skip
+    monitor.bind(env.trading)
+
+    await monitor.step()  # the read raises; the pass fails and is logged, the monitor carries on
+    env.clock.advance(1)
+    await monitor.step()
+
+    assert repo.reads == 1
+
+
+async def test_a_hung_ban_list_read_never_delays_the_flatten_of_a_locked_day() -> None:
+    """Exits come first: on a killed day the pass asks for the flatten before it retries the
+    ban-list read, so a database that hangs on that read (or fails it) cannot delay it."""
+    from engine.risk.banlist import BanListService
+    from engine.risk.repository import StoredBanList
+
+    class Hung(MemoryRiskRepository):
+        failing = False
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def load_ban_list(self, account_id: str, from_date: date) -> list[StoredBanList]:
+            self.entered.set()
+            await self.release.wait()
+            if self.failing:
+                raise PersistenceError("database unavailable")
+            return await super().load_ban_list(account_id, from_date)
+
+    repo = Hung()
+    await repo.save_day(DayState("main", TODAY, NOW, halt_level=HaltLevel.KILL, halt_reason="k"))
+    env = await Env(repo=repo).ready()
+
+    for failing in (False, True):  # a read that hangs then answers, and one that hangs then fails
+        repo.failing = failing
+        repo.entered.clear()
+        repo.release.clear()
+        ban_lists = BanListService(
+            account_id="main", repository=repo, results=MemoryRepository(), now=env.clock
+        )
+        monitor = RiskMonitor(
+            account_id="main", limits=env.limits, daybook=env.daybook, repository=repo,
+            audit=env.audit, instruments=instrument_of, checks=CHECKS, subscribed=lambda: True,
+            interval_s=1.0, persist_interval_s=10.0, ensure_flat=env._ensure_flat,
+            ban_lists=ban_lists, now=env.clock,
+        )  # fmt: skip
+        monitor.bind(env.trading)
+        calls = len(env.flat_calls)
+        step = asyncio.create_task(monitor.step())
+        await asyncio.wait_for(repo.entered.wait(), timeout=2)  # the read is hanging now
+
+        assert len(env.flat_calls) == calls + 1  # and the flatten was already asked for
+
+        repo.release.set()
+        await asyncio.wait_for(step, timeout=2)
+        assert ban_lists.read is not failing  # a failed read leaves the lists unread
+
+
+async def test_a_monitor_without_ban_lists_has_no_list_and_knows_no_spot() -> None:
+    spy = SeeContext()
+    env = await Env(checks=(spy,)).ready()
+
+    await env.monitor.step()
+
+    assert env.monitor.ban_list(env.clock.at) is None
+    assert spy.seen[-1].ban_list is None and spy.seen[-1].spot_key("NIFTY") is None
+
+
+# ---- the profit target (add-risk-guards tasks 9.1 and 9.2) ------------------------------------
+
+# A target of 500 confirmed on 2 consecutive passes. The carried position is 65 units bought at
+# 100: at 110 its MTM_day is 650 less the exit charge (above the target), at 106 it is 390 less
+# the charge (below). The peak stays under every floor term's trigger, so the floor stays far below.
+TARGET_LIMITS = {**BASE, "daily_profit_target": "500", "target_confirm_ticks": 2}
+TARGET_CHECKS: tuple[ContinuousCheck, ...] = (*CHECKS, ProfitTarget())
+
+
+async def target_env(**kwargs) -> Env:  # type: ignore[no-untyped-def]
+    options = {"positions": [carried()], "limits": TARGET_LIMITS, "checks": TARGET_CHECKS}
+    return await Env(**{**options, **kwargs}).ready()
+
+
+async def priced(env: Env, price: str) -> None:
+    """One second on, a tick at ``price``, and a monitor pass."""
+    env.clock.advance(1)
+    env.tick(price)
+    await stepped(env)
+
+
+async def test_the_monitor_counts_the_confirmations_into_its_own_context() -> None:
+    """The monitor fills ``target_confirmations``: one more per pass at or above the target."""
+    seeing = _Seeing()
+    env = await target_env(checks=(seeing,))
+    await stepped(env)  # at the cost price: below the target
+
+    await priced(env, "110")
+    await priced(env, "110")
+
+    assert [ctx.target_confirmations for ctx in seeing.seen] == [0, 1, 2]
+    assert seeing.seen[-1].mtm_day is not None and seeing.seen[-1].mtm_day >= D(500)
+
+
+async def test_a_confirmed_target_locks_the_day_persisted_before_it_asks_for_the_flatten() -> None:
+    """Spec "Confirmed target" through the monitor, and the TARGET_HALT branch of ``_act``: the
+    halt level and its reason are stored BEFORE the flatten is asked for (the hook reads the
+    stored row), the day is not killed, and the lock is announced once, not on every pass."""
+    env = await target_env()
+    await stepped(env)
+    await priced(env, "110")
+    assert env.daybook.day().halt_level is HaltLevel.NONE  # one confirmation is not enough
+    assert env.flat_calls == []
+
+    with capture_logs() as logs:
+        await priced(env, "110")
+        await priced(env, "111")
+        await priced(env, "112")
+
+    day = env.daybook.day()
+    assert day.halt_level is HaltLevel.TARGET_HALT
+    assert (day.halt_reason or "").startswith(TARGET_HALT)
+    first_saw = env.flat_saw[0]
+    assert first_saw is not None and first_saw.halt_level is HaltLevel.TARGET_HALT  # stored first
+    assert (first_saw.halt_reason or "").startswith(TARGET_HALT)
+    assert env.flat_calls[0].startswith(TARGET_HALT) and len(env.flat_calls) == 3  # every pass
+    assert env.kills == []  # a target halt is its own level, not a kill
+    assert sum(e["event"].startswith("profit target reached") for e in logs) == 1
+    assert env.monitor.entry_halt() is None  # a day lock, not a standing halt
+
+
+async def test_a_dip_resets_the_count_through_the_monitor() -> None:
+    """Spec "A dip resets the count": above, below, above is not yet reached; one more pass is."""
+    env = await target_env()
+    await stepped(env)
+
+    await priced(env, "110")
+    await priced(env, "106")  # below the target
+    await priced(env, "110")
+    assert env.daybook.day().halt_level is HaltLevel.NONE and env.flat_calls == []
+
+    await priced(env, "110")
+    assert env.daybook.day().halt_level is HaltLevel.TARGET_HALT
+
+
+async def test_an_unknown_mtm_resets_the_count_through_the_monitor() -> None:
+    """Spec "Unknown MTM resets the count": a held instrument with no price makes MTM_day unknown
+    for a pass, and the count starts again from zero afterwards."""
+    env = await target_env()
+    await stepped(env)
+    await priced(env, "110")
+    held = dict(env.trading.positions)
+    unpriced = position(STOCK, 10, "200.00")
+
+    env.trading.positions = {**held, position_id(unpriced): unpriced}  # never ticked
+    await priced(env, "110")
+    assert env.monitor.mtm_day() is None
+    env.trading.positions = held
+    await priced(env, "110")
+    assert env.daybook.day().halt_level is HaltLevel.NONE  # one confirmation since the reset
+
+    await priced(env, "110")
+    assert env.daybook.day().halt_level is HaltLevel.TARGET_HALT
+
+
+async def test_a_count_left_at_the_end_of_a_day_does_not_carry_into_the_next() -> None:
+    """One confirmation on Monday, then Tuesday's first pass at or above the target: a new day
+    counts from zero, so it takes Tuesday's own two passes to reach the target."""
+    env = await target_env()
+    await stepped(env)
+    await priced(env, "110")  # Monday: one confirmation
+
+    env.clock.at = NOW + timedelta(days=1)
+    env.tick("110")
+    await stepped(env)
+    assert env.daybook.day().trade_date == TODAY + timedelta(days=1)
+    assert env.daybook.day().halt_level is HaltLevel.NONE and env.flat_calls == []
+
+    await priced(env, "110")
+    assert env.daybook.day().halt_level is HaltLevel.TARGET_HALT
+
+
+async def test_a_pass_that_fails_resets_the_count() -> None:
+    """A pass that raises after counting (here the ratchet) did not complete a confirmation: the
+    count starts again, so one more pass at or above the target is not enough."""
+    env = await target_env()
+    await stepped(env)
+    await priced(env, "110")
+    real = env.monitor._ratchet  # type: ignore[attr-defined]
+
+    def broken(*args: object) -> None:
+        raise RuntimeError("ratchet bug")
+
+    env.monitor._ratchet = broken  # type: ignore[attr-defined,method-assign]
+    await priced(env, "110")  # counted, then failed before acting
+    env.monitor._ratchet = real  # type: ignore[attr-defined,method-assign]
+    halt = env.monitor.entry_halt()
+    assert halt is not None and halt.code == "RISK_STATE_UNAVAILABLE"
+    await priced(env, "110")
+    assert env.daybook.day().halt_level is HaltLevel.NONE and env.flat_calls == []
+
+    await priced(env, "110")
+    assert env.daybook.day().halt_level is HaltLevel.TARGET_HALT
+
+
+async def test_a_pass_with_the_day_unavailable_resets_the_count() -> None:
+    """A pass on which the day's state cannot be read sees no MTM_day: the count starts again."""
+    env = await target_env()
+    await stepped(env)
+    await priced(env, "110")
+    real = env.monitor._ensure_day  # type: ignore[attr-defined]
+
+    async def unavailable(now: datetime) -> bool:
+        return False
+
+    env.monitor._ensure_day = unavailable  # type: ignore[attr-defined,method-assign]
+    await priced(env, "110")
+    env.monitor._ensure_day = real  # type: ignore[attr-defined,method-assign]
+    await priced(env, "110")
+    assert env.daybook.day().halt_level is HaltLevel.NONE and env.flat_calls == []
+
+    await priced(env, "110")
+    assert env.daybook.day().halt_level is HaltLevel.TARGET_HALT
+
+
+async def test_with_no_target_set_nothing_is_counted_or_halted() -> None:
+    """Spec "No target set" through the monitor: BASE sets no target."""
+    seeing = _Seeing()
+    env = await target_env(limits=BASE, checks=(*TARGET_CHECKS, seeing))
+    await stepped(env)
+
+    for _ in range(5):
+        await priced(env, "110")
+
+    assert {ctx.target_confirmations for ctx in seeing.seen} == {0}
+    assert env.daybook.day().halt_level is HaltLevel.NONE and env.flat_calls == []
+
+
+async def test_a_target_in_shadow_mode_logs_a_warning_and_neither_halts_nor_flattens() -> None:
+    env = await target_env(limits={**TARGET_LIMITS, MODE_PREFIX + "profit_target": "shadow"})
+    await stepped(env)
+
+    with capture_logs() as logs:
+        for _ in range(4):
+            await priced(env, "110")
+
+    assert env.daybook.day().halt_level is HaltLevel.NONE
+    assert env.flat_calls == [] and env.monitor.entry_halt() is None
+    started = [
+        e for e in logs if e["event"] == "risk decision started" and e["code"] == TARGET_HALT
+    ]
+    assert [e["log_level"] for e in started] == ["warning"]  # tried out, once per episode
+    assert len(env.rows(TARGET_HALT)) == 1  # and audited, as a shadow verdict
+
+
+class Says:
+    """A continuous check that always returns ``decision``."""
+
+    def __init__(self, name: str, decision: Decision) -> None:
+        self.name, self.decision = name, decision
+
+    def continuous(self, ctx: RiskContext, event: RiskTrigger) -> Decision:
+        return self.decision
+
+
+async def test_a_breach_and_the_target_together_act_on_the_kill() -> None:
+    """Spec "A breach and the target together": one pass sees both, and the engine acts on the
+    kill. The target branch comes after the KILL branch, so it does not run in that pass."""
+    target = Decision(Severity.TARGET_HALT, TARGET_HALT, "target")
+    env = await target_env(
+        checks=(Says("profit_target", target), Says("equity_floor", kill(FLOOR_BREACH, "breach")))
+    )
+
+    await stepped(env)
+
+    assert [k.code for k in env.kills] == [FLOOR_BREACH]
+    assert env.daybook.day().halt_level is HaltLevel.NONE  # (the fake kill hook locks nothing)
+    halt = env.monitor.entry_halt()
+    assert halt is not None and halt.code == FLOOR_BREACH
+
+
+async def test_after_a_target_halt_the_day_stays_locked_when_mtm_falls_back() -> None:
+    """Spec "MTM falls back": the lock does not clear with the condition (the gate then refuses
+    every entry with RISK_HALTED_DAY: test_risk_runtime.py), and the flatten is still asked for."""
+    env = await target_env()
+    await stepped(env)
+    await priced(env, "110")
+    await priced(env, "110")
+    asked = len(env.flat_calls)
+
+    await priced(env, "90")  # MTM_day now a loss, well below the target
+    await priced(env, "90")
+
+    assert env.daybook.day().halt_level is HaltLevel.TARGET_HALT
+    assert len(env.flat_calls) == asked + 2
+
+
+async def test_a_target_halt_whose_write_fails_still_asks_for_the_flatten() -> None:
+    """Exits come first: a day-state write that fails, of any kind, does not leave the book open.
+    The lock holds in memory (the gate reads it) and the write is retried later."""
+    env = await target_env()
+    await stepped(env)
+    await priced(env, "110")
+
+    async def broken(state: DayState) -> DayState:
+        raise RuntimeError("driver bug")
+
+    env.repo.save_day = broken  # type: ignore[method-assign]
+    await priced(env, "110")
+
+    assert env.daybook.day().halt_level is HaltLevel.TARGET_HALT
+    assert env.flat_calls != []
+    saw = env.flat_saw[0]
+    assert saw is None or saw.halt_level is HaltLevel.NONE  # not stored, and the flatten went on
+
+
+async def test_a_monitor_restarted_on_a_target_halted_day_asks_for_the_flatten_at_once() -> None:
+    """Spec "Restart keeps the halt" at the monitor: the lock is read from the stored day row (the
+    confirmation count starts at zero after a restart, and is not needed), so the first pass of
+    the new process asks for the flatten again."""
+    repo = MemoryRiskRepository()
+    reason = "RISK_TARGET_HALT: banked"
+    await repo.save_day(
+        DayState("main", TODAY, NOW, halt_level=HaltLevel.TARGET_HALT, halt_reason=reason)
+    )
+    env = await target_env(repo=repo)
+
+    await stepped(env)
+
+    assert env.flat_calls == [reason]
+    assert env.daybook.day().halt_level is HaltLevel.TARGET_HALT

@@ -18,7 +18,7 @@ from typing import Literal
 
 import structlog
 
-from contracts.market import Instrument, InstrumentKey
+from contracts.market import ExchangeSegment, Instrument, InstrumentKey
 from engine.market_data.clock import ist_date, next_ist_time, utc_now
 
 log = structlog.get_logger("engine.instruments")
@@ -27,11 +27,19 @@ log = structlog.get_logger("engine.instruments")
 ContractKey = tuple[str, date | None, Decimal | None, Literal["CE", "PE"] | None]
 
 
+# The segments a spot instrument is looked for in, in order of preference (``spot_of``): an index
+# row first (NIFTY, BANKNIFTY), else a cash-equity row (a stock option's underlying share).
+_SPOT_SEGMENTS: tuple[ExchangeSegment, ...] = (ExchangeSegment.IDX_I, ExchangeSegment.NSE_EQ)
+
+
 @dataclass(frozen=True)
 class _Snapshot:
     as_of: date
     by_key: dict[InstrumentKey, Instrument]
     by_contract: dict[ContractKey, Instrument]
+    # For each spot segment, the rows by underlying symbol. A symbol with more than one row in a
+    # segment is ambiguous and maps to None (``spot_of`` then refuses to guess).
+    spots: dict[ExchangeSegment, dict[str, Instrument | None]]
     all: tuple[Instrument, ...] = field(repr=False)
 
 
@@ -42,13 +50,18 @@ class InstrumentMaster:
     def replace(self, instruments: Iterable[Instrument], as_of: date) -> None:
         items = tuple(instruments)
         by_contract: dict[ContractKey, Instrument] = {}
+        spots: dict[ExchangeSegment, dict[str, Instrument | None]] = {s: {} for s in _SPOT_SEGMENTS}
         for item in items:
             if item.expiry is not None:  # only derivatives are looked up by contract
                 contract = (item.underlying_symbol, item.expiry, item.strike, item.option_type)
                 by_contract.setdefault(contract, item)
+            if (rows := spots.get(item.key.segment)) is not None:
+                symbol = item.underlying_symbol.upper()
+                rows[symbol] = None if symbol in rows else item  # a second row: ambiguous
         self._snapshot = _Snapshot(
-            as_of=as_of, by_key={i.key: i for i in items}, by_contract=by_contract, all=items
-        )
+            as_of=as_of, by_key={i.key: i for i in items}, by_contract=by_contract, spots=spots,
+            all=items,
+        )  # fmt: skip
 
     @property
     def available(self) -> bool:
@@ -77,6 +90,27 @@ class InstrumentMaster:
         if self._snapshot is None:
             return None
         return self._snapshot.by_contract.get((underlying.upper(), expiry, strike, option_type))
+
+    def spot_of(self, symbol: str) -> Instrument | None:
+        """The *spot* instrument of an underlying: the price an option's strike is measured
+        against (add-risk-guards task 7.1, design §7). The ``IDX_I`` index row whose underlying
+        symbol is ``symbol`` (NIFTY, BANKNIFTY), else the ``NSE_EQ`` equity row (RELIANCE for a
+        RELIANCE stock option). None when there is no such row, or more than one in the segment
+        that would answer: the caller then fails closed (no fresh spot price, no strike-distance
+        judgement), which is safer than picking one.
+
+        Matched on the master's own ``underlying_symbol``, never on a guessed name. In the recorded
+        Dhan master an index row's underlying symbol is the same text its options carry (NIFTY,
+        BANKNIFTY, not the display name "Nifty Bank"), so no alias table is needed;
+        ``tests/engine/test_instrument_master.py`` pins that against the fixture."""
+        if self._snapshot is None:
+            return None
+        wanted = symbol.upper()
+        for segment in _SPOT_SEGMENTS:
+            rows = self._snapshot.spots[segment]
+            if wanted in rows:
+                return rows[wanted]  # None when ambiguous: never fall through to another segment
+        return None
 
     def search(self, text: str, limit: int = 20) -> list[Instrument]:
         """Case-insensitive substring search over trading symbol and display name.

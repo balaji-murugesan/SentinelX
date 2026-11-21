@@ -8,7 +8,10 @@ about them is a recommendation. They are chosen so a rule can never end a test b
     does not decide whether an entry is allowed;
   * the loss limit is huge and every optional floor term is off, so the simulated random walk can
     never breach the floor and trigger a kill;
-  * the price band is wide, so a far resting limit order still passes the price check.
+  * the price band is wide, so a far resting limit order still passes the price check;
+  * the lot caps, entry pacing and rejection breaker (add-risk-guards) are far above anything a
+    test does, and every optional add-risk-guards limit is unset;
+  * an F&O entry also needs today's ban list loaded (``send_ban_list``, empty: no bans).
 """
 
 import asyncio
@@ -24,9 +27,11 @@ from contracts.commands import (
     KillSwitch,
     LimitValue,
     PlaceOrder,
+    SetBanList,
     SetRiskLimits,
     reply_stream,
 )
+from engine.market_data.clock import ist_date
 
 ALL_DAY: dict[str, LimitValue] = {
     "per_trade_max_risk": "100000", "daily_max_loss": "10000000",
@@ -40,6 +45,9 @@ ALL_DAY: dict[str, LimitValue] = {
     "lock_mode": "OFF", "trail_loss_x": None, "trail_loss_y": None, "lock_trigger": None,
     "lock_at": None, "trail_step": None, "trail_by": None, "giveback_arm": None,
     "giveback_abs": None, "giveback_pct": None,
+    "max_open_lots_per_underlying": 100, "max_open_lots_total": 100,
+    "max_gross_lots_per_day": 1000, "max_entries_per_minute": 100, "reject_breaker_n": 100,
+    "min_entry_gap_s": 1,
 }  # fmt: skip
 
 
@@ -61,6 +69,19 @@ async def send_limits(
     command = SetRiskLimits(
         command_id=f"c-{key}", idempotency_key=key, account_id="main", source="test",
         sent_at=datetime.now(UTC), limits=limits or ALL_DAY,
+    )  # fmt: skip
+    await redis.xadd(COMMAND_STREAM, {"data": command.model_dump_json()})
+    return await reply(redis, command.command_id)
+
+
+async def send_ban_list(
+    redis: Redis, symbols: tuple[str, ...] = (), key: str = "ban-1"
+) -> CommandResult:
+    """Send today's F&O ban list (empty by default: no bans) through the stream, like ``cli risk
+    set-ban-list``. Without one for today every F&O entry is refused (add-risk-guards)."""
+    command = SetBanList(
+        command_id=f"c-{key}", idempotency_key=key, account_id="main", source="test",
+        sent_at=datetime.now(UTC), trade_date=ist_date(datetime.now(UTC)), symbols=list(symbols),
     )  # fmt: skip
     await redis.xadd(COMMAND_STREAM, {"data": command.model_dump_json()})
     return await reply(redis, command.command_id)

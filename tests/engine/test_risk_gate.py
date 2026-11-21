@@ -8,12 +8,14 @@ halt) and the guarantee that none of it refuses an exit.
 """
 
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 import pytest
 
 from contracts.commands import LimitValue
+from contracts.market import Instrument, InstrumentKey
 from contracts.mode import TradingMode
 from contracts.orders import Order, OrderSide
 from contracts.snapshot import HaltLevel
@@ -34,8 +36,10 @@ from engine.risk.gate import RiskEngine
 from engine.risk.limits import MODE_PREFIX, parse_limits
 from engine.risk.limits_service import LimitsService
 from tests.engine.risk_builders import (
+    INSTRUMENTS,
     NOW,
     OPTION,
+    TODAY,
     day_state,
     instrument_of,
     order,
@@ -83,6 +87,8 @@ class Harness:
         positions: list[Any] | None = None,
         state: StubState | None = None,
         on_kill: Callable[[Decision], None] | None = None,
+        instruments: Callable[[InstrumentKey], Instrument | None] = instrument_of,
+        now: datetime = NOW,
     ) -> None:
         self.repo = MemoryRiskRepository()
         self.limits = LimitsService(
@@ -96,7 +102,7 @@ class Harness:
         self.checks = checks if checks is not None else []
         self.gate = RiskEngine(
             account_id="main", mode=mode, limits=self.limits, state=self.state, audit=self.audit,
-            instruments=instrument_of, checks=self.checks, on_kill=on_kill, now=lambda: NOW,
+            instruments=instruments, checks=self.checks, on_kill=on_kill, now=lambda: now,
         )  # fmt: skip
         if bind:
             self.gate.bind(self.trading)
@@ -603,3 +609,116 @@ async def test_an_entry_whose_count_cannot_be_saved_is_refused_after_the_rules_a
 
     assert (reason or "").startswith("RISK_STATE_UNAVAILABLE") and "count" in (reason or "")
     assert h.verdict().reason_code == "RISK_STATE_UNAVAILABLE"
+
+
+# ---- lots, expiry and recent entries (add-risk-guards tasks 4.1, 4.2) -------------------------
+
+
+def _expiring_on(expiry: object) -> Callable[[InstrumentKey], Instrument | None]:
+    option = INSTRUMENTS[OPTION].model_copy(update={"expiry": expiry})
+    return {**INSTRUMENTS, OPTION: option}.get
+
+
+async def test_an_allowed_entry_is_counted_with_its_lots_from_the_instrument_master() -> None:
+    """Spec lot-caps "Lots of an option order": quantity / lot size (65 for the test option)."""
+    state = StubState(day_state())
+    h = await harness(state=state, checks=[Rule("max_trades", ALLOW)])
+
+    assert await h.gate.check(order(BUY, 130)) is None
+
+    assert state.counted == [(2, False)]
+
+
+@pytest.mark.parametrize(
+    ("expiry", "expiring"),
+    [(TODAY, True), (TODAY + timedelta(days=1), False), (None, False)],
+    ids=["today", "tomorrow", "none"],
+)
+async def test_an_entry_is_counted_as_expiring_only_when_its_contract_expires_today(
+    expiry: object, expiring: bool
+) -> None:
+    state = StubState(day_state())
+    h = await harness(state=state, checks=[], instruments=_expiring_on(expiry))
+
+    assert await h.gate.check(order(BUY, 65)) is None
+
+    assert state.counted == [(1, expiring)]
+
+
+@pytest.mark.parametrize(
+    ("expiry", "expiring"),
+    [(TODAY + timedelta(days=1), True), (TODAY, False)],
+    ids=["ist-date", "utc-date"],
+)
+async def test_expiring_is_judged_on_the_ist_date_not_the_utc_date(
+    expiry: object, expiring: bool
+) -> None:
+    """19:00 UTC on the 16th is 00:30 IST on the 17th: a contract expiring on the 17th expires
+    today, one that expired on the 16th does not."""
+    late = datetime(2026, 11, 16, 19, 0, tzinfo=UTC)
+    state = StubState(day_state())
+    h = await harness(state=state, checks=[], instruments=_expiring_on(expiry), now=late)
+
+    assert await h.gate.check(order(BUY, 65)) is None
+
+    assert state.counted == [(1, expiring)]
+
+
+async def test_an_entry_whose_instrument_is_unknown_at_counting_is_refused_fail_closed() -> None:
+    state = StubState(day_state())
+    h = await harness(state=state, checks=[Rule("max_trades", ALLOW)], instruments=lambda _: None)
+
+    reason = await h.gate.check(order(BUY, 65))
+
+    assert (reason or "").startswith("RISK_STATE_UNAVAILABLE") and "instrument master" in (
+        reason or ""
+    )
+    assert state.counted == []  # nothing was counted
+    assert h.verdict().reason_code == "RISK_STATE_UNAVAILABLE"
+
+
+async def test_an_exit_is_never_counted_and_needs_no_instrument() -> None:
+    state = StubState(day_state())
+    h = await harness(state=state, positions=[position(quantity=65)], instruments=lambda _: None)
+
+    assert await h.gate.check(order(SELL, 65)) is None
+    assert state.counted == []
+
+
+async def test_the_rules_see_the_recent_entries_and_safe_defaults_for_the_rest() -> None:
+    state = StubState(day_state())
+    state.recent = (NOW,)
+    rule = Rule("max_trades")
+    h = await harness(state=state, checks=[rule])
+
+    await h.gate.check(order(BUY, 65))
+
+    ctx, _ = rule.asked[0]
+    assert ctx.recent_entries == (NOW,)
+    assert (ctx.broker_rejections, ctx.target_confirmations) == ((), 0)
+    assert ctx.ban_list == frozenset()  # the state's ban list (task 7.2): the stub's is empty
+    assert ctx.spot_key("NIFTY") is None  # no spot lookup given: none known (fail closed)
+
+
+async def test_the_rules_see_todays_ban_list_and_the_spot_lookup() -> None:
+    """add-risk-guards tasks 7.2 and 7.4: the gate fills ``ban_list`` from the risk state (None
+    when it has none for today) and ``spot_key`` from the lookup it was built with."""
+    nifty = InstrumentKey.parse("IDX_I:13")
+    for bans in (frozenset({"XYZ"}), None):
+        state = StubState(day_state())
+        state.bans = bans
+        rule = Rule("max_trades")
+        h = Harness(state=state, checks=[rule])
+        h.gate = RiskEngine(
+            account_id="main", mode=TradingMode.PAPER, limits=h.limits, state=state,
+            audit=h.audit, instruments=instrument_of, checks=[rule],
+            spot_key={"NIFTY": nifty}.get, now=lambda: NOW,
+        )  # fmt: skip
+        h.gate.bind(h.trading)
+        await h.ready()
+
+        await h.gate.check(order(BUY, 65))
+
+        ctx, _ = rule.asked[0]
+        assert ctx.ban_list == bans
+        assert ctx.spot_key("NIFTY") == nifty and ctx.spot_key("XYZ") is None

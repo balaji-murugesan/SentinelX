@@ -25,7 +25,7 @@ from engine.persistence import tables as t
 from engine.persistence.migrate import alembic_config
 from engine.persistence.postgres_risk import PostgresRiskRepository
 from engine.persistence.repository import PersistenceError
-from engine.risk.repository import RiskEvent, RiskRepository
+from engine.risk.repository import RiskEvent, RiskRepository, StoredBanList
 from engine.risk.state import DayState
 from tests.engine.risk_fakes import MemoryRiskRepository
 from tests.engine.test_trading_repository import (
@@ -157,6 +157,7 @@ async def test_first_save_is_stored_exactly_and_returned(harness: Harness) -> No
         halt_reason="equity floor breached", entries_today=4, loss_streak=2,
         cooldown_until=NOW + timedelta(minutes=30),
         close_marks={"NSE_FNO:53720|INTRADAY": "201.35"},
+        entry_lots_today=9, last_entry_at=NOW - timedelta(minutes=2), expiry_exposure=True,
     )  # fmt: skip
 
     returned = await harness.repo.save_day(first)
@@ -311,14 +312,66 @@ async def test_close_marks_keep_the_first_marks_written(harness: Harness) -> Non
     assert later.close_marks == first and none.close_marks == first
 
 
+async def test_a_new_day_row_starts_with_no_lots_no_entry_time_and_no_expiry_exposure(
+    harness: Harness,
+) -> None:
+    returned = await harness.repo.save_day(day())
+
+    assert returned.entry_lots_today == 0 and returned.last_entry_at is None
+    assert returned.expiry_exposure is False
+
+
+async def test_entry_lots_and_the_last_entry_time_never_decrease(harness: Harness) -> None:
+    """add-risk-guards task 2.3: GREATEST, like the other counters."""
+    latest = NOW + timedelta(minutes=10)
+    await harness.repo.save_day(day(entry_lots_today=6, last_entry_at=latest))
+
+    stale = await harness.repo.save_day(day(entry_lots_today=2, last_entry_at=NOW))
+    unset = await harness.repo.save_day(day(entry_lots_today=0, last_entry_at=None))
+
+    assert stale.entry_lots_today == 6 and stale.last_entry_at == latest
+    assert unset.entry_lots_today == 6 and unset.last_entry_at == latest
+    stored = await harness.repo.load_day("main", TODAY)
+    assert stored is not None
+    assert stored.entry_lots_today == 6 and stored.last_entry_at == latest
+
+
+async def test_more_entry_lots_and_a_later_entry_time_are_taken(harness: Harness) -> None:
+    await harness.repo.save_day(day(entry_lots_today=2, last_entry_at=NOW))
+    later = NOW + timedelta(seconds=45)
+
+    returned = await harness.repo.save_day(day(entry_lots_today=3, last_entry_at=later))
+
+    assert returned.entry_lots_today == 3 and returned.last_entry_at == later
+
+
+async def test_expiry_exposure_switches_on_and_never_back_off(harness: Harness) -> None:
+    off = await harness.repo.save_day(day(expiry_exposure=False))
+    on = await harness.repo.save_day(day(expiry_exposure=True))
+    stale = await harness.repo.save_day(day(expiry_exposure=False))
+
+    assert off.expiry_exposure is False and on.expiry_exposure is True
+    assert stale.expiry_exposure is True
+    stored = await harness.repo.load_day("main", TODAY)
+    assert stored is not None and stored.expiry_exposure is True
+
+
 async def test_each_date_and_account_has_its_own_row(harness: Harness) -> None:
     tomorrow = TODAY + timedelta(days=1)
-    await harness.repo.save_day(day(peak=Decimal("500"), halt_level=HaltLevel.KILL))
+    await harness.repo.save_day(
+        day(
+            peak=Decimal("500"), halt_level=HaltLevel.KILL,
+            entry_lots_today=3, last_entry_at=NOW, expiry_exposure=True,
+        )
+    )  # fmt: skip
 
     # The next day starts fresh: a kill does not carry over (the "post-close reset").
     assert await harness.repo.load_day("main", tomorrow) is None
     fresh = await harness.repo.save_day(day(trade_date=tomorrow))
     assert fresh.halt_level is HaltLevel.NONE and fresh.peak == Decimal("0")
+    # Nor do the guard counters: no lots entered, no last entry, no expiry-day exposure yet.
+    assert fresh.entry_lots_today == 0 and fresh.last_entry_at is None
+    assert fresh.expiry_exposure is False
     # Another account is untouched.
     assert await harness.repo.load_day("other", TODAY) is None
     other = await harness.repo.save_day(day(account_id="other"))
@@ -352,6 +405,8 @@ async def test_concurrent_writes_never_lower_a_rising_column(harness: Harness) -
                 peak=Decimal(i), floor=Decimal(i - 100), entries_today=i,
                 halt_level=levels[i % len(levels)], halt_reason=f"reason {i}",
                 cooldown_until=NOW + timedelta(minutes=i), loss_streak=i % 4,
+                entry_lots_today=i, last_entry_at=NOW + timedelta(seconds=i),
+                expiry_exposure=i == 17,  # only one write switches it on
             )
             for i in range(40)
         ]  # fmt: skip
@@ -365,6 +420,9 @@ async def test_concurrent_writes_never_lower_a_rising_column(harness: Harness) -
         assert stored.entries_today == 39
         assert stored.halt_level is max(levels)
         assert stored.cooldown_until == NOW + timedelta(minutes=39)
+        assert stored.entry_lots_today == 39
+        assert stored.last_entry_at == NOW + timedelta(seconds=39)
+        assert stored.expiry_exposure is True
 
 
 # ---- audit --------------------------------------------------------------------------------
@@ -393,6 +451,64 @@ async def test_audit_events_are_stored_in_order_with_every_field(harness: Harnes
     assert await harness.events() == [rejected, verdict, shadow]
 
 
+# ---- ban list (add-risk-guards task 2.3) --------------------------------------------------
+
+
+async def test_no_ban_list_until_one_is_saved(harness: Harness) -> None:
+    assert await harness.repo.load_ban_list("main", TODAY) == []
+
+
+async def test_a_ban_list_round_trips_and_survives_a_reload(harness: Harness) -> None:
+    """instrument-policy "The list SHALL be stored and survive a restart"."""
+    returned = await harness.repo.save_ban_list("main", TODAY, frozenset({"XYZ", "ABC"}), NOW)
+
+    expected = StoredBanList(TODAY, frozenset({"ABC", "XYZ"}), NOW)
+    assert returned == expected
+    assert await harness.repo.load_ban_list("main", TODAY) == [expected]
+
+
+async def test_an_empty_ban_list_is_stored_and_differs_from_no_list(harness: Harness) -> None:
+    """An empty list means "no bans that day"; no row means "not loaded" (fail closed)."""
+    await harness.repo.save_ban_list("main", TODAY, frozenset(), NOW)
+
+    assert await harness.repo.load_ban_list("main", TODAY) == [
+        StoredBanList(TODAY, frozenset(), NOW)
+    ]
+
+
+async def test_saving_a_ban_list_again_replaces_it(harness: Harness) -> None:
+    await harness.repo.save_ban_list("main", TODAY, frozenset({"ABC", "XYZ"}), NOW)
+    later = NOW + timedelta(hours=1)
+
+    returned = await harness.repo.save_ban_list("main", TODAY, frozenset({"ABC"}), later)
+
+    assert returned == StoredBanList(TODAY, frozenset({"ABC"}), later)  # replaced, not merged
+    assert await harness.repo.load_ban_list("main", TODAY) == [returned]
+
+
+async def test_ban_lists_load_from_a_date_onwards_earliest_first(harness: Harness) -> None:
+    """Scenario "Loading tomorrow's list in the evening": a later date is stored too."""
+    yesterday, tomorrow = TODAY - timedelta(days=1), TODAY + timedelta(days=1)
+    for trade_date, symbol in ((tomorrow, "T"), (yesterday, "Y"), (TODAY, "D")):
+        await harness.repo.save_ban_list("main", trade_date, frozenset({symbol}), NOW)
+
+    loaded = await harness.repo.load_ban_list("main", TODAY)
+
+    assert [(b.trade_date, b.symbols) for b in loaded] == [
+        (TODAY, frozenset({"D"})), (tomorrow, frozenset({"T"})),
+    ]  # fmt: skip
+    assert await harness.repo.load_ban_list("main", tomorrow + timedelta(days=1)) == []
+
+
+async def test_ban_lists_are_per_account(harness: Harness) -> None:
+    await harness.repo.save_ban_list("main", TODAY, frozenset({"XYZ"}), NOW)
+
+    assert await harness.repo.load_ban_list("other", TODAY) == []
+    await harness.repo.save_ban_list("other", TODAY, frozenset({"ABC"}), NOW)
+    main = await harness.repo.load_ban_list("main", TODAY)
+    assert [b.symbols for b in main] == [frozenset({"XYZ"})]
+
+
 # ---- failure ------------------------------------------------------------------------------
 
 # A refused or failed database call must say only what kind of failure it was: never a driver
@@ -408,6 +524,8 @@ async def test_unreachable_database_raises_persistence_error_naming_only_the_typ
         lambda: repo.load_day("main", TODAY),
         lambda: repo.save_day(day()),
         lambda: repo.append_event(RiskEvent(NOW, "main", "gate", "verdict", "ALLOW", True, 1)),
+        lambda: repo.load_ban_list("main", TODAY),
+        lambda: repo.save_ban_list("main", TODAY, frozenset({"XYZ"}), NOW),
     ):
         with pytest.raises(PersistenceError) as info:
             await call()  # type: ignore[operator]
@@ -447,7 +565,8 @@ async def test_a_database_that_never_answers_gives_up_after_the_timeout() -> Non
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="TEST_DATABASE_URL not set")
 async def test_a_stored_halt_level_this_version_does_not_know_fails_closed() -> None:
-    """The reserved level 20 (or damage) must never decode as "no halt": it raises."""
+    """A level this version does not know (from a newer version, or damage) must never decode
+    as "no halt": it raises. 25 stands in for it, since add-risk-guards made 20 a real level."""
     assert TEST_DATABASE_URL
     await prepare_database(TEST_DATABASE_URL)
     engine = create_async_engine(TEST_DATABASE_URL)
@@ -457,7 +576,7 @@ async def test_a_stored_halt_level_this_version_does_not_know_fails_closed() -> 
                 account_id="main",
                 trade_date=TODAY,
                 peak=Decimal(0),
-                halt_level=20,
+                halt_level=25,
                 entries_today=0,
                 loss_streak=0,
                 updated_at=NOW,
@@ -471,6 +590,28 @@ async def test_a_stored_halt_level_this_version_does_not_know_fails_closed() -> 
         assert "stored risk data is invalid" in str(info.value)
         with pytest.raises(PersistenceError):  # the same row reached through a write
             await repo.save_day(day(halt_level=HaltLevel.MTM_BLIND))
+    finally:
+        await repo.close()
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="TEST_DATABASE_URL not set")
+async def test_a_damaged_stored_ban_list_fails_closed() -> None:
+    """A document that is not a list of text must never read as "no bans": it raises."""
+    assert TEST_DATABASE_URL
+    await prepare_database(TEST_DATABASE_URL)
+    engine = create_async_engine(TEST_DATABASE_URL)
+    async with engine.begin() as conn:
+        await conn.execute(
+            sa.insert(t.risk_ban_list).values(
+                account_id="main", trade_date=TODAY, symbols={"XYZ": True}, loaded_at=NOW
+            )
+        )
+    await engine.dispose()
+    repo = PostgresRiskRepository(TEST_DATABASE_URL)
+    try:
+        with pytest.raises(PersistenceError) as info:
+            await repo.load_ban_list("main", TODAY)
+        assert "stored risk data is invalid" in str(info.value)
     finally:
         await repo.close()
 
@@ -491,3 +632,47 @@ async def test_the_migrations_and_the_table_definitions_do_not_drift() -> None:
     await asyncio.to_thread(migrate, TEST_DATABASE_URL, "0003")
     await asyncio.to_thread(migrate, TEST_DATABASE_URL, "head")
     await asyncio.to_thread(command.check, alembic_config(TEST_DATABASE_URL))
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="TEST_DATABASE_URL not set")
+async def test_migration_0005_downgrades_to_0004_and_upgrades_again() -> None:
+    """add-risk-guards task 2.3: ``upgrade head`` then ``downgrade 0004`` runs cleanly, removes
+    exactly what 0005 added, and a row stored meanwhile gets the new columns' defaults."""
+    assert TEST_DATABASE_URL
+    await prepare_database(TEST_DATABASE_URL)  # at head
+    await asyncio.to_thread(migrate, TEST_DATABASE_URL, "0004")
+
+    def schema(conn: sa.Connection) -> tuple[set[str], set[str]]:
+        inspector = sa.inspect(conn)
+        columns = {c["name"] for c in inspector.get_columns("risk_day_state")}
+        return set(inspector.get_table_names()), columns
+
+    engine = create_async_engine(TEST_DATABASE_URL)
+    try:
+        async with engine.begin() as conn:
+            tables, columns = await conn.run_sync(schema)
+            assert "risk_ban_list" not in tables and "risk_day_state" in tables
+            assert not columns & {"entry_lots_today", "last_entry_at", "expiry_exposure"}
+            # A row written by the 0004 schema, before the upgrade.
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO risk_day_state (account_id, trade_date, peak, halt_level, "
+                    "entries_today, loss_streak, updated_at) "
+                    "VALUES ('main', :d, 0, 0, 2, 0, :at)"
+                ),
+                {"d": TODAY, "at": NOW},
+            )
+    finally:
+        await engine.dispose()
+
+    await asyncio.to_thread(migrate, TEST_DATABASE_URL, "head")
+
+    repo = PostgresRiskRepository(TEST_DATABASE_URL)
+    try:
+        stored = await repo.load_day("main", TODAY)
+        assert stored is not None and stored.entries_today == 2
+        assert stored.entry_lots_today == 0 and stored.last_entry_at is None
+        assert stored.expiry_exposure is False
+        assert await repo.load_ban_list("main", TODAY) == []
+    finally:
+        await repo.close()

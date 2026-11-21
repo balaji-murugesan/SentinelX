@@ -20,6 +20,16 @@ class BrokerRejected(Exception):
     """The broker refused the order outright (it never became open)."""
 
 
+class RateLimited(BrokerRejected):
+    """The engine's own rate limiter refused the order before it was sent (``RISK_RATE_LIMITED``).
+
+    A subclass, so every caller that handles ``BrokerRejected`` treats it exactly as before (the
+    order ends ``Rejected`` with this reason). The type says who refused: the order never reached
+    the broker, so it must not count as a *broker* rejection for the rejection breaker
+    (add-risk-guards design §4). In C# terms: ``class RateLimited : BrokerRejected``, and a
+    ``catch (RateLimited)`` placed before ``catch (BrokerRejected)`` picks it out."""
+
+
 class BrokerError(Exception):
     """A broker call failed for another reason (for example cancelling an order not open)."""
 
@@ -94,7 +104,7 @@ class Admitting(Protocol):
     caller may ignore this. The order service uses the steps separately so that the time spent
     waiting for a turn does not count against the broker's acknowledgement timeout (an exit may
     legitimately wait up to a minute for a token, and must not become ``Unknown`` for it).
-    ``admit_*`` takes the turn (an entry that has none is refused at once with ``BrokerRejected``);
+    ``admit_*`` takes the turn (an entry that has none is refused at once with ``RateLimited``);
     ``send_*`` is the call to the broker and takes no turn."""
 
     async def admit_place(self, order: Order) -> None: ...

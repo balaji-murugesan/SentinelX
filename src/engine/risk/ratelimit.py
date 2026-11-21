@@ -47,8 +47,8 @@ from engine.broker.adapter import (
     BrokerAck,
     BrokerAdapter,
     BrokerOrder,
-    BrokerRejected,
     BrokerUpdate,
+    RateLimited,
 )
 from engine.orders.intent import Intent, classify
 from engine.positions.book import PositionId
@@ -145,7 +145,7 @@ class RateLimitedAdapter:
 
     async def admit_place(self, order: Order) -> None:
         """Take the token for placing ``order``: an exit waits for one, an entry that finds none
-        is refused at once (``BrokerRejected``, ``RISK_RATE_LIMITED``)."""
+        is refused at once (``RateLimited``, a ``BrokerRejected``, with ``RISK_RATE_LIMITED``)."""
         if classify(order, self._positions()) is Intent.EXIT:
             await self._take_priority_token("exit")
         else:
@@ -175,7 +175,9 @@ class RateLimitedAdapter:
         now = self._clock()
         if not all(w.has_entry_token(now) for w in self._windows):
             log.warning("entry refused by the rate limiter", order_id=order.order_id)
-            raise BrokerRejected(
+            # ``RateLimited`` (a ``BrokerRejected``): the service rejects the order as before, and
+            # the type tells it the broker never saw it, so the rejection breaker does not count it.
+            raise RateLimited(
                 f"{RATE_LIMITED}: too many orders just now (entries leave the last tokens of "
                 f"each window to exits and cancels)"
             )

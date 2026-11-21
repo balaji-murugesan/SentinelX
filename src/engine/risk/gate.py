@@ -45,6 +45,7 @@ from engine.market_data.clock import utc_now
 from engine.orders.intent import Intent, classify
 from engine.positions.book import PositionId
 from engine.risk.audit import RiskAudit
+from engine.risk.checks.lots import capped_lots
 from engine.risk.decision import (
     CHECK_ERROR,
     HALTED_DAY,
@@ -57,8 +58,10 @@ from engine.risk.decision import (
     RuleResult,
     Severity,
     most_severe,
+    no_spot,
     run_pre_trade,
 )
+from engine.risk.expiry import expires_today
 from engine.risk.limits import STATE_UNAVAILABLE
 from engine.risk.limits_service import LimitsService
 from engine.risk.repository import AuditValue, RiskEvent
@@ -109,9 +112,24 @@ class RiskState(Protocol):
         unprotected position), or None."""
         ...
 
-    async def entry_allowed(self) -> str | None:
-        """Count one allowed entry and persist the count before the entry is sent. None on
-        success; otherwise why it could not be saved, and the entry is refused."""
+    def recent_entries(self, now: datetime) -> tuple[datetime, ...]:
+        """The times of the entries allowed in the last 60 s (entry pacing), oldest first."""
+        ...
+
+    def broker_rejections(self, now: datetime) -> tuple[datetime, ...]:
+        """The times of the broker rejections in the last 300 s (the rejection breaker), oldest
+        first."""
+        ...
+
+    def ban_list(self, now: datetime) -> frozenset[str] | None:
+        """The F&O ban list for the IST date of ``now``, or None when none is loaded for it or the
+        stored lists have not been read (the instrument policy then refuses F&O entries)."""
+        ...
+
+    async def entry_allowed(self, lots: int, expiring: bool) -> str | None:
+        """Count one allowed entry of ``lots`` lots (``expiring``: its contract expires today) and
+        persist the count, the lots, the entry time and the expiry flag before the entry is sent.
+        None on success; otherwise why it could not be saved, and the entry is refused."""
         ...
 
 
@@ -127,13 +145,16 @@ class RiskEngine:
         instruments: Callable[[InstrumentKey], Instrument | None],
         checks: Sequence[PreTradeCheck],  # required: a gate with no rules would allow everything
         on_kill: Callable[[Decision], None] | None = None,
+        spot_key: Callable[[str], InstrumentKey | None] = no_spot,
         now: Callable[[], datetime] = utc_now,
     ) -> None:
         """``on_kill`` is called when an enforced pre-trade rule returns KILL, so that the engine
         acts on the most severe decision wherever it was seen (the floor check is normally a
         continuous one, but a pre-trade rule may return KILL too). The gate runs inside the order
         service's lock, which the kill's own cancels need, so the hook must only *schedule* the
-        kill and return (``KillSwitch.request``); it must never await it."""
+        kill and return (``KillSwitch.request``); it must never await it. ``spot_key`` maps an
+        underlying symbol to its spot instrument (the instrument policy's strike distance); the
+        default knows none, which refuses an option entry while a strike distance is set."""
         self._account_id = account_id
         self._mode = mode
         self._limits = limits
@@ -142,6 +163,7 @@ class RiskEngine:
         self._instruments = instruments
         self._checks = tuple(checks)
         self._on_kill = on_kill
+        self._spot_key = spot_key
         self._now = now
         self._trading: TradingView | None = None
 
@@ -167,11 +189,8 @@ class RiskEngine:
                     reason = self._judge_exit(order, now, results, extra)
                 else:
                     reason = self._judge_entry(order, now, results, extra)
-                    if reason is None and (saved := await self._state.entry_allowed()) is not None:
-                        # Every rule allowed it, but the day's entry count could not be written
-                        # first: refuse (fail closed), because an uncounted entry could breach
-                        # the daily maximum after a restart.
-                        reason = f"{STATE_UNAVAILABLE}: {saved}"
+                    if reason is None:
+                        reason = await self._count_entry(order, now)
         except Exception as error:
             # Nothing above should raise (the checks are guarded), but if it does: an entry
             # fails closed and an exit goes through, exactly as the spec's rule for unavailable
@@ -240,6 +259,33 @@ class RiskEngine:
         self._request_kill_if_severe(winner)
         return None if winner is None else self._refusal(winner, extra)
 
+    async def _count_entry(self, order: Order, now: datetime) -> str | None:
+        """Every rule allowed the entry: count it, with its lots and whether its contract expires
+        today, in the day's state before it is sent. The reason to refuse it, or None.
+
+        Trading terms: a *lot* is the exchange's minimum contract size (65 units of a NIFTY
+        option, say); order quantity is in units, a whole number of lots. A contract *expires
+        today* when its expiry date is today's IST date."""
+        instrument = self._instruments(order.key)
+        if instrument is None:
+            # Validation refuses an instrument the master does not know before the gate sees it,
+            # so this should not happen; if it does, the lots cannot be counted: fail closed.
+            return (
+                f"{STATE_UNAVAILABLE}: {order.key} is not in the instrument master, so its lots "
+                "cannot be counted"
+            )
+        # The lots the lot caps count: whole lots in every capped segment (a part lot counts as a
+        # whole one), and 0 for a cash equity, which still counts as an entry for the entry
+        # counters and pacing.
+        lots = capped_lots(order.key, order.quantity, instrument.lot_size)
+        expiring = expires_today(instrument, now)
+        if (saved := await self._state.entry_allowed(lots, expiring)) is not None:
+            # Every rule allowed it, but the day's counters could not be written first: refuse
+            # (fail closed), because an uncounted entry could breach a daily maximum after a
+            # restart.
+            return f"{STATE_UNAVAILABLE}: {saved}"
+        return None
+
     @staticmethod
     def _refusal(winner: RuleResult, extra: dict[str, AuditValue]) -> str:
         extra["decided_by"] = winner.rule
@@ -258,6 +304,10 @@ class RiskEngine:
             orders=trading.orders,
             instruments=self._instruments,
             quote=self._state.quote,
+            recent_entries=self._state.recent_entries(now),
+            broker_rejections=self._state.broker_rejections(now),
+            ban_list=self._state.ban_list(now),
+            spot_key=self._spot_key,
         )
 
     # ---- audit -----------------------------------------------------------------------------
