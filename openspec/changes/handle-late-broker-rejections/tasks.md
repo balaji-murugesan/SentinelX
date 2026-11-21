@@ -41,7 +41,7 @@ Start both test containers first (sx-redis-test on 6380, sx-pg-test on 5433). Ru
 
 ## 4. Exits rejected after acceptance
 
-- [ ] 4.1 Add tests in `tests/engine/test_risk_kill*.py`, driving the `Flattener` through a real acknowledgement followed by a stream `Rejected`. This is no code change unless a test fails; if one does, fix the code, never the test. Verify:
+- [x] 4.1 Add tests in `tests/engine/test_risk_kill*.py`, driving the `Flattener` through a real acknowledgement followed by a stream `Rejected`. This is no code change unless a test fails; if one does, fix the code, never the test. Verify:
   - spec "Exit rejected after the acknowledgement", chase interval 5 s: no exit before 10:00:05, then one for the current quantity at the current price;
   - spec "Rejections do not use up the chase steps", with `max_chase_steps` 3 and four rejections, after which a fifth exit is placed;
   - the flatten still finishes once the position is flat.
