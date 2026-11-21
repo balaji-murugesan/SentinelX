@@ -83,15 +83,15 @@ The rate limiter's refusal becomes `RateLimited(BrokerRejected)`, a subclass tha
 ### 5. Lot caps and pacing
 
 ```
-lots(o)       = |o.quantity| / lot_size(o.key)                  # master lookup; unknown → refuse
-pending(u)    = Σ lots(o) for non-final orders, classify(o) is ENTRY, underlying(o) = u, o ≠ order
-open(u)       = Σ |p.quantity| / lot_size for open positions on u (carried included)
+lots(q, k)    = ⌈|q| / lot_size(k)⌉ if k is F&O, else 0         # master lookup; unknown F&O → refuse
+pending(u)    = Σ lots(|o.quantity| - o.filled_quantity, o.key) for non-final orders whose unfilled part classifies as ENTRY, underlying(o) = u, o ≠ order
+open(u)       = Σ lots(p.quantity, p.key) for open positions on u (carried included)
 per-underlying: open(u) + pending(u) + lots(order) ≤ cap_u      # cap_u = expiry cap if order expires today
 total:          Σ_u open(u) + Σ_u pending(u) + lots(order) ≤ cap_total
 daily gross:    day.entry_lots_today + lots(order) ≤ max_gross_lots_per_day
 ```
 
-A non-final order is reclassified against the current positions with the same `classify`, so a resting order that only reduces a position does not reserve lots. Pacing reads `recent_entries` (60 s window, `max_entries_per_minute`) and `day.last_entry_at` (`min_entry_gap_s`).
+The caps count F&O contract lots only (segment `NSE_FNO` or `BSE_FNO`, from the instrument key, so an unknown equity is skipped and an unknown F&O contract is refused). An equity entry is not judged by them and adds 0 to `entry_lots_today`, though it still counts as an entry for `entries_today` and pacing. A non-final order is reclassified on its unfilled part against the current positions with the same `classify`, so a resting order that only reduces a position does not reserve lots. Pacing reads `recent_entries` (60 s window, `max_entries_per_minute`) and `day.last_entry_at` (`min_entry_gap_s`).
 
 ### 6. Expiry profile
 

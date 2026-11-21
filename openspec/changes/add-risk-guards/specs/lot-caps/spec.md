@@ -6,8 +6,21 @@ Caps how large the book can grow, measured in lots, per underlying, in total and
 
 ## ADDED Requirements
 
+### Requirement: Lot caps count F&O contract lots only
+The lot caps SHALL count only instruments in an F&O (derivative) segment, decided from the instrument key's segment. An entry in a non-F&O instrument (an equity) SHALL NOT be judged by any lot cap, SHALL add no lots to the day's gross lots, and SHALL still count as an entry for the other entry counters. Non-F&O positions and orders SHALL count no lots, and a non-F&O instrument with no master record SHALL NOT cause a lot-cap refusal.
+
+#### Scenario: Equity holdings do not count
+- **GIVEN** `max_open_lots_total` = 8 and a carried CNC holding of 500 shares
+- **WHEN** a 2-lot NIFTY option entry is submitted
+- **THEN** it is not refused by any lot cap
+
+#### Scenario: An equity entry is not judged
+- **GIVEN** `max_gross_lots_per_day` = 20 and 20 lots allowed today
+- **WHEN** an entry for 100 shares of an equity is allowed
+- **THEN** no lot cap refuses it and the day's gross lots stay at 20
+
 ### Requirement: Lots are counted from the instrument master
-An order's or position's lots SHALL be its absolute quantity divided by the instrument's lot size from the instrument master. An entry whose instrument, or any counted instrument, has no master record SHALL be refused with the lot-cap code of the cap being checked.
+An F&O order's or position's lots SHALL be its absolute quantity divided by the instrument's lot size from the instrument master. An F&O entry whose instrument, or any counted F&O instrument, has no master record SHALL be refused with the lot-cap code of the cap being checked.
 
 #### Scenario: Lots of an option order
 - **GIVEN** an option with a lot size of 75
@@ -15,7 +28,7 @@ An order's or position's lots SHALL be its absolute quantity divided by the inst
 - **THEN** it counts as 2 lots
 
 #### Scenario: Unknown instrument in the book
-- **GIVEN** an open position whose instrument is missing from the master
+- **GIVEN** an open F&O position whose instrument is missing from the master
 - **WHEN** an entry on the same underlying is judged
 - **THEN** it is refused with `RISK_LOTS_UNDERLYING`
 

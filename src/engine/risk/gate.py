@@ -41,10 +41,11 @@ from contracts.market import Instrument, InstrumentKey
 from contracts.mode import TradingMode
 from contracts.orders import Order, Position
 from contracts.snapshot import HaltLevel
-from engine.market_data.clock import ist_date, utc_now
+from engine.market_data.clock import utc_now
 from engine.orders.intent import Intent, classify
 from engine.positions.book import PositionId
 from engine.risk.audit import RiskAudit
+from engine.risk.checks.lots import fno_lots
 from engine.risk.decision import (
     CHECK_ERROR,
     HALTED_DAY,
@@ -59,6 +60,7 @@ from engine.risk.decision import (
     most_severe,
     run_pre_trade,
 )
+from engine.risk.expiry import expires_today
 from engine.risk.limits import STATE_UNAVAILABLE
 from engine.risk.limits_service import LimitsService
 from engine.risk.repository import AuditValue, RiskEvent
@@ -257,10 +259,10 @@ class RiskEngine:
                 f"{STATE_UNAVAILABLE}: {order.key} is not in the instrument master, so its lots "
                 "cannot be counted"
             )
-        # Ceiling division (``-(-a // b)``): a part lot counts as a whole one, the safe side.
-        # Validation only lets whole lots through, so it is exact in practice.
-        lots = -(-abs(order.quantity) // instrument.lot_size)
-        expiring = instrument.expiry is not None and instrument.expiry == ist_date(now)
+        # The lots the lot caps count: whole F&O lots (a part lot counts as a whole one), and 0
+        # for an equity, which still counts as an entry for the entry counters and pacing.
+        lots = fno_lots(order.key, order.quantity, instrument.lot_size)
+        expiring = expires_today(instrument, now)
         if (saved := await self._state.entry_allowed(lots, expiring)) is not None:
             # Every rule allowed it, but the day's counters could not be written first: refuse
             # (fail closed), because an uncounted entry could breach a daily maximum after a

@@ -10,6 +10,8 @@ nothing else, and a test pins that their names match the rule table in ``engine.
 
 from engine.risk.checks.counters import Cooldown, MaxTrades
 from engine.risk.checks.exposure import EntryCutoff, FloorHeadroom, OpenPositions
+from engine.risk.checks.flow import EntryPacing
+from engine.risk.checks.lots import LotCaps
 from engine.risk.checks.prices import PriceSanity, StaleQuote
 from engine.risk.checks.protection import Unprotected
 from engine.risk.checks.stale import FeedDown, FloorBreach, MtmBlind
@@ -29,6 +31,9 @@ def default_checks() -> list[PreTradeCheck]:
         OpenPositions(),
         EntryCutoff(),
         FloorHeadroom(),
+        # add-risk-guards, appended (so the rules above keep their tie-break order):
+        LotCaps(),
+        EntryPacing(),
     ]
 
 
