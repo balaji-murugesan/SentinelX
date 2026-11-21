@@ -44,7 +44,7 @@ from engine.persistence.postgres import PostgresRepository
 from engine.persistence.repository import LoadedState
 from tests.engine.test_order_service import command
 from tests.engine.test_trading_repository import prepare_database
-from tests.integration.risk_setup import send_kill, send_limits, with_stop
+from tests.integration.risk_setup import send_ban_list, send_kill, send_limits, with_stop
 from tests.integration.test_engine_run import eventually, send, snapshot_shows
 
 TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL")
@@ -275,6 +275,7 @@ async def test_kill_minus_9_then_restart_keeps_state_and_the_resting_limit(
         engine.start()
         await wait_for_snapshot(redis, engine)
         assert (await send_limits(redis)).accepted  # stored in Postgres: the restart finds them
+        assert (await send_ban_list(redis)).accepted  # and so is today's F&O ban list
         buy_key, buy_order_id = await buy_one_lot(redis, engine)
         await eventually(
             lambda: snapshot_shows(
@@ -383,6 +384,7 @@ async def test_kill_minus_9_right_after_a_kill_keeps_the_day_locked_and_resumes_
         engine.start()
         await wait_for_snapshot(redis, engine)
         assert (await send_limits(redis)).accepted
+        assert (await send_ban_list(redis)).accepted
         await buy_one_lot(redis, engine)
         await eventually(
             lambda: snapshot_shows(

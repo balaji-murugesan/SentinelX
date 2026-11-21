@@ -38,6 +38,7 @@ from tests.engine.test_trading_repository import prepare_database
 from tests.engine.trading_fakes import MemoryRepository
 from tests.integration.risk_setup import (
     place_when_ready,
+    send_ban_list,
     send_kill,
     send_limits,
     with_stop,
@@ -155,6 +156,7 @@ async def test_paper_order_goes_through_the_command_stream(
     )
     try:
         assert (await send_limits(redis)).accepted
+        assert (await send_ban_list(redis)).accepted
         # A resting buy well below the simulated price (it starts at 100), so it stays open.
         _, reply = await place_when_ready(redis, lambda k: with_stop(command(k, limit="95"), "85"))
         await eventually(lambda: snapshot_shows(redis, lambda s: len(s.open_orders) == 1))
@@ -197,6 +199,7 @@ async def test_snapshot_writer_crash_leaves_orders_and_heartbeat_running(
     try:
         await eventually(lambda: _at_least(crashes, 2))  # crashed, restarted, crashed again
         assert (await send_limits(redis)).accepted
+        assert (await send_ban_list(redis)).accepted
         _, reply = await place_when_ready(redis, lambda k: with_stop(command(k, limit="95"), "85"))
         assert is_healthy(tmp_path / "hb")
         assert not engine.task.done()
@@ -229,6 +232,7 @@ async def test_halted_start_is_shown_and_only_resume_clears_it(
             lines: list[str] = []
             code = await cli.resume_recovery(redis, account_id="main", out=lines.append)
             assert (await send_limits(redis)).accepted
+            assert (await send_ban_list(redis)).accepted
             _, accepted = await place_when_ready(
                 redis, lambda k: with_stop(command(k, limit="95"), "85")
             )
@@ -255,6 +259,7 @@ async def test_run_on_real_postgres_keeps_state_across_a_restart(
     first = Engine(settings, redis, None)  # no injected repository: Postgres from DATABASE_URL
     try:
         assert (await send_limits(redis)).accepted  # stored in Postgres: the restart finds them
+        assert (await send_ban_list(redis)).accepted  # and so is the ban list
         key, placed = await place_when_ready(
             redis, lambda k: with_stop(command(k, limit="95"), "85")
         )

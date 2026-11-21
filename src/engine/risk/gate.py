@@ -58,6 +58,7 @@ from engine.risk.decision import (
     RuleResult,
     Severity,
     most_severe,
+    no_spot,
     run_pre_trade,
 )
 from engine.risk.expiry import expires_today
@@ -120,6 +121,11 @@ class RiskState(Protocol):
         first."""
         ...
 
+    def ban_list(self, now: datetime) -> frozenset[str] | None:
+        """The F&O ban list for the IST date of ``now``, or None when none is loaded for it or the
+        stored lists have not been read (the instrument policy then refuses F&O entries)."""
+        ...
+
     async def entry_allowed(self, lots: int, expiring: bool) -> str | None:
         """Count one allowed entry of ``lots`` lots (``expiring``: its contract expires today) and
         persist the count, the lots, the entry time and the expiry flag before the entry is sent.
@@ -139,13 +145,16 @@ class RiskEngine:
         instruments: Callable[[InstrumentKey], Instrument | None],
         checks: Sequence[PreTradeCheck],  # required: a gate with no rules would allow everything
         on_kill: Callable[[Decision], None] | None = None,
+        spot_key: Callable[[str], InstrumentKey | None] = no_spot,
         now: Callable[[], datetime] = utc_now,
     ) -> None:
         """``on_kill`` is called when an enforced pre-trade rule returns KILL, so that the engine
         acts on the most severe decision wherever it was seen (the floor check is normally a
         continuous one, but a pre-trade rule may return KILL too). The gate runs inside the order
         service's lock, which the kill's own cancels need, so the hook must only *schedule* the
-        kill and return (``KillSwitch.request``); it must never await it."""
+        kill and return (``KillSwitch.request``); it must never await it. ``spot_key`` maps an
+        underlying symbol to its spot instrument (the instrument policy's strike distance); the
+        default knows none, which refuses an option entry while a strike distance is set."""
         self._account_id = account_id
         self._mode = mode
         self._limits = limits
@@ -154,6 +163,7 @@ class RiskEngine:
         self._instruments = instruments
         self._checks = tuple(checks)
         self._on_kill = on_kill
+        self._spot_key = spot_key
         self._now = now
         self._trading: TradingView | None = None
 
@@ -296,6 +306,8 @@ class RiskEngine:
             quote=self._state.quote,
             recent_entries=self._state.recent_entries(now),
             broker_rejections=self._state.broker_rejections(now),
+            ban_list=self._state.ban_list(now),
+            spot_key=self._spot_key,
         )
 
     # ---- audit -----------------------------------------------------------------------------

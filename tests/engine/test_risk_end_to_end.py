@@ -17,12 +17,14 @@ from engine.market_data.provider import Tick
 from engine.orders.service import OrderService
 from engine.positions.book import position_id
 from engine.risk.audit import RiskAudit
+from engine.risk.banlist import BanListService
 from engine.risk.checks.registry import default_checks
 from engine.risk.checks.stale import FeedDown, FloorBreach, MtmBlind
 from engine.risk.daybook import DayBook
 from engine.risk.gate import RiskEngine
 from engine.risk.limits_service import LimitsService
 from engine.risk.monitor import RiskMonitor
+from engine.risk.repository import StoredBanList
 from tests.engine.risk_builders import NOW, OPTION, TODAY, instrument_of, position
 from tests.engine.risk_fakes import MemoryRiskRepository
 from tests.engine.test_order_service import build
@@ -54,6 +56,7 @@ class Engine:
         risk_repo: MemoryRiskRepository | None = None,
         trading_repo: MemoryRepository | None = None,
         key_prefix: str = "k",
+        ban_list: frozenset[str] | None = frozenset(),
     ) -> None:
         self.clock = Clock()
         self.risk_repo = risk_repo or MemoryRiskRepository()  # the "database": pass it to restart
@@ -71,11 +74,20 @@ class Engine:
             now=self.clock,
         )  # fmt: skip
         self.audit = RiskAudit(self.risk_repo)
+        # Today's F&O ban list, loaded and empty unless a test says otherwise: without one every
+        # F&O entry is refused (add-risk-guards instrument policy), which is not what most of
+        # these tests are about.
+        if ban_list is not None:
+            self.risk_repo.ban_lists[("main", TODAY)] = StoredBanList(TODAY, ban_list, NOW)
+        self.ban_lists = BanListService(
+            account_id="main", repository=self.risk_repo, results=self.trading_repo,
+            now=self.clock,
+        )  # fmt: skip
         self.monitor = RiskMonitor(
             account_id="main", limits=self.limits, daybook=self.daybook,
             repository=self.risk_repo, audit=self.audit, instruments=instrument_of,
             checks=[FeedDown(), MtmBlind(), FloorBreach()], subscribed=lambda: True,
-            interval_s=1.0, persist_interval_s=10.0, now=self.clock,
+            interval_s=1.0, persist_interval_s=10.0, ban_lists=self.ban_lists, now=self.clock,
         )  # fmt: skip
         self.gate = RiskEngine(
             account_id="main", mode=TradingMode.PAPER, limits=self.limits, state=self.monitor,

@@ -48,6 +48,7 @@ from engine.orders.service import OrderService
 from engine.persistence.repository import PersistenceError, TradingRepository
 from engine.positions.book import PositionId
 from engine.risk.audit import RiskAudit
+from engine.risk.banlist import BanListService
 from engine.risk.checks.registry import continuous_checks, default_checks
 from engine.risk.daybook import DayBook
 from engine.risk.decision import Decision
@@ -76,8 +77,12 @@ class RiskRuntime:
         risk_repository: RiskRepository,
         instruments: Callable[[InstrumentKey], Instrument | None],
         subscribed: Callable[[], bool],
+        spot_of: Callable[[str], Instrument | None] = lambda symbol: None,
         now: Callable[[], datetime] = utc_now,
     ) -> None:
+        """``spot_of`` is ``InstrumentMaster.spot_of``: an underlying's index or equity row, whose
+        fresh price the instrument policy measures an option's strike distance from. The default
+        knows none, which refuses option entries while a strike distance is set (fail closed)."""
         account = settings.account_id
         self._account_id = account
         self._repository = repository
@@ -100,6 +105,16 @@ class RiskRuntime:
             account_id=account, repository=risk_repository, limits=lambda: self.limits.current,
             now=now,
         )  # fmt: skip
+        # The exchange's F&O ban lists: loaded at start, retried by the monitor while unread, set
+        # by the ``SetBanList`` command, read by the instrument policy through the monitor.
+        self.ban_lists = BanListService(
+            account_id=account, repository=risk_repository, results=repository, now=now
+        )
+
+        def spot_key(symbol: str) -> InstrumentKey | None:
+            spot = spot_of(symbol)
+            return None if spot is None else spot.key
+
         self.monitor = RiskMonitor(
             account_id=account, limits=self.limits, daybook=self.daybook,
             repository=risk_repository, audit=self.audit, instruments=instruments,
@@ -108,12 +123,12 @@ class RiskRuntime:
             persist_interval_s=settings.risk_persist_interval_s,
             on_kill=self._on_kill, ensure_flat=self._ensure_flat, lock_pending=self._lock_pending,
             unprotected=self._unprotected, rejections=self.rejections.recent,
-            now=now,
+            ban_lists=self.ban_lists, spot_key=spot_key, now=now,
         )  # fmt: skip
         self.gate = RiskEngine(
             account_id=account, mode=settings.mode, limits=self.limits, state=self.monitor,
             audit=self.audit, instruments=instruments, checks=default_checks(),
-            on_kill=self._request_kill, now=now,
+            on_kill=self._request_kill, spot_key=spot_key, now=now,
         )  # fmt: skip
         self._started = asyncio.Event()
 
@@ -177,6 +192,9 @@ class RiskRuntime:
     async def _try_start(self) -> bool:
         if not await self.limits.load() or not await self.daybook.load():
             return False
+        # The ban lists do not hold up the start: while they are unread only F&O entries are
+        # refused (instrument-policy "Storage down at start"), and the monitor retries the read.
+        await self.ban_lists.load()
         # The stored book is read last, right before it is seeded, with no await in between: a fill
         # that lands while the awaits above run is already in the day book (``attach`` registered
         # its listener) and would be wiped by the seed if the book had been read before them.
@@ -269,5 +287,6 @@ class RiskRuntime:
             loss_streak=day.loss_streak,
             cooldown_until=day.cooldown_until,
             broker_rejections_5m=len(self.rejections.recent(self._now())),
+            ban_list_loaded=self.ban_lists.for_now(self._now()) is not None,
             unprotected=[PositionRef(key=k, product=prod) for _, k, prod in unprotected],
         )  # fmt: skip

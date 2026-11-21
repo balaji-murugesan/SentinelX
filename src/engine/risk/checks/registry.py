@@ -12,6 +12,7 @@ from engine.risk.checks.counters import Cooldown, MaxTrades
 from engine.risk.checks.exposure import EntryCutoff, FloorHeadroom, OpenPositions
 from engine.risk.checks.flow import EntryPacing, RejectBreaker
 from engine.risk.checks.lots import LotCaps
+from engine.risk.checks.policy import InstrumentPolicy
 from engine.risk.checks.prices import PriceSanity, StaleQuote
 from engine.risk.checks.protection import Unprotected
 from engine.risk.checks.stale import FeedDown, FloorBreach, MtmBlind
@@ -35,6 +36,7 @@ def default_checks() -> list[PreTradeCheck]:
         LotCaps(),
         EntryPacing(),
         RejectBreaker(),
+        InstrumentPolicy(),
     ]
 
 

@@ -50,6 +50,7 @@ from engine.market_data.clock import IST, MARKET_OPEN, ist_date, market_close_ut
 from engine.market_data.provider import Tick
 from engine.positions.book import PositionId
 from engine.risk.audit import RiskAudit
+from engine.risk.banlist import BanListService
 from engine.risk.checks.common import money
 from engine.risk.checks.flow import REJECT_BREAKER
 from engine.risk.checks.stale import MTM_BLIND
@@ -64,6 +65,7 @@ from engine.risk.decision import (
     Severity,
     halt_new_entries,
     most_severe,
+    no_spot,
     run_continuous,
 )
 from engine.risk.floor import next_floor
@@ -128,6 +130,8 @@ class RiskMonitor:
         lock_pending: Callable[[], bool] = lambda: False,
         unprotected: Callable[[], frozenset[PositionId]] = frozenset,
         rejections: Callable[[datetime], tuple[datetime, ...]] = lambda now: (),
+        ban_lists: BanListService | None = None,
+        spot_key: Callable[[str], InstrumentKey | None] = no_spot,
         now: Callable[[], datetime] = utc_now,
     ) -> None:
         """``on_kill`` is called with the KILL decision on every pass while a breach holds, so it
@@ -139,7 +143,11 @@ class RiskMonitor:
         though the loaded day is not locked yet, which is how that kill reaches the day.
         ``unprotected`` returns the open positions that have no catastrophic stop. ``rejections``
         returns the times of the broker rejections within 300 s of the time it is given
-        (``RejectionWindow.recent``); the default, none, suits a monitor with no order service."""
+        (``RejectionWindow.recent``); the default, none, suits a monitor with no order service.
+        ``ban_lists`` holds the F&O ban lists: the monitor retries its read on every pass while it
+        is unread, and serves today's list to the gate (``ban_list``); without one no list is ever
+        loaded, so F&O entries are refused. ``spot_key`` maps an underlying symbol to its spot
+        instrument, for the instrument policy's strike distance (default: none known)."""
         self._account_id = account_id
         self._limits = limits
         self._daybook = daybook
@@ -156,6 +164,8 @@ class RiskMonitor:
         self._lock_pending = lock_pending
         self._unprotected = unprotected
         self._rejections = rejections
+        self._ban_lists = ban_lists
+        self._spot_key = spot_key
         self._now = now
         self._trading: TradingView | None = None
         self._tracker: MtmTracker | None = None
@@ -212,6 +222,9 @@ class RiskMonitor:
 
     def broker_rejections(self, now: datetime) -> tuple[datetime, ...]:
         return self._rejections(now)
+
+    def ban_list(self, now: datetime) -> frozenset[str] | None:
+        return None if self._ban_lists is None else self._ban_lists.for_now(now)
 
     async def entry_allowed(self, lots: int, expiring: bool) -> str | None:
         return await self._daybook.entry_allowed(lots, expiring)
@@ -274,6 +287,10 @@ class RiskMonitor:
         await self._act(results)
         await self._keep_flattening()
         await self._record(results, now)  # after acting: a slow audit must not delay a flatten
+        if self._ban_lists is not None and not self._ban_lists.read:
+            # Retried after acting: a hung database must never delay a kill or a flatten (exits
+            # come first). Until the lists are read, F&O entries are refused.
+            await self._ban_lists.load()
         await self._persist_if_due(now)
         await self._write_close_marks_if_due(now)
 
@@ -408,6 +425,8 @@ class RiskMonitor:
             unprotected=self._unprotected(),
             recent_entries=self._daybook.recent_entries(now),
             broker_rejections=self._rejections(now),
+            ban_list=self.ban_list(now),
+            spot_key=self._spot_key,
         )
         return run_continuous(self._checks, ctx, RiskTrigger.TIMER)
 

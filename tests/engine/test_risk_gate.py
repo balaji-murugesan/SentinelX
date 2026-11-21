@@ -695,5 +695,30 @@ async def test_the_rules_see_the_recent_entries_and_safe_defaults_for_the_rest()
 
     ctx, _ = rule.asked[0]
     assert ctx.recent_entries == (NOW,)
-    assert (ctx.broker_rejections, ctx.target_confirmations, ctx.ban_list) == ((), 0, None)
-    assert ctx.spot_key("NIFTY") is None
+    assert (ctx.broker_rejections, ctx.target_confirmations) == ((), 0)
+    assert ctx.ban_list == frozenset()  # the state's ban list (task 7.2): the stub's is empty
+    assert ctx.spot_key("NIFTY") is None  # no spot lookup given: none known (fail closed)
+
+
+async def test_the_rules_see_todays_ban_list_and_the_spot_lookup() -> None:
+    """add-risk-guards tasks 7.2 and 7.4: the gate fills ``ban_list`` from the risk state (None
+    when it has none for today) and ``spot_key`` from the lookup it was built with."""
+    nifty = InstrumentKey.parse("IDX_I:13")
+    for bans in (frozenset({"XYZ"}), None):
+        state = StubState(day_state())
+        state.bans = bans
+        rule = Rule("max_trades")
+        h = Harness(state=state, checks=[rule])
+        h.gate = RiskEngine(
+            account_id="main", mode=TradingMode.PAPER, limits=h.limits, state=state,
+            audit=h.audit, instruments=instrument_of, checks=[rule],
+            spot_key={"NIFTY": nifty}.get, now=lambda: NOW,
+        )  # fmt: skip
+        h.gate.bind(h.trading)
+        await h.ready()
+
+        await h.gate.check(order(BUY, 65))
+
+        ctx, _ = rule.asked[0]
+        assert ctx.ban_list == bans
+        assert ctx.spot_key("NIFTY") == nifty and ctx.spot_key("XYZ") is None

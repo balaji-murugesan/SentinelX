@@ -15,12 +15,14 @@ from typing import Any
 import pytest
 from structlog.testing import capture_logs
 
-from contracts.commands import CommandResult, KillSwitch, PlaceOrder, SetRiskLimits
+from contracts.commands import CommandResult, KillSwitch, PlaceOrder, SetBanList, SetRiskLimits
+from contracts.market import Instrument, InstrumentKey
 from contracts.orders import Order, OrderSide, OrderType, ProductType
 from contracts.settings import load_settings
 from contracts.snapshot import HaltLevel, Snapshot
 from engine.broker.adapter import BrokerRejected
 from engine.config import EngineSettings
+from engine.market_data.clock import ist_date
 from engine.market_data.provider import Tick
 from engine.orders.commands import CommandConsumer
 from engine.orders.intent import PROTECTIVE_STOP_SOURCE, RESERVED_SOURCES
@@ -34,6 +36,7 @@ from engine.risk.checks.registry import continuous_checks, default_checks
 from engine.risk.decision import Decision, RiskContext, kill
 from engine.risk.kill import OWN_SOURCES
 from engine.risk.limits import RULES, TIGHTEN_ONLY
+from engine.risk.repository import StoredBanList
 from engine.risk.runtime import RiskRuntime
 from tests.engine.risk_builders import NOW, OPTION, TODAY, fill, instrument_of, position
 from tests.engine.risk_fakes import MemoryRiskRepository
@@ -65,14 +68,23 @@ class Env:
         *,
         risk_repo: MemoryRiskRepository | None = None,
         at: datetime = NOW,
+        ban_list: frozenset[str] | None = frozenset(),
+        spot_of: Callable[[str], Instrument | None] | None = None,
     ) -> None:
         self.clock = Clock(at)
         self.settings = settings_for(monkeypatch, tmp_path)
         self.trading_repo = MemoryRepository()
         self.risk_repo = risk_repo or MemoryRiskRepository()
+        # Today's F&O ban list, stored and empty unless a test says otherwise (None: none stored):
+        # without one every F&O entry is refused by the instrument policy (fail closed).
+        if ban_list is not None:
+            self.risk_repo.ban_lists[("main", ist_date(at))] = StoredBanList(
+                ist_date(at), ban_list, at
+            )
         self.runtime = RiskRuntime(
             settings=self.settings, repository=self.trading_repo, risk_repository=self.risk_repo,
             instruments=instrument_of, subscribed=lambda: True, now=self.clock,
+            **({} if spot_of is None else {"spot_of": spot_of}),
         )  # fmt: skip
         self.adapter = StopAdapter()
         self.service, _, _ = build(
@@ -472,6 +484,105 @@ async def test_the_snapshot_shows_the_days_gross_entry_lots_and_it_round_trips(
 class _Subscription:
     def get_nowait(self) -> None:
         return None
+
+
+# ---- the F&O ban list and the instrument policy (add-risk-guards group 7) ---------------------
+
+
+async def test_without_todays_ban_list_fno_entries_wait_for_one_and_exits_never_do(
+    env_factory: Callable[..., Env],
+) -> None:
+    """Instrument-policy "Morning without a list" through the assembly, then the list is loaded
+    with the ``SetBanList`` command: the snapshot shows it, and the next entry goes through."""
+    env = await env_factory(ban_list=None).ready()
+    held = position(OPTION, 65, "200.00")
+
+    refused = await env.entry()
+    status = env.runtime.status()
+    assert not refused.accepted and (refused.reason or "").startswith("RISK_BAN_LIST_MISSING")
+    assert status is not None and not status.ban_list_loaded
+
+    env.service.positions[position_id(held)] = held
+    exit_ = await env.service.place(
+        PlaceOrder(
+            command_id="x", idempotency_key="x", account_id="main", source="cli", sent_at=NOW,
+            key=OPTION, side=OrderSide.SELL, quantity=65, product=ProductType.INTRADAY,
+            order_type=OrderType.LIMIT, limit_price=D("199.00"),
+        )
+    )  # fmt: skip
+    assert exit_.accepted  # a missing ban list never refuses an exit
+    del env.service.positions[position_id(held)]
+
+    loaded = await env.runtime.ban_lists.set_ban_list(
+        SetBanList(
+            command_id="b", idempotency_key="b", account_id="main", source="cli", sent_at=NOW,
+            trade_date=TODAY, symbols=[],
+        )
+    )  # fmt: skip
+    status = env.runtime.status()
+    assert loaded.accepted and status is not None and status.ban_list_loaded
+    assert Snapshot.model_validate_json(
+        Snapshot(
+            account_id="main", taken_at=NOW, open_orders=[], positions=[], risk=status
+        ).model_dump_json()
+    ).risk == status  # fmt: skip
+    assert (await env.entry()).accepted
+
+
+async def test_a_banned_underlying_is_refused_through_the_assembly(
+    env_factory: Callable[..., Env],
+) -> None:
+    env = await env_factory(ban_list=frozenset({"NIFTY"})).ready()
+
+    refused = await env.entry()
+
+    assert not refused.accepted and (refused.reason or "").startswith("RISK_FNO_BAN")
+
+
+async def test_ban_lists_unreadable_at_start_refuse_fno_entries_until_the_monitor_reads_them(
+    env_factory: Callable[..., Env],
+) -> None:
+    """Instrument-policy "Storage down at start": the start does not wait for the ban lists, F&O
+    entries are refused meanwhile, and the monitor's pass reads them once storage is back."""
+
+    class BanListDown(MemoryRiskRepository):
+        down = True
+
+        async def load_ban_list(self, account_id: str, from_date: Any) -> Any:
+            if self.down:
+                raise PersistenceError("database unavailable")
+            return await super().load_ban_list(account_id, from_date)
+
+    repo = BanListDown()
+    env = await env_factory(risk_repo=repo).ready()  # the empty list for today is stored
+
+    refused = await env.entry()
+    assert not refused.accepted and (refused.reason or "").startswith("RISK_BAN_LIST_MISSING")
+    assert not env.runtime.ban_lists.read
+
+    repo.down = False
+    await env.runtime.monitor.step()  # the retry
+    assert env.runtime.ban_lists.read
+    env.tick()
+    assert (await env.entry()).accepted
+
+
+def test_the_spot_lookup_reaches_the_gate_and_the_monitor(
+    env_factory: Callable[..., Env],
+) -> None:
+    """The runtime turns ``InstrumentMaster.spot_of`` into the context's ``spot_key`` for both
+    context builders; without it no spot is known (strike distance fails closed)."""
+    nifty = Instrument(
+        key=InstrumentKey.parse("IDX_I:13"), trading_symbol="NIFTY", display_name="Nifty 50",
+        underlying_symbol="NIFTY", instrument_type="INDEX", lot_size=1, tick_size=D("0.05"),
+    )  # fmt: skip
+    wired = env_factory(spot_of={"NIFTY": nifty}.get).runtime
+    bare = env_factory().runtime
+
+    assert wired.gate._spot_key("NIFTY") == nifty.key  # type: ignore[attr-defined]
+    assert wired.monitor._spot_key("NIFTY") == nifty.key  # type: ignore[attr-defined]
+    assert wired.gate._spot_key("XYZ") is None  # type: ignore[attr-defined]
+    assert bare.gate._spot_key("NIFTY") is None  # type: ignore[attr-defined]
 
 
 async def test_broker_rejections_trip_the_breaker_through_the_assembly(

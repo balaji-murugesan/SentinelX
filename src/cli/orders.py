@@ -1,6 +1,6 @@
 """CLI order commands: ``order place``, ``order cancel``, ``orders``, ``positions`` (task 7.3),
 and the risk commands ``kill``, ``risk set-limits``, ``risk size`` and ``risk status``
-(add-risk-engine task 11.2).
+(add-risk-engine task 11.2), and ``risk set-ban-list`` (add-risk-guards task 7.3).
 
 The CLI never talks to the broker or the database. It writes a command to the engine's Redis
 stream and waits for the reply (the same path the API will use), and it shows orders, positions
@@ -11,9 +11,10 @@ Run inside the engine container, because Redis is not published to the host:
 """
 
 import json
+import re
 import uuid
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
@@ -30,6 +31,7 @@ from contracts.commands import (
     LimitValue,
     PlaceOrder,
     ResumeRecovery,
+    SetBanList,
     SetRiskLimits,
     SizeOrder,
     reply_stream,
@@ -167,6 +169,68 @@ async def set_limits(
     except (ValueError, ValidationError) as error:
         out(f"Not sent: {error}")
         return REJECTED
+    return await _send(redis, command, out, wait_s)
+
+
+# What a ban-list line may hold: an exchange symbol such as XYZ, M&M or BAJAJ-AUTO. Anything else
+# (two words, a comma, an invisible character pasted from a web page) is refused. The cap on length
+# also keeps a file that is not a ban list (a settings file holding a token, say) from being sent.
+_SYMBOL = re.compile(r"[A-Z0-9][A-Z0-9&._-]{0,19}")
+
+
+def read_ban_list_file(path: Path) -> list[str]:
+    """Read a ban-list file: one underlying symbol per line, upper-cased. Blank lines and lines
+    starting with ``#`` are ignored; a file with no symbols is "no bans that day". A line that is
+    not a symbol (an empty symbol made of invisible characters, two words, punctuation) is refused
+    by its line number, never by its text: if the wrong file was given, its content is not echoed.
+    Raises ``ValueError`` with a message for the user."""
+    try:
+        text = path.read_text(encoding="utf-8-sig")  # -sig: drop a byte-order mark, if any
+    except OSError as error:
+        raise ValueError(f"cannot read {path}: {error.strerror or error}") from None
+    except UnicodeDecodeError:
+        raise ValueError(f"{path} is not a UTF-8 text file") from None
+    symbols: list[str] = []
+    for number, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        symbol = stripped.upper()
+        if _SYMBOL.fullmatch(symbol) is None:
+            raise ValueError(
+                f"line {number} of {path} is not a symbol: one symbol per line, letters, digits "
+                "and & . _ - only, at most 20 characters"
+            )
+        symbols.append(symbol)
+    return sorted(set(symbols))
+
+
+async def set_ban_list(
+    redis: Redis,
+    *,
+    account_id: str,
+    path: Path,
+    trade_date: date,
+    out: Out,
+    wait_s: float = REPLY_WAIT_S,
+) -> int:
+    """Send the F&O ban list in ``path`` for ``trade_date`` (an IST trading day). The engine refuses
+    a past date, and during market hours a list for today that drops a symbol already loaded."""
+    try:
+        symbols = read_ban_list_file(path)
+        command = SetBanList(
+            command_id=uuid.uuid4().hex,
+            idempotency_key=uuid.uuid4().hex,
+            account_id=account_id,
+            source="cli",
+            sent_at=datetime.now(UTC),
+            trade_date=trade_date,
+            symbols=symbols,
+        )
+    except (ValueError, ValidationError) as error:
+        out(f"Not sent: {error}")
+        return REJECTED
+    out(f"Ban list for {trade_date.isoformat()}: {len(symbols)} symbols")
     return await _send(redis, command, out, wait_s)
 
 
@@ -314,6 +378,8 @@ def format_risk(r: RiskStatus) -> list[str]:
         + (f" ({r.halt_reason})" if r.halt_reason else ""),
         f"entries today            : {r.entries_today}",
         f"loss streak              : {r.loss_streak}",
+        "F&O ban list today       : "
+        + ("loaded" if r.ban_list_loaded else "MISSING (F&O entries refused: risk set-ban-list)"),
     ]
     if r.cooldown_until is not None:
         lines.append(f"cooldown until           : {r.cooldown_until.isoformat()}")

@@ -169,6 +169,7 @@ async def run(
         risk_repository=risk_repository,
         instruments=market_data.master.get,
         subscribed=lambda: bool(market_data.subscriptions.keys),
+        spot_of=market_data.master.spot_of,
     )
     service = OrderService(
         account_id=account,
@@ -196,6 +197,7 @@ async def run(
         set_limits=risk.limits.set_limits,
         size=risk.sizing.size,
         kill=risk.kill.handle,
+        set_ban_list=risk.ban_lists.set_ban_list,
     )
     snapshots = SnapshotWriter(
         redis,

@@ -21,6 +21,9 @@ Commands so far:
                          position. No intraday undo; --yes is the confirmation.
   risk set-limits --file PATH
                          Send the risk limits in a JSON file (see docs/risk-limits.example.json).
+  risk set-ban-list --file PATH [--date YYYY-MM-DD]
+                         Send the exchange's F&O ban list (one symbol per line) for today in
+                         IST, or for --date. Without one for today every F&O entry is refused.
   risk size KEY SIDE --entry P --stop P
                          Ask the engine how many units fit the per-trade risk limit.
   risk status            Show today's risk figures from the engine's snapshot.
@@ -127,6 +130,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     set_limits = risk.add_parser("set-limits", help="send the risk limits in a JSON file")
     set_limits.add_argument("--file", type=Path, required=True, metavar="PATH")
+    set_ban = risk.add_parser(
+        "set-ban-list", help="send today's (or --date's) F&O ban list, one symbol per line"
+    )
+    set_ban.add_argument("--file", type=Path, required=True, metavar="PATH")
+    set_ban.add_argument(
+        "--date",
+        type=date.fromisoformat,
+        metavar="YYYY-MM-DD",
+        help="the IST trading day it applies to (default: today in IST)",
+    )
     size = risk.add_parser("size", help="how many units fit the per-trade risk limit")
     size.add_argument("key", type=InstrumentKey.parse, metavar="KEY")
     size.add_argument("side", type=str.upper, choices=[s.value for s in OrderSide])
@@ -223,6 +236,15 @@ async def _risk_command(url: str, account: str, args: argparse.Namespace) -> int
             url,
             None,
             lambda r: order_cli.set_limits(r, account_id=account, path=args.file, out=_print_now),
+        )
+    if args.command == "set-ban-list":
+        trade_date = args.date or ist_date(utc_now())
+        return await order_cli.run_with_redis(
+            url,
+            None,
+            lambda r: order_cli.set_ban_list(
+                r, account_id=account, path=args.file, trade_date=trade_date, out=_print_now
+            ),
         )
     if args.command == "size":
         return await order_cli.run_with_redis(

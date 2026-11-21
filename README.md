@@ -172,6 +172,19 @@ docker compose exec engine python -m cli risk size NSE_FNO:53720 BUY --entry 100
 - An entry needs `--stop PRICE` (where the trade is wrong): the engine sizes the risk from it and places a wide catastrophic stop at the broker once the entry fills.
 - **`kill --yes`** cancels pending entries and exits every position, and refuses entries until the next trading day. There is no intraday undo, and `recovery resume` does not clear it.
 
+### Morning checklist: today's F&O ban list
+
+Without a ban list loaded for today, **every NSE/BSE F&O entry is refused** (`RISK_BAN_LIST_MISSING`); exits, cash equity and commodity entries are not affected. Before 09:15 IST (or the evening before, with `--date`), put the exchange's list in a text file, one underlying per line (blank lines and lines starting with `#` are ignored; an empty file means "no bans today"), and load it:
+
+```bash
+docker compose cp ban.txt engine:/tmp/ban.txt
+docker compose exec engine python -m cli risk set-ban-list --file /tmp/ban.txt   # today (IST)
+docker compose exec engine python -m cli risk set-ban-list --file /tmp/ban.txt --date 2026-11-24
+docker compose exec engine python -m cli risk status        # shows whether today's list is loaded
+```
+
+During market hours today's list may only grow (a list that drops a name is refused with `TIGHTEN_ONLY`). A past date is refused.
+
 ## Each morning: fresh Dhan token
 
 Dhan access tokens last about 24 hours and the engine never creates or renews them.

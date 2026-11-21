@@ -20,7 +20,7 @@ Decides which instruments may be entered at all: the underlyings the owner allow
 - **THEN** it is refused with `RISK_DENIED`
 
 ### Requirement: The F&O ban list is loaded by the owner for each trading day
-The owner SHALL load the ban list for an IST date through a ban-list command, sent from the CLI with a file of underlying symbols. The command SHALL carry an idempotency key. It SHALL be refused if the date is earlier than today. An empty list SHALL be accepted as "no bans that day". The list SHALL be stored and survive a restart.
+The owner SHALL load the ban list for an IST date through a ban-list command, sent from the CLI with a file of underlying symbols. The command SHALL carry an idempotency key. It SHALL be refused if the date is earlier than today. A command with a date earlier than today, a blank symbol, or another account's id SHALL be refused with `RISK_BAN_LIST_INVALID`. An empty list SHALL be accepted as "no bans that day". The list SHALL be stored and survive a restart.
 
 #### Scenario: Loading tomorrow's list in the evening
 - **WHEN** at 20:00 IST the owner loads a list dated the next trading day
@@ -28,7 +28,11 @@ The owner SHALL load the ban list for an IST date through a ban-list command, se
 
 #### Scenario: Past date
 - **WHEN** a ban-list command names yesterday's date
-- **THEN** it is refused and nothing is stored
+- **THEN** it is refused with `RISK_BAN_LIST_INVALID` and nothing is stored
+
+#### Scenario: Blank symbol
+- **WHEN** a ban-list command holds a symbol that is blank
+- **THEN** it is refused with `RISK_BAN_LIST_INVALID` and nothing is stored
 
 #### Scenario: Repeated command
 - **WHEN** the same ban-list command key arrives twice

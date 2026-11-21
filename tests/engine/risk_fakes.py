@@ -89,6 +89,9 @@ class StubState:
         self.count_fails: str | None = None  # a reason: make the count fail like a database error
         self.recent: tuple[datetime, ...] = ()  # what ``recent_entries`` returns
         self.rejections: tuple[datetime, ...] = ()  # what ``broker_rejections`` returns
+        # What ``ban_list`` returns. A stub starts with today's list loaded and empty (no bans),
+        # so a test about another rule is not refused for a missing list; set None to test that.
+        self.bans: frozenset[str] | None = frozenset()
 
     def unavailable(self, now: datetime) -> str | None:
         return self.unavailable_reason
@@ -110,6 +113,9 @@ class StubState:
 
     def broker_rejections(self, now: datetime) -> tuple[datetime, ...]:
         return self.rejections
+
+    def ban_list(self, now: datetime) -> frozenset[str] | None:
+        return self.bans
 
     async def entry_allowed(self, lots: int, expiring: bool) -> str | None:
         if self.count_fails is not None:

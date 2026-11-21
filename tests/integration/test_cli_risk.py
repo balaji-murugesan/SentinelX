@@ -11,7 +11,7 @@ import asyncio
 import json
 import os
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -25,6 +25,7 @@ from contracts.commands import COMMAND_STREAM, CommandResult, parse_command
 from contracts.orders import OrderSide, OrderType, ProductType
 from contracts.snapshot import HaltLevel, PositionRef, RiskStatus, Snapshot, snapshot_key
 from engine.orders.commands import CommandConsumer
+from engine.risk.banlist import BanListService
 from engine.risk.daybook import DayBook
 from engine.risk.kill import KillSwitch
 from engine.risk.limits import MODE_PREFIX, REGISTRY, parse_limits
@@ -256,6 +257,150 @@ def test_set_limits_requires_a_file() -> None:
         main(["risk", "set-limits"])
 
 
+# ---- risk set-ban-list (add-risk-guards task 7.3) --------------------------------------------
+
+
+def test_help_lists_set_ban_list_with_its_file_and_date(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        main(["risk", "--help"])
+    assert "set-ban-list" in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        main(["risk", "set-ban-list", "--help"])
+    text = capsys.readouterr().out
+    assert "--file" in text and "--date" in text and "YYYY-MM-DD" in text
+
+
+@pytest.mark.parametrize("argv", [[], ["--file", "x.txt", "--date", "21-11-2026"]])
+def test_set_ban_list_needs_a_file_and_an_iso_date(argv: list[str]) -> None:
+    with pytest.raises(SystemExit):
+        main(["risk", "set-ban-list", *argv])
+
+
+def test_a_ban_list_file_ignores_comments_and_blank_lines_and_upper_cases(tmp_path: Path) -> None:
+    path = tmp_path / "ban.txt"
+    path.write_text(
+        "﻿# NSE F&O ban list for 2026-11-17\n\nxyz\n  M&M  \nBAJAJ-AUTO\n# trailing\nXYZ\n",
+        encoding="utf-8",
+    )
+
+    assert cli.read_ban_list_file(path) == ["BAJAJ-AUTO", "M&M", "XYZ"]
+
+
+def test_an_empty_ban_list_file_means_no_bans(tmp_path: Path) -> None:
+    path = tmp_path / "ban.txt"
+    path.write_text("# no names in ban today\n\n", encoding="utf-8")
+
+    assert cli.read_ban_list_file(path) == []
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "​",  # an empty symbol: only an invisible character (pasted from a web page)
+        '""',  # an empty symbol in quotes
+        "ABC XYZ",  # two symbols on one line
+        "ABC,XYZ",
+        "NIFTY BANK",
+        "A" * 21,  # longer than any exchange symbol
+    ],
+)
+def test_a_line_that_is_not_one_symbol_is_refused_by_its_line_number(
+    tmp_path: Path, line: str
+) -> None:
+    path = tmp_path / "ban.txt"
+    path.write_text(f"ABC\n{line}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="line 2 of .* is not a symbol"):
+        cli.read_ban_list_file(path)
+
+
+def test_a_wrong_file_is_refused_without_echoing_its_content(tmp_path: Path) -> None:
+    """The CLI must not be a way to leak a secret: a settings file given by mistake is refused,
+    and the message names the line, never its text."""
+    path = tmp_path / "settings.env"
+    path.write_text("DHAN_ACCESS_TOKEN=eyJhbGciOi.secret-value\n", encoding="utf-8")
+
+    with pytest.raises(ValueError) as refused:
+        cli.read_ban_list_file(path)
+
+    assert "secret-value" not in str(refused.value) and "DHAN" not in str(refused.value)
+
+
+def test_a_missing_ban_list_file_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="cannot read"):
+        cli.read_ban_list_file(tmp_path / "nope.txt")
+
+
+async def test_a_bad_ban_list_file_is_never_sent(tmp_path: Path) -> None:
+    path = tmp_path / "ban.txt"
+    path.write_text("ABC XYZ\n", encoding="utf-8")
+    lines: list[str] = []
+
+    code = await cli.set_ban_list(
+        NoRedis(),  # type: ignore[arg-type]
+        account_id="main", path=path, trade_date=NOW.date(), out=lines.append,
+    )  # fmt: skip
+
+    assert code == cli.REJECTED and lines[0].startswith("Not sent: ")
+
+
+class RecordingRedis(SilentRedis):
+    """Keeps what was sent; never answers."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.data: list[str] = []
+
+    async def xadd(self, *args: object, **kwargs: object) -> None:
+        await super().xadd(*args, **kwargs)
+        fields = args[1]
+        assert isinstance(fields, dict)
+        self.data.append(fields["data"])
+
+
+def test_the_date_defaults_to_today_in_ist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--date`` omitted: the command names today's IST date (here 00:30 IST on the 17th, still
+    the 16th in UTC, so a UTC date would be wrong)."""
+    import cli.__main__ as entry
+    from engine.market_data.clock import ist_date
+
+    path = tmp_path / "ban.txt"
+    path.write_text("XYZ\n", encoding="utf-8")
+    sent = RecordingRedis()
+    just_after_midnight = datetime(2026, 11, 16, 19, 0, tzinfo=UTC)  # 00:30 IST on the 17th
+
+    class Settings:
+        class redis_url:  # noqa: N801 - mimics SecretStr's one method
+            @staticmethod
+            def get_secret_value() -> str:
+                return "redis://unused"
+
+        account_id = "main"
+
+    async def with_fake_redis(url: str, redis: object, action: Any) -> int:
+        return int(await action(sent))
+
+    monkeypatch.setattr(entry, "load_settings", lambda _cls: Settings())
+    monkeypatch.setattr(entry, "utc_now", lambda: just_after_midnight)
+    monkeypatch.setattr(entry.order_cli, "run_with_redis", with_fake_redis)
+
+    main(["risk", "set-ban-list", "--file", str(path)])
+
+    [data] = sent.data
+    command = parse_command(data)
+    assert command.command == "set_ban_list"
+    assert command.trade_date == ist_date(just_after_midnight) == date(2026, 11, 17)  # type: ignore[union-attr]
+    assert command.symbols == ["XYZ"]  # type: ignore[union-attr]
+
+
+def test_the_risk_figures_say_whether_todays_ban_list_is_loaded() -> None:
+    missing = cli.format_risk(RiskStatus())
+    loaded = cli.format_risk(RiskStatus(ban_list_loaded=True))
+
+    assert any(line.startswith("F&O ban list today") and "MISSING" in line for line in missing)
+    assert "F&O ban list today       : loaded" in loaded
+
+
 # ---- formatting ------------------------------------------------------------------------------
 
 
@@ -370,9 +515,13 @@ class Engine:
         sizing = SizingService(
             account_id="main", limits=self.limits, instruments=instrument_of, now=lambda: NOW
         )
+        self.ban_lists = BanListService(
+            account_id="main", repository=self.risk_repo, results=MemoryRepository(),
+            now=lambda: NOW,
+        )  # fmt: skip
         self.consumer = CommandConsumer(
             redis, service, account_id="main", set_limits=self.limits.set_limits,
-            size=sizing.size, kill=self.kill.handle,
+            size=sizing.size, kill=self.kill.handle, set_ban_list=self.ban_lists.set_ban_list,
         )  # fmt: skip
         self.stop = asyncio.Event()
         self.task: asyncio.Task[None] | None = None
@@ -425,6 +574,55 @@ async def test_set_limits_then_size_then_kill_round_trip(redis: Redis, tmp_path:
         lines.clear()  # a second kill: accepted, and it says nothing new was started
         assert await cli.kill(redis, account_id="main", out=lines.append) == cli.ACCEPTED
         assert lines[0].startswith("Accepted. (already stopped today: ")
+
+
+@integration
+@requires_redis
+async def test_set_ban_list_round_trip(redis: Redis, tmp_path: Path) -> None:
+    """The ban list from a file, through Redis and the engine's consumer to the ban-list service:
+    loaded for today (it is 10:30 IST, market hours), grown, refused when it would drop a name,
+    refused for a past date, and accepted for tomorrow."""
+    today, tomorrow = NOW.date(), NOW.date() + timedelta(days=1)
+    path = tmp_path / "ban.txt"
+    async with Engine(redis) as engine:
+        lines: list[str] = []
+
+        path.write_text("# today\nxyz\n", encoding="utf-8")
+        sent = await cli.set_ban_list(
+            redis, account_id="main", path=path, trade_date=today, out=lines.append
+        )
+        assert sent == cli.ACCEPTED and lines == ["Ban list for 2026-11-16: 1 symbols", "Accepted."]
+        assert engine.ban_lists.for_date(today) == {"XYZ"}
+
+        lines.clear()
+        path.write_text("XYZ\nABC\n", encoding="utf-8")
+        assert await cli.set_ban_list(
+            redis, account_id="main", path=path, trade_date=today, out=lines.append
+        ) == cli.ACCEPTED  # fmt: skip
+        assert engine.ban_lists.for_date(today) == {"XYZ", "ABC"}
+
+        lines.clear()
+        path.write_text("ABC\n", encoding="utf-8")
+        refused = await cli.set_ban_list(
+            redis, account_id="main", path=path, trade_date=today, out=lines.append
+        )
+        assert refused == cli.REJECTED and "TIGHTEN_ONLY" in lines[-1] and "XYZ" in lines[-1]
+        assert engine.ban_lists.for_date(today) == {"XYZ", "ABC"}  # unchanged
+
+        lines.clear()
+        past = await cli.set_ban_list(
+            redis, account_id="main", path=path, trade_date=today - timedelta(days=1),
+            out=lines.append,
+        )  # fmt: skip
+        assert past == cli.REJECTED and lines[-1].startswith("Rejected: RISK_BAN_LIST_INVALID")
+
+        lines.clear()
+        path.write_text("", encoding="utf-8")  # no bans tomorrow
+        assert await cli.set_ban_list(
+            redis, account_id="main", path=path, trade_date=tomorrow, out=lines.append
+        ) == cli.ACCEPTED  # fmt: skip
+        assert engine.ban_lists.for_date(tomorrow) == frozenset()
+        assert engine.risk_repo.ban_lists[("main", tomorrow)].symbols == frozenset()
 
 
 @integration

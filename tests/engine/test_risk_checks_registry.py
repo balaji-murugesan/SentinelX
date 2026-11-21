@@ -15,7 +15,7 @@ def test_every_registered_rule_is_a_rule_the_limits_know_by_name() -> None:
 # add-risk-guards added these rule names to the limits (task 3.1) before their checks exist
 # (groups 5-9). Each group that registers a check removes its name here, so a rule left without a
 # check, or a check whose name is still listed, fails the test below.
-NOT_BUILT_YET = {"profit_target", "instrument_policy"}
+NOT_BUILT_YET = {"profit_target"}
 
 
 def test_every_rule_in_the_limits_table_is_registered() -> None:
@@ -36,3 +36,4 @@ def test_the_most_basic_problems_are_named_first() -> None:
     # so the earlier rules keep their tie-break order.
     assert names.index("equity_floor") < names.index("lot_caps") < names.index("entry_pacing")
     assert names.index("entry_pacing") < names.index("reject_breaker")
+    assert names.index("reject_breaker") < names.index("instrument_policy")

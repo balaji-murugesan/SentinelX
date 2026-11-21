@@ -64,6 +64,7 @@ class CommandConsumer:
         set_limits: Callable[[SetRiskLimits], Awaitable[CommandResult]] | None = None,
         size: Callable[[SizeOrder], Awaitable[CommandResult]] | None = None,
         kill: Callable[[KillSwitch], Awaitable[CommandResult]] | None = None,
+        set_ban_list: Callable[[SetBanList], Awaitable[CommandResult]] | None = None,
     ) -> None:
         self._redis = redis
         self._service = service
@@ -75,6 +76,7 @@ class CommandConsumer:
         self._set_limits = set_limits
         self._size = size
         self._kill = kill
+        self._set_ban_list = set_ban_list
 
     async def run(
         self, stop: asyncio.Event, *, block_ms: int = 500, retry_seconds: float = 1.0
@@ -194,10 +196,11 @@ class CommandConsumer:
                 return await self._size(command)
             case KillSwitch() if self._kill is not None:
                 return await self._kill(command)
+            case SetBanList() if self._set_ban_list is not None:
+                return await self._set_ban_list(command)
             case KillSwitch() | SetRiskLimits() | SizeOrder() | SetBanList():
                 # These parse already but have no handler when the risk engine is not wired
-                # (an engine built without it; SetBanList until add-risk-guards task 7.2 routes
-                # it), so they are answered, not dropped: a command
+                # (an engine built without it), so they are answered, not dropped: a command
                 # nobody handles must not crash this loop, and the reply fails closed. They are
                 # listed, not caught by a default arm (``case _``, like ``_ =>`` in a C# switch
                 # expression), so that mypy flags a missing arm when a command is added to

@@ -54,3 +54,26 @@ async def test_a_command_with_no_handler_is_answered_not_accepted(command: AnyCo
     assert command.command in (result.reason or "") and "not supported" in (result.reason or "")
     assert result.command_id == "c1" and result.idempotency_key == "k1"
     assert adapter.placed == [] and repo.orders == {}
+
+
+async def test_a_ban_list_command_is_routed_to_its_handler_when_wired() -> None:
+    """add-risk-guards task 7.2: the consumer hands ``SetBanList`` to the ban-list service."""
+    from engine.risk.banlist import BanListService
+    from tests.engine.risk_fakes import MemoryRiskRepository
+    from tests.engine.trading_fakes import MemoryRepository
+
+    service, _, _ = build()
+    risk_repo = MemoryRiskRepository()
+    ban_lists = BanListService(
+        account_id="main", repository=risk_repo, results=MemoryRepository(), now=lambda: NOW
+    )
+    consumer = CommandConsumer(
+        cast(Redis, None), service, account_id="main", set_ban_list=ban_lists.set_ban_list
+    )
+
+    result = await consumer._process(
+        SetBanList(**BASE, trade_date=date(2026, 11, 16), symbols=["xyz"])  # type: ignore[arg-type]
+    )
+
+    assert result.accepted
+    assert risk_repo.ban_lists[("main", date(2026, 11, 16))].symbols == {"XYZ"}

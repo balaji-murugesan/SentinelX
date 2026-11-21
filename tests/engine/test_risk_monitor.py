@@ -1187,3 +1187,126 @@ async def test_a_breaker_in_shadow_mode_logs_a_warning_and_halts_nothing() -> No
 
     assert env.monitor.entry_halt() is None  # tried out, not enforced
     assert [e["log_level"] for e in breaker_trips(logs)] == ["warning"]
+
+
+# ---- the F&O ban list and the spot lookup (add-risk-guards tasks 7.2 and 7.4) -----------------
+
+
+class SeeContext:
+    """A continuous check that only records the contexts it is given."""
+
+    name = "equity_floor"
+
+    def __init__(self) -> None:
+        self.seen: list[RiskContext] = []
+
+    def continuous(self, ctx: RiskContext, event: RiskTrigger) -> Decision:
+        self.seen.append(ctx)
+        return ALLOW
+
+
+async def test_the_monitor_retries_the_ban_list_read_and_fills_the_context() -> None:
+    """The monitor serves today's ban list (to its own checks and to the gate through
+    ``ban_list``) and the spot lookup; while the stored lists cannot be read, it retries on every
+    pass, and the list is None (F&O entries refused) until a read succeeds."""
+    from contracts.market import InstrumentKey
+    from engine.risk.banlist import BanListService
+    from engine.risk.repository import StoredBanList
+
+    class Down(MemoryRiskRepository):
+        down = True
+        reads = 0
+
+        async def load_ban_list(self, account_id: str, from_date: date) -> list[StoredBanList]:
+            self.reads += 1
+            if self.down:
+                raise PersistenceError("database unavailable")
+            return await super().load_ban_list(account_id, from_date)
+
+    repo = Down()
+    repo.ban_lists[("main", TODAY)] = StoredBanList(TODAY, frozenset({"XYZ"}), NOW)
+    spy = SeeContext()
+    env = await Env(repo=repo, checks=(spy,)).ready()
+    nifty = InstrumentKey.parse("IDX_I:13")
+    ban_lists = BanListService(
+        account_id="main", repository=repo, results=MemoryRepository(), now=env.clock
+    )
+    monitor = RiskMonitor(
+        account_id="main", limits=env.limits, daybook=env.daybook, repository=repo,
+        audit=env.audit, instruments=instrument_of, checks=(spy,), subscribed=lambda: True,
+        interval_s=1.0, persist_interval_s=10.0, ban_lists=ban_lists,
+        spot_key={"NIFTY": nifty}.get, now=env.clock,
+    )  # fmt: skip
+    monitor.bind(env.trading)
+
+    await monitor.step()
+    await monitor.step()
+    assert repo.reads == 2  # retried on each pass while unread
+    assert spy.seen[-1].ban_list is None and monitor.ban_list(env.clock.at) is None
+
+    repo.down = False
+    await monitor.step()
+    await monitor.step()
+    assert repo.reads == 3  # read once, then not again
+    assert spy.seen[-1].ban_list == {"XYZ"} and monitor.ban_list(env.clock.at) == {"XYZ"}
+    assert spy.seen[-1].spot_key("NIFTY") == nifty and spy.seen[-1].spot_key("XYZ") is None
+
+
+async def test_a_hung_ban_list_read_never_delays_the_flatten_of_a_locked_day() -> None:
+    """Exits come first: on a killed day the pass asks for the flatten before it retries the
+    ban-list read, so a database that hangs on that read (or fails it) cannot delay it."""
+    from engine.risk.banlist import BanListService
+    from engine.risk.repository import StoredBanList
+
+    class Hung(MemoryRiskRepository):
+        failing = False
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def load_ban_list(self, account_id: str, from_date: date) -> list[StoredBanList]:
+            self.entered.set()
+            await self.release.wait()
+            if self.failing:
+                raise PersistenceError("database unavailable")
+            return await super().load_ban_list(account_id, from_date)
+
+    repo = Hung()
+    await repo.save_day(DayState("main", TODAY, NOW, halt_level=HaltLevel.KILL, halt_reason="k"))
+    env = await Env(repo=repo).ready()
+
+    for failing in (False, True):  # a read that hangs then answers, and one that hangs then fails
+        repo.failing = failing
+        repo.entered.clear()
+        repo.release.clear()
+        ban_lists = BanListService(
+            account_id="main", repository=repo, results=MemoryRepository(), now=env.clock
+        )
+        monitor = RiskMonitor(
+            account_id="main", limits=env.limits, daybook=env.daybook, repository=repo,
+            audit=env.audit, instruments=instrument_of, checks=CHECKS, subscribed=lambda: True,
+            interval_s=1.0, persist_interval_s=10.0, ensure_flat=env._ensure_flat,
+            ban_lists=ban_lists, now=env.clock,
+        )  # fmt: skip
+        monitor.bind(env.trading)
+        calls = len(env.flat_calls)
+        step = asyncio.create_task(monitor.step())
+        await asyncio.wait_for(repo.entered.wait(), timeout=2)  # the read is hanging now
+
+        assert len(env.flat_calls) == calls + 1  # and the flatten was already asked for
+
+        repo.release.set()
+        await asyncio.wait_for(step, timeout=2)
+        assert ban_lists.read is not failing  # a failed read leaves the lists unread
+
+
+async def test_a_monitor_without_ban_lists_has_no_list_and_knows_no_spot() -> None:
+    spy = SeeContext()
+    env = await Env(checks=(spy,)).ready()
+
+    await env.monitor.step()
+
+    assert env.monitor.ban_list(env.clock.at) is None
+    assert spy.seen[-1].ban_list is None and spy.seen[-1].spot_key("NIFTY") is None

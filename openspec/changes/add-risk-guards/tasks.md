@@ -61,16 +61,16 @@
 
 ## 7. Instrument policy and the ban list
 
-- [ ] 7.1 Add `InstrumentMaster.spot_of(symbol)`: the `IDX_I` index row, else the `NSE_EQ` equity row, with that `underlying_symbol`. Verify against the recorded instrument-master fixture that NIFTY, BANKNIFTY and FINNIFTY options each map to exactly one index row. If a name differs (for example "NIFTY BANK"), add an explicit mapping in the master code with a comment and a test, never a guess at runtime.
-- [ ] 7.2 Implement `BanListService` (`engine/risk/banlist.py`):
+- [x] 7.1 Add `InstrumentMaster.spot_of(symbol)`: the `IDX_I` index row, else the `NSE_EQ` equity row, with that `underlying_symbol`. Verify against the recorded instrument-master fixture that NIFTY, BANKNIFTY and FINNIFTY options each map to exactly one index row. If a name differs (for example "NIFTY BANK"), add an explicit mapping in the master code with a comment and a test, never a guess at runtime.
+- [x] 7.2 Implement `BanListService` (`engine/risk/banlist.py`):
   - load at start, retried while unread;
   - lists kept in memory for today and later dates;
   - the `SetBanList` handler (date not in the past; today during market hours must keep every stored symbol, else `TIGHTEN_ONLY`; an empty list accepted);
   - a `risk_event` per load.
 
   Route the command in `CommandConsumer`, wire it in `RiskRuntime`, and fill `RiskContext.ban_list` in both the gate's and the monitor's context builders. Verify every ban-list scenario in `instrument-policy` as unit tests, including the repeated-key and storage-down cases.
-- [ ] 7.3 Add CLI `risk set-ban-list --file PATH [--date YYYY-MM-DD]`: one symbol per line, `#` comments and blank lines ignored, upper-cased, date defaulting to today in IST. Report `ban_list_loaded` in the snapshot and in `risk status`. Add a short morning-checklist note to the README. Verify `--help` lists the command, the CLI round trip against `TEST_REDIS_URL`, and that the file parser rejects an empty symbol.
-- [ ] 7.4 Implement `InstrumentPolicy` (`checks/policy.py`, design §7): deny → allow → ban list (F&O segments) → minimum premium, including the expiry minimum → strike distance from a fresh spot price. Use `applies_to_exits = False`, and append it to the registry. Fill `RiskContext.spot_key` (via `InstrumentMaster.spot_of` from 7.1) in both the gate's and the monitor's context builders. Verify every `instrument-policy` entry scenario and the expiry minimum-premium scenario as unit tests, plus a test that no part of the policy refuses an exit, a missing ban list included.
+- [x] 7.3 Add CLI `risk set-ban-list --file PATH [--date YYYY-MM-DD]`: one symbol per line, `#` comments and blank lines ignored, upper-cased, date defaulting to today in IST. Report `ban_list_loaded` in the snapshot and in `risk status`. Add a short morning-checklist note to the README. Verify `--help` lists the command, the CLI round trip against `TEST_REDIS_URL`, and that the file parser rejects an empty symbol.
+- [x] 7.4 Implement `InstrumentPolicy` (`checks/policy.py`, design §7): deny → allow → ban list (F&O segments) → minimum premium, including the expiry minimum → strike distance from a fresh spot price. Use `applies_to_exits = False`, and append it to the registry. Fill `RiskContext.spot_key` (via `InstrumentMaster.spot_of` from 7.1) in both the gate's and the monitor's context builders. Verify every `instrument-policy` entry scenario and the expiry minimum-premium scenario as unit tests, plus a test that no part of the policy refuses an exit, a missing ban list included.
 
 ## 8. Expiry-day profile
 
